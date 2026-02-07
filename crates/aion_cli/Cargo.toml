@@ -1,0 +1,19 @@
+[package]
+name = "aion_cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aion_common = { workspace = true }
+aion_source = { workspace = true }
+aion_diagnostics = { workspace = true }
+aion_config = { workspace = true }
+aion_ir = { workspace = true }
+aion_vhdl_parser = { workspace = true }
+aion_verilog_parser = { workspace = true }
+aion_sv_parser = { workspace = true }
+aion_elaborate = { workspace = true }
+aion_lint = { workspace = true }
+aion_cache = { workspace = true }
+clap = { workspace = true }

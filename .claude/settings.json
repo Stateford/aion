@@ -1,0 +1,57 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build*)",
+      "Bash(cargo test*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo doc*)",
+      "Bash(cargo add*)",
+      "Bash(cargo check*)",
+      "Bash(cargo run*)",
+      "Bash(rustup*)",
+      "Bash(cat *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(rm *)"
+    ],
+    "deny": [
+      "Bash(git push*)",
+      "Bash(git rebase*)",
+      "Bash(cargo publish*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "for f in $CLAUDE_FILE_PATHS; do if [[ \"$f\" == *.rs ]]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo fmt -- \"$f\" 2>/dev/null; fi; done",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && echo '--- Quality Gate Check ---' >&2 && FAILED=0 && echo 'Running cargo fmt --check...' >&2 && cargo fmt --check 2>&1 >&2 || { echo '❌ cargo fmt --check failed. Code is not formatted.' >&2; FAILED=1; } && echo 'Running cargo clippy...' >&2 && cargo clippy --all-targets -- -D warnings 2>&1 >&2 || { echo '❌ cargo clippy failed. There are lint warnings.' >&2; FAILED=1; } && echo 'Running cargo test...' >&2 && cargo test 2>&1 >&2 || { echo '❌ cargo test failed. Tests are not passing.' >&2; FAILED=1; } && if [ $FAILED -eq 1 ]; then echo '{\"decision\": \"block\", \"reason\": \"Quality gates failed. Fix formatting, clippy warnings, or test failures before completing.\"}' >&2; exit 2; else echo '✅ All quality gates passed.' >&2; fi",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}

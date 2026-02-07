@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aion_common",
+    "crates/aion_source",
+    "crates/aion_diagnostics",
+    "crates/aion_config",
+    "crates/aion_ir",
+    "crates/aion_vhdl_parser",
+    "crates/aion_verilog_parser",
+    "crates/aion_sv_parser",
+    "crates/aion_elaborate",
+    "crates/aion_lint",
+    "crates/aion_cache",
+    "crates/aion_cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aion-fpga/aion"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+thiserror = "2"
+lasso = { version = "0.7", features = ["serialize", "multi-threaded"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+petgraph = "0.6"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+
+# Internal crates
+aion_common = { path = "crates/aion_common" }
+aion_source = { path = "crates/aion_source" }
+aion_diagnostics = { path = "crates/aion_diagnostics" }
+aion_config = { path = "crates/aion_config" }
+aion_ir = { path = "crates/aion_ir" }
+aion_vhdl_parser = { path = "crates/aion_vhdl_parser" }
+aion_verilog_parser = { path = "crates/aion_verilog_parser" }
+aion_sv_parser = { path = "crates/aion_sv_parser" }
+aion_elaborate = { path = "crates/aion_elaborate" }
+aion_lint = { path = "crates/aion_lint" }
+aion_cache = { path = "crates/aion_cache" }
