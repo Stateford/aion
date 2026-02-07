@@ -10,6 +10,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct Ident(u32);
 
+impl Ident {
+    /// Creates an `Ident` from a raw `u32` index.
+    ///
+    /// This is primarily intended for deserialization and testing.
+    /// In normal use, identifiers should be created through [`Interner::get_or_intern`].
+    pub fn from_raw(index: u32) -> Self {
+        Self(index)
+    }
+
+    /// Returns the raw `u32` index of this identifier.
+    pub fn as_raw(self) -> u32 {
+        self.0
+    }
+}
+
 // SAFETY: `Ident` wraps a `u32` which is always a valid `usize` on 32-bit and
 // 64-bit platforms. `try_from_usize` rejects values that don't fit in `u32`.
 unsafe impl lasso::Key for Ident {

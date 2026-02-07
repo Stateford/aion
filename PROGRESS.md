@@ -17,8 +17,8 @@
 | `aion_source` | 🟢 Complete | 22 | FileId, Span, SourceFile, SourceDb, ResolvedSpan |
 | `aion_diagnostics` | 🟢 Complete | 22 | Severity, DiagnosticCode, Label, Diagnostic, DiagnosticSink, TerminalRenderer |
 | `aion_config` | 🟢 Complete | 22 | ProjectConfig, all config types, loader, validator, target resolver |
-| `aion_ir` | 🟡 Stub only | — | Core IR types (Design, Module, Signal, Cell, etc.) |
-| `aion_vhdl_parser` | 🟡 Stub only | — | Full VHDL-2008 recursive descent parser |
+| `aion_ir` | 🟢 Complete | 77 | Arena, IDs, TypeDb, Design, Module, Signal, Cell, Process, Expr, Statement, SourceMap |
+| `aion_vhdl_parser` | 🟢 Complete | 85 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_verilog_parser` | 🟡 Stub only | — | Full Verilog-2005 recursive descent parser |
 | `aion_sv_parser` | 🟡 Stub only | — | SystemVerilog-2017 parser (synth subset priority) |
 | `aion_elaborate` | 🟡 Stub only | — | Basic elaboration (hierarchy resolution) |
@@ -34,10 +34,10 @@
 - [x] `aion_source` — source file management and spans
 - [x] `aion_diagnostics` — diagnostic types and terminal renderer
 - [x] `aion_config` — aion.toml parser
-- [ ] `aion_vhdl_parser` — full grammar coverage
+- [x] `aion_vhdl_parser` — full grammar coverage
 - [ ] `aion_verilog_parser` — full grammar coverage
 - [ ] `aion_sv_parser` — synthesizable subset
-- [ ] `aion_ir` — core IR type definitions
+- [x] `aion_ir` — core IR type definitions
 - [ ] `aion_elaborate` — basic hierarchy resolution
 - [ ] `aion_lint` — syntax checking, basic semantic analysis
 - [ ] `aion_cli` — `init` and `lint` commands
@@ -57,6 +57,68 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-07 — aion_vhdl_parser full VHDL-2008 parser
+
+**Crate:** `aion_vhdl_parser`
+
+**What:** Implemented a complete hand-rolled recursive descent VHDL-2008 parser across 8 modules:
+- `token` — `VhdlToken` enum (~95 keywords + operators + literals + punctuation), `Token` struct, `lookup_keyword()` function
+- `lexer` — Full lexer with case-insensitive keyword matching, based literals (`16#FF#`), character/string/bit-string literals, line comments (`--`), nested block comments (`/* */`), extended identifiers (`\foo\`), error recovery
+- `ast` — ~60 AST node types with `Span` on every node, serde derives, `Error` variants for recovery in DesignUnit/Declaration/ConcurrentStatement/SequentialStatement/Expr
+- `parser` — `VhdlParser` struct with primitives (advance/eat/expect), error recovery (recover_to_semicolon), top-level rules (design file, entity, architecture, package, package body, generics, ports, interface lists)
+- `expr` — Pratt expression parser with correct VHDL precedence (7 levels), physical literal support (`10 ns`), name parsing with dot/index/slice/attribute suffixes, aggregates, qualified expressions
+- `types` — Type indication parsing with range constraints, index constraints, discrete ranges
+- `decl` — All declaration types: signal, variable, constant, type (enum/range/array/record), subtype, component, function, procedure, alias, attribute declaration/specification
+- `stmt` — Concurrent statements (process, signal assignment, component instantiation, for-generate, if-generate, assert) and sequential statements (if/elsif/else, case/when, for/while/loop, next, exit, return, wait, assert, report, null, variable/signal assignment, procedure call)
+- `lib` — Public API `parse_file()` wiring lexer → parser
+
+**Key design decisions:**
+- `<=` always lexed as `LessEquals`; parser disambiguates by parsing targets as name expressions
+- Physical literals (`10 ns`) handled by consuming unit identifier after numeric literal in Pratt parser
+- Error recovery via `Error(Span)` poison nodes and `recover_to_semicolon()`
+- VHDL-2008 features: `process(all)`, nested block comments, matching operators (`?=`, `?/=`, etc.)
+
+**Tests added:** 85 tests
+- 25 lexer tests (keywords, identifiers, all literal types, operators, comments, error cases, spans)
+- 5 AST serde roundtrip tests
+- 45 parser tests (entity/arch/package parsing, all declaration types, expression precedence/associativity/unary/parens/aggregates, all statement types, error recovery)
+- 10 integration tests (counter entity+arch, multiplexer with case, package+body, multi-unit file, error recovery, component instantiation, generate statements, wait with time, signal assignment with after, serde roundtrip)
+
+**Test results:** 273 passed, 0 failed (188 previous + 85 new)
+**Clippy:** ✅ Clean (zero warnings with -D warnings)
+**Next:** Implement `aion_verilog_parser` and `aion_sv_parser`
+
+---
+
+#### 2026-02-07 — aion_ir core IR types
+
+**Crate:** `aion_ir`
+
+**What:** Implemented all core IR types from the technical spec across 12 submodules:
+- `arena` — Generic `Arena<I, T>` container with dense ID-indexed storage, O(1) alloc/lookup, Index/IndexMut impls, serde support
+- `ids` — 7 opaque ID newtypes via macro: ModuleId, SignalId, CellId, ProcessId, PortId, TypeId, ClockDomainId
+- `types` — `Type` enum (Bit, BitVec, Integer, Real, Bool, Str, Array, Enum, Record, Error) + `TypeDb` with interning and `bit_width()` computation
+- `port` — `Port` struct with `PortDirection` enum (Input, Output, InOut)
+- `signal` — `Signal` struct with `SignalKind` (Wire, Reg, Latch, Port, Const) + `SignalRef` (Signal, Slice, Concat, Const)
+- `const_value` — `ConstValue` enum (Int, Real, Logic, String, Bool)
+- `cell` — `Cell` + `CellKind` (Instance, And/Or/Xor/Not/Mux/Add/Sub/Mul/Shl/Shr/Eq/Lt/Concat/Slice/Repeat/Const, Dff/Latch, Memory, Lut/Carry/Bram/Dsp/Pll/Iobuf, BlackBox) + `Connection`, config structs
+- `process` — `Process` with `ProcessKind` (Combinational, Sequential, Latched, Initial), `Sensitivity` (All, EdgeList, SignalList), `Edge`
+- `expr` — `Expr` tree (Signal, Literal, Unary, Binary, Ternary, FuncCall, Concat, Repeat, Index, Slice) + `UnaryOp` (6 variants) + `BinaryOp` (19 variants)
+- `stmt` — `Statement` enum (Assign, If, Case, Block, Wait, Assertion, Display, Finish, Nop) + `CaseArm`, `AssertionKind`
+- `source_map` — `SourceMap` with per-module scoping for signals, cells, processes
+- `module` — `Module` with signals/cells/processes arenas, `Parameter`, `Assignment`, `ClockDomain`
+- `design` — `Design` top-level container with modules arena, type db, source map
+
+Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construction.
+
+**Tests added:** 77 tests in aion_ir (arena alloc/get/iter/serde, ID roundtrip/equality/hash/serde, TypeDb intern/dedup/bit_width, all cell kinds, all signal kinds/refs, all process kinds/sensitivities, all expr/stmt variants, source map scoped lookups, module/design construction/serde)
+
+**Test results:** 188 passed, 0 failed (111 previous + 77 new)
+**Clippy:** ✅ Clean (zero warnings with -D warnings)
+**Next:** Implement parsers (VHDL, Verilog, SystemVerilog)
+
+---
 
 #### 2026-02-07 — Workspace scaffolding + foundation crates
 

@@ -92,6 +92,7 @@ dependencies = [
  "aion_source",
  "petgraph",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -137,6 +138,8 @@ dependencies = [
  "aion_common",
  "aion_diagnostics",
  "aion_source",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
