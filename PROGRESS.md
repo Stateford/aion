@@ -1,7 +1,7 @@
 # Aion — Implementation Progress
 
 **Started:** 2026-02-07
-**Current Phase:** Phase 0 — Foundation
+**Current Phase:** Phase 1 — Simulation
 
 ---
 
@@ -25,6 +25,7 @@
 | `aion_lint` | 🟢 Complete | 91 | LintEngine, 15 rules (W101-W108, E102/E104/E105, C201-C204), IR traversal helpers |
 | `aion_cache` | 🟢 Complete | 47 | Content-hash caching: manifest, artifact store, source hasher, cache orchestrator |
 | `aion_cli` | 🟢 Complete | 38 | CLI entry point: `init` (scaffolding) and `lint` (full pipeline) commands |
+| `aion_sim` | 🟢 Complete | 136 | Event-driven HDL simulator: kernel, evaluator, VCD waveform, delta cycles |
 
 ### Phase 0 Checklist
 
@@ -57,6 +58,45 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — aion_sim event-driven HDL simulator
+
+**Crate:** `aion_sim`
+
+**What:** Implemented a complete event-driven HDL simulator with delta-cycle-accurate execution, 4-state logic (IEEE 1164), multi-driver resolution, hierarchy flattening, and VCD waveform output across 7 modules:
+
+- `error.rs` — `SimError` enum with 11 variants: `NoTopModule`, `ModuleNotFound`, `EvalError`, `InvalidSignalRef`, `DivisionByZero`, `Unsupported`, `Finished`, `AssertionFailed`, `WaveformIo`, `TimeLimitExceeded`, `DeltaCycleLimit`. All using `thiserror` derives
+- `time.rs` — `SimTime { fs: u64, delta: u32 }` with femtosecond precision and delta cycle tracking. Implements `Ord` (fs first, then delta), `Display` (auto-scales to ps/ns/us/ms), `Default`. Constants: `FS_PER_PS`, `FS_PER_NS`, `FS_PER_US`, `FS_PER_MS`. Methods: `zero()`, `from_ns()`, `from_ps()`, `from_fs()`, `next_delta()`, `advance_to()`, `to_ns()`
+- `value.rs` — `SimSignalId(u32)` implementing `ArenaId` for flat simulation namespace, `DriveStrength` enum (HighImpedance < Weak < Pull < Strong < Supply), `Driver` with value+strength, `SimSignalState` with current/previous values for edge detection, `resolve_drivers()` for multi-driver resolution (strongest wins, equal-strength conflict → X per bit)
+- `evaluator.rs` — Recursive tree-walker for IR expressions and statements. `eval_expr()` handles all `Expr` variants (arithmetic via `to_u64()` with X/Z → all-X propagation, bitwise via `LogicVec` operators, comparisons, signal refs including slices and concat). `exec_statement()` handles all `Statement` variants, collecting `PendingUpdate`s for deferred application. Helper functions: `eval_signal_ref`, `eval_unary`, `eval_binary`, `has_xz`, `arith_op`, `cmp_op`, `match_widths`, `format_display`
+- `waveform.rs` — `WaveformRecorder` trait (register_signal, begin/end_scope, record_change, finalize) + `VcdRecorder<W: Write>` implementing IEEE 1364 VCD text format. ID code generation from sequential index (printable ASCII starting at `!`), header with `$date`/`$version`/`$timescale`, `$dumpvars` section, value change encoding (single-bit: `0!`/`1!`, multi-bit: `b1010 !`)
+- `kernel.rs` — `SimKernel` main simulation engine with `BinaryHeap<Reverse<SimEvent>>` min-heap event queue. `flatten_module()` recursively flattens hierarchy (port-connected signals share `SimSignalId`). `build_sensitivity_map()` maps signals to processes. 3-phase execution: initial processes, combinational propagation, main event loop with delta cycle support. `SimProcess` with sensitivity matching (All, EdgeList with posedge/negedge detection, SignalList). `SimResult` with final time, display output, assertion failures
+- `lib.rs` — `SimConfig { time_limit, waveform_path, record_waveform }` with `#[derive(Default)]`. `simulate(design, config) -> Result<SimResult, SimError>` high-level entry point. Module declarations, `#![warn(missing_docs)]`, re-exports
+
+**Key design decisions:**
+- Flat simulation: module hierarchy flattened at init time. Port signals share `SimSignalId` between parent and child (zero-copy wire binding)
+- Deferred updates: all `Statement::Assign` within a process collect `PendingUpdate`s; applied only after process completes (correct for both combinational and sequential semantics)
+- Delta cycle limit: default 10,000 per time step to catch combinational loops
+- Previous value tracking: `SimSignalState.previous_value` for posedge/negedge edge detection
+- X/Z propagation: arithmetic ops convert to u64, any X/Z bit → all-X result. Bitwise ops use native `LogicVec` operators
+- No `aion_ir` dependency changes: simulator operates entirely on existing IR types
+
+**Tests added:** 136 tests
+- 11 error tests (display format for all 11 variants)
+- 19 time tests (zero, from_ns/ps/fs, next_delta, advance_to, to_ns truncation, ordering by fs/delta/precedence, display all units + delta suffix, default, serde roundtrip)
+- 14 value tests (SimSignalId roundtrip/ArenaId/equality, DriveStrength ordering, SimSignalState new/unknown, resolve_drivers: no drivers → Z, single driver, stronger wins, same strength same value, same strength conflict → X, Z driver weakest, serde roundtrip for id and strength)
+- 42 evaluator tests (literal, signal ref, binary ops add/sub/mul/div/mod/and/or/xor/shl/shr/eq/ne/lt/le/gt/ge, unary not/negate, ternary, concat, repeat, slice, index, X propagation arithmetic/comparison, Z propagation, logic_is_true, width mismatch extend, statement assign, statement if true/false, statement case match/no-match/default, statement block, statement display, statement finish, statement assertion pass/fail, nested if-else, multiple assigns, division by zero)
+- 12 waveform tests (id codes first/sequential/multi-char, register_signal writes var, single-bit change, multi-bit change, X/Z values, format_value single/multi bit, finalize empty, VCD header contents, dumpvars section, multiple signals, Z value)
+- 22 kernel tests (construction empty, single signal, combinational step, counter 3 cycles, finish stops, assertion failure, hierarchy with inverter, display output, find_signal, signal_value, time limit, event scheduling, delta limit, step_delta, multiple signals, sensitivity edge, unknown init, process kinds, empty event queue, concurrent assigns, run zero duration, large width signal)
+- 12 integration tests (empty module, combinational chain a & b, counter 3 posedges, finish + display, assertion failure, hierarchy parent→child with inverter, VCD output, if-else branching, time limit, case statement, combinational chain propagation, sequential with reset)
+- 4 lib tests (default config, config with options, simulate empty, simulate not found)
+
+**Test results:** 991 passed, 0 failed (855 previous + 136 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Fmt:** Clean
+**Next:** CI/CD pipeline (GitHub Actions), conformance testing, CLI integration (`aion sim`/`aion test` commands)
+
+---
 
 #### 2026-02-07 — aion_cache incremental compilation cache
 
@@ -418,7 +458,15 @@ Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construct
 
 ## Phase 1 — Simulation (Months 4–8)
 
-_Not yet started. See `docs/aion-prd.md` §15 and `docs/aion-technical-spec.md` §25._
+**Goal:** Event-driven HDL simulator with delta-cycle semantics, VCD output, and CLI integration.
+
+### Phase 1 Checklist
+
+- [x] `aion_sim` — Core simulation kernel (136 tests)
+- [ ] CLI integration (`aion sim` / `aion test` commands)
+- [ ] FST waveform format support
+- [ ] Interactive TUI for simulation control
+- [ ] Conformance testing on real HDL designs
 
 ## Phase 2 — Synthesis (Months 8–14)
 

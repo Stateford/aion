@@ -115,6 +115,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aion_sim"
+version = "0.1.0"
+dependencies = [
+ "aion_common",
+ "aion_ir",
+ "aion_source",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "aion_source"
 version = "0.1.0"
 dependencies = [

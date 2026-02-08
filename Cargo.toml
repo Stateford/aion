@@ -13,6 +13,7 @@ members = [
     "crates/aion_lint",
     "crates/aion_cache",
     "crates/aion_cli",
+    "crates/aion_sim",
 ]
 
 [workspace.package]
@@ -45,3 +46,4 @@ aion_sv_parser = { path = "crates/aion_sv_parser" }
 aion_elaborate = { path = "crates/aion_elaborate" }
 aion_lint = { path = "crates/aion_lint" }
 aion_cache = { path = "crates/aion_cache" }
+aion_sim = { path = "crates/aion_sim" }
