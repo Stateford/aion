@@ -103,8 +103,10 @@ name = "aion_lint"
 version = "0.1.0"
 dependencies = [
  "aion_common",
+ "aion_config",
  "aion_diagnostics",
  "aion_ir",
+ "aion_source",
 ]
 
 [[package]]

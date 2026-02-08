@@ -22,7 +22,7 @@
 | `aion_verilog_parser` | 🟢 Complete | 127 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_sv_parser` | 🟢 Complete | 166 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_elaborate` | 🟢 Complete | 113 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, all 3 languages |
-| `aion_lint` | 🟡 Stub only | — | W101-W108, E101-E105, C201-C204 rules |
+| `aion_lint` | 🟢 Complete | 91 | LintEngine, 15 rules (W101-W108, E102/E104/E105, C201-C204), IR traversal helpers |
 | `aion_cache` | 🟡 Stub only | — | Content-hash caching for parsed ASTs |
 | `aion_cli` | 🟡 Stub only | — | `init`, `lint` commands |
 
@@ -39,7 +39,7 @@
 - [x] `aion_sv_parser` — synthesizable subset
 - [x] `aion_ir` — core IR type definitions
 - [x] `aion_elaborate` — AST→IR elaboration engine
-- [ ] `aion_lint` — syntax checking, basic semantic analysis
+- [x] `aion_lint` — lint rules and engine (15 rules)
 - [ ] `aion_cli` — `init` and `lint` commands
 - [ ] `aion_cache` — basic content-hash caching
 - [ ] Human-readable error output with source spans
@@ -57,6 +57,74 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — aion_lint lint rules and engine
+
+**Crate:** `aion_lint`
+
+**What:** Implemented a full lint engine with 15 rules across 3 categories, plus IR traversal helpers:
+
+- `lib.rs` — `LintRule` trait (code, name, description, default_severity, check_module), public API re-exports
+- `engine.rs` — `LintEngine` struct: rule registration, `LintConfig`-based deny/allow/warn lists, severity override, `run()` loop over all modules, `make_diagnostic()` helper
+- `helpers.rs` — IR traversal utilities: `collect_read_signals`, `collect_written_signals`, `collect_expr_signals`, `collect_signal_ref_signals`, `is_signal_read_in_module`, `is_signal_driven_in_module`, `count_drivers`, `stmt_has_full_else_coverage`, `has_assign`, `check_cell_port_match`
+- `rules/` — 15 individual rule files:
+
+**Warning rules (W101-W108):**
+- W101 `unused-signal` — Signal declared but never read (skips Port/Const kinds)
+- W102 `undriven-signal` — Signal never assigned/driven (skips Input ports and Const)
+- W103 `width-mismatch` — LHS and RHS of assignment have different bit widths
+- W104 `missing-reset` — Sequential process has no reset in sensitivity or body
+- W105 `incomplete-sensitivity` — Combinational process with SignalList missing read signals
+- W106 `latch-inferred` — Combinational process if without else or case without default
+- W107 `truncation` — RHS wider than LHS causing bit truncation
+- W108 `dead-logic` — Code after $finish, always-true/false conditions
+
+**Error rules (E102, E104, E105):**
+- E102 `non-synthesizable` — Initial blocks, Wait/Display/Finish in non-initial processes
+- E104 `multiple-drivers` — Wire signal driven by >1 concurrent source
+- E105 `port-mismatch` — Cell instance connections don't match module ports
+
+**Convention rules (C201-C204):**
+- C201 `naming-violation` — Naming convention utilities (snake_case, UPPER_SNAKE_CASE, camelCase, PascalCase)
+- C202 `missing-doc` — Stub for module documentation check (needs source text access)
+- C203 `magic-number` — Literal values >1 bit and not 0/1 used directly in expressions
+- C204 `inconsistent-style` — Detects latched process kind as potential style issue
+
+**Also added to `aion_common`:** `LogicVec::from_bool()`, `from_u64()`, `to_u64()`, `is_all_zero()`, `is_all_one()` utility methods.
+
+**Key design decisions:**
+- `LintRule` trait is Send+Sync for future parallel module analysis
+- Engine uses temporary `DiagnosticSink` per rule to enable severity override without modifying rule logic
+- Rules operate on `Module` + `Design` references — no interner access (naming rules are stubs for now)
+- `PortMatchIssue` enum returned from `check_cell_port_match` for structured error reporting
+- C201 naming utilities exported as standalone functions for reuse
+- C202 is a stub pending source text / interner access in future engine refactor
+
+**Tests added:** 91 tests
+- 8 engine tests (register builtin rules count, custom rule, run emits diagnostics, allow suppresses, deny promotes severity, rule names, make_diagnostic default/denied)
+- 22 helpers tests (collect_signal_ref for Signal/Slice/Concat/Const, collect_expr_signals for signal/binary/literal, collect_read_signals for assign/if, collect_written_signals for assign/block, signal_read/driven_in_module, stmt coverage if-with-else/without-else/case-with-default/without-default, count_drivers multiple/none, has_assign block/nop)
+- 4 W101 tests (unused fires, used no warning, port skipped, const skipped)
+- 5 W102 tests (undriven fires, driven no warning, input port skipped, output port undriven fires, const skipped)
+- 3 W103 tests (width mismatch fires, matching widths no warning, mismatch in process)
+- 4 W104 tests (missing reset fires, async reset no warning, sync reset no warning, combinational skipped)
+- 3 W105 tests (incomplete sensitivity fires, complete no warning, sensitivity all skipped)
+- 4 W106 tests (if without else, if with else, case without default, sequential skipped)
+- 3 W107 tests (truncation fires, same width no warning, rhs narrower no warning)
+- 4 W108 tests (dead logic after finish, always true, always false, normal no warning)
+- 4 E102 tests (initial block fires, wait fires, display fires, normal no error)
+- 3 E104 tests (multiple drivers fires, single driver no error, reg skipped)
+- 4 E105 tests (missing port fires, extra port fires, matching ports no error, non-instance skipped)
+- 10 C201 tests (snake_case valid/invalid, upper_snake_case valid/invalid, camelCase valid/invalid, PascalCase valid/invalid, no false positives)
+- 2 C202 tests (stub no diagnostics, rule metadata)
+- 5 C203 tests (magic number fires, zero no warning, one-bit no warning, all-ones no warning, magic in process)
+- 4 C204 tests (latched fires, combinational no warning, sequential no warning, rule metadata)
+
+**Test results:** 770 passed, 0 failed (679 previous + 91 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Docs:** Clean (zero warnings from `cargo doc`)
+**Next:** Implement `aion_cli` (init and lint commands)
+
+---
 
 #### 2026-02-08 — aion_elaborate AST→AionIR elaboration engine
 

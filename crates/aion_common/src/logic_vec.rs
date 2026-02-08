@@ -89,6 +89,57 @@ impl LogicVec {
         v
     }
 
+    /// Creates a single-bit `LogicVec` from a boolean value.
+    pub fn from_bool(value: bool) -> Self {
+        let mut v = Self::new(1);
+        if value {
+            v.set(0, Logic::One);
+        }
+        v
+    }
+
+    /// Creates a `LogicVec` from a `u64` value with the given width.
+    ///
+    /// Bits beyond the given width are ignored.
+    pub fn from_u64(value: u64, width: u32) -> Self {
+        let mut v = Self::new(width);
+        for i in 0..width.min(64) {
+            if (value >> i) & 1 != 0 {
+                v.set(i, Logic::One);
+            }
+        }
+        v
+    }
+
+    /// Converts the `LogicVec` to a `u64`, if all bits are definite (0 or 1).
+    ///
+    /// Returns `None` if the vector contains X or Z values, or if the width
+    /// exceeds 64 bits.
+    pub fn to_u64(&self) -> Option<u64> {
+        if self.width > 64 {
+            return None;
+        }
+        let mut result = 0u64;
+        for i in 0..self.width {
+            match self.get(i) {
+                Logic::Zero => {}
+                Logic::One => result |= 1 << i,
+                Logic::X | Logic::Z => return None,
+            }
+        }
+        Some(result)
+    }
+
+    /// Returns true if all bits are `Logic::Zero`.
+    pub fn is_all_zero(&self) -> bool {
+        (0..self.width).all(|i| self.get(i) == Logic::Zero)
+    }
+
+    /// Returns true if all bits are `Logic::One`.
+    pub fn is_all_one(&self) -> bool {
+        (0..self.width).all(|i| self.get(i) == Logic::One)
+    }
+
     /// Parses a binary string like `"10XZ"` into a `LogicVec`.
     ///
     /// The leftmost character is the most significant bit (highest index).
