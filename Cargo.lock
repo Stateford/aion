@@ -120,6 +120,8 @@ dependencies = [
  "aion_common",
  "aion_diagnostics",
  "aion_source",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

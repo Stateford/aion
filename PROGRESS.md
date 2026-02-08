@@ -20,7 +20,7 @@
 | `aion_ir` | 🟢 Complete | 77 | Arena, IDs, TypeDb, Design, Module, Signal, Cell, Process, Expr, Statement, SourceMap |
 | `aion_vhdl_parser` | 🟢 Complete | 85 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_verilog_parser` | 🟢 Complete | 127 | Lexer, Pratt parser, full AST, error recovery, serde |
-| `aion_sv_parser` | 🟡 Stub only | — | SystemVerilog-2017 parser (synth subset priority) |
+| `aion_sv_parser` | 🟢 Complete | 166 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_elaborate` | 🟡 Stub only | — | Basic elaboration (hierarchy resolution) |
 | `aion_lint` | 🟡 Stub only | — | W101-W108, E101-E105, C201-C204 rules |
 | `aion_cache` | 🟡 Stub only | — | Content-hash caching for parsed ASTs |
@@ -36,7 +36,7 @@
 - [x] `aion_config` — aion.toml parser
 - [x] `aion_vhdl_parser` — full grammar coverage
 - [x] `aion_verilog_parser` — full grammar coverage
-- [ ] `aion_sv_parser` — synthesizable subset
+- [x] `aion_sv_parser` — synthesizable subset
 - [x] `aion_ir` — core IR type definitions
 - [ ] `aion_elaborate` — basic hierarchy resolution
 - [ ] `aion_lint` — syntax checking, basic semantic analysis
@@ -57,6 +57,45 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — aion_sv_parser full SystemVerilog-2017 parser
+
+**Crate:** `aion_sv_parser`
+
+**What:** Implemented a complete hand-rolled recursive descent SystemVerilog-2017 parser (synthesizable subset) across 8 modules:
+- `token` — `SvToken` enum (~100 variants: all Verilog-2005 keywords + ~45 SV keywords like `logic`, `bit`, `int`, `enum`, `struct`, `typedef`, `interface`, `package`, `always_comb`, `always_ff`, `always_latch`, `import`, `modport`, `unique`, `priority`, `return`, `break`, `continue` + ~45 operators including `++`, `--`, `+=`, `-=`, `::`, `->`, `==?`, `!=?`, `'`), `Token` struct, `lookup_keyword()`, predicates (`is_keyword`, `is_direction`, `is_net_type`, `is_data_type`, `is_always_variant`, `is_assignment_op`)
+- `lexer` — Full lexer with all Verilog-2005 features + SV-specific operators (`++`, `--`, `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `<<<`, `>>>`, `==?`, `!=?`, `::`, `->`, `'`), case-sensitive keywords
+- `ast` — ~75 AST node types with `Span` on every node, serde derives, `Error` variants. New SV types: `SvPortType` with `InterfacePort` variant, `VarType` (Logic/Bit/Byte/Shortint/Int/Longint), `TypeSpec` (named/scoped types), `EnumDecl`/`StructDecl`/`TypedefDecl`, `AlwaysCombBlock`/`AlwaysFfBlock` (with sensitivity list)/`AlwaysLatchBlock`, `SvInterfaceDecl`/`SvModportDecl`/`SvModportPort`, `SvPackageDecl`/`SvImport`, `SvAssertion`, `CompoundOp`, `CaseModifier` (Unique/Priority). All statement/expression variants from Verilog plus compound assignments, incr/decr, return/break/continue, scoped identifiers, wildcard equality
+- `parser` — `SvParser` struct with primitives, error recovery, top-level rules (source file, module, interface, package), ANSI/non-ANSI port detection including interface ports (`axi_if.master bus`), parameter port lists with type parameters, end labels (`endmodule : name`)
+- `expr` — Pratt expression parser with IEEE 1800-2017 precedence (13 levels + ternary + SV ops), `inside` at relational level, `==?`/`!=?` at equality level, prefix/postfix `++`/`--`, scoped names (`pkg::name`), same `<=` disambiguation and part-select restricted binding power as Verilog parser
+- `stmt` — All Verilog statements + compound assignments (`+=` etc), `++`/`--` (prefix/postfix), `return`/`break`/`continue`, `do...while`, `unique if`/`priority case`, `for (int i = 0; ...)` with local variable declarations, immediate assertions (`assert`/`assume`/`cover`), local variable declarations in procedural blocks
+- `decl` — All Verilog declarations + `logic`/`bit`/`byte`/`int`/`longint` variable declarations, `typedef` (logic, enum, struct packed), `enum` type with member values, `struct packed` with field declarations, `import pkg::*` / `import pkg::name`, `modport` declarations, `always_comb`/`always_ff` (extracts sensitivity list from `@(...)`)/`always_latch`, functions with return types and ANSI ports, tasks with `automatic`. Named-type variable disambiguation (`state_t state;` vs `mod_name inst(...)`) via 3rd-token peek. Scoped-type variable support (`pkg::type_t var;`)
+- `lib` — Public API `parse_file()` + 16 integration tests
+
+**Key design decisions:**
+- Standalone crate — no code sharing with Verilog parser (follows VHDL/Verilog precedent)
+- `always_ff @(posedge clk)` extracts sensitivity list into `AlwaysFfBlock.sensitivity` field rather than wrapping body in `EventControl`
+- Named-type vs instantiation disambiguation: `ident ident` pattern checked by peeking 3rd token — `(` means instantiation, otherwise named-type variable declaration
+- Interface port parsing: `ident.modport name` pattern detected in ANSI port list, creates `SvPortType::InterfacePort`
+- Function/task ANSI port parsing: single name per port call with comma-lookahead to detect next port declaration (direction/type keyword)
+- Same `<=` disambiguation and part-select restricted binding power as Verilog parser
+
+**Tests added:** 166 tests
+- 10 token tests (keyword lookup, SV-specific keywords, predicates for direction/net_type/data_type/always_variant/assignment_op)
+- 30 lexer tests (SV operators, compound assignments, increment/decrement, scope resolution, wildcard equality, arrow, tick, SV keywords by category, all Verilog lexer tests)
+- 10 AST serde roundtrip tests (module, source file, expr, statement, binary op, compound op, enum, range, import, span accessor)
+- 15 parser tests (minimal module, ports, parameters, interfaces, packages, end labels, error recovery, direction inheritance, signed ports, multiple modules)
+- 26 expression tests (identifiers, literals, binary ops, precedence, unary, ternary, concat, repeat, index, range/part-select, function/system calls, hierarchical names, scoped identifiers, prefix/postfix increment/decrement, wildcard equality/inequality, power associativity)
+- 20 statement tests (blocking/non-blocking, if/else, case, for with int, while, forever, do-while, event control, compound assignments, return, break/continue, unique if, priority case, incr/decr, local var decl, null, system task)
+- 39 declaration tests (wire, reg, integer, real, logic/bit/int, parameter, localparam, assign, all always variants, initial, typedef logic/enum/struct, import wildcard/named, instantiation named/positional, gate, genvar, generate for/if, function with return type/verilog style/end label, task with ANSI ports/end label, non-ANSI port decl, assertion, var with init, multiple var names, enum variable)
+- 16 integration tests (counter, mux, FSM with enum, package+import, interface+modport, struct packed, for loop with int, always_latch, end labels, compound assignments, named import, non-ANSI ports, error recovery, serde roundtrip, generate+always_ff, function with return)
+
+**Test results:** 566 passed, 0 failed (400 previous + 166 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Docs:** Clean (zero warnings from `cargo doc`)
+**Next:** Implement `aion_elaborate` (AST → AionIR elaboration)
+
+---
 
 #### 2026-02-07 — aion_verilog_parser full Verilog-2005 parser
 
