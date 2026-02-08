@@ -5,6 +5,7 @@
 //! change log that supports efficient time-based lookup for waveform rendering.
 
 use aion_common::{Logic, LogicVec};
+use aion_sim::vcd_loader::LoadedWaveform;
 use aion_sim::SimSignalId;
 
 /// A single value change event for a signal.
@@ -151,6 +152,24 @@ impl WaveformData {
     /// Returns the number of registered signals.
     pub fn signal_count(&self) -> usize {
         self.signals.len()
+    }
+
+    /// Creates a `WaveformData` from a loaded VCD waveform.
+    ///
+    /// Registers each signal from the loaded waveform with a synthetic
+    /// `SimSignalId` and replays the value-change history.
+    pub fn from_loaded(loaded: &LoadedWaveform) -> Self {
+        let mut data = Self::new();
+        for (i, sig) in loaded.signals.iter().enumerate() {
+            let id = SimSignalId::from_raw(i as u32);
+            data.register(id, sig.name.clone(), sig.width);
+        }
+        for (i, history) in loaded.histories.iter().enumerate() {
+            for (time_fs, value) in history {
+                data.record(i, *time_fs, value.clone());
+            }
+        }
+        data
     }
 }
 
@@ -317,6 +336,62 @@ mod tests {
         let mut data = WaveformData::new();
         // Recording to a non-existent signal index should not panic
         data.record(999, 0, LogicVec::from_bool(false));
+    }
+
+    #[test]
+    fn from_loaded_basic() {
+        use aion_sim::vcd_loader::{LoadedWaveform, VcdSignalDef, VcdTimescale};
+
+        let loaded = LoadedWaveform {
+            timescale: VcdTimescale { fs_per_unit: 1 },
+            signals: vec![
+                VcdSignalDef {
+                    id_code: "!".into(),
+                    name: "top.clk".into(),
+                    width: 1,
+                    var_type: "wire".into(),
+                },
+                VcdSignalDef {
+                    id_code: "\"".into(),
+                    name: "top.data".into(),
+                    width: 4,
+                    var_type: "wire".into(),
+                },
+            ],
+            histories: vec![
+                vec![
+                    (0, LogicVec::from_bool(false)),
+                    (100, LogicVec::from_bool(true)),
+                ],
+                vec![
+                    (0, LogicVec::from_u64(0, 4)),
+                    (100, LogicVec::from_u64(5, 4)),
+                ],
+            ],
+        };
+
+        let data = WaveformData::from_loaded(&loaded);
+        assert_eq!(data.signal_count(), 2);
+        assert_eq!(data.signals[0].name, "top.clk");
+        assert_eq!(data.signals[1].name, "top.data");
+        assert_eq!(data.signals[0].changes.len(), 2);
+        assert_eq!(data.signals[1].changes.len(), 2);
+        assert_eq!(data.max_time(), 100);
+    }
+
+    #[test]
+    fn from_loaded_empty() {
+        use aion_sim::vcd_loader::{LoadedWaveform, VcdTimescale};
+
+        let loaded = LoadedWaveform {
+            timescale: VcdTimescale { fs_per_unit: 1 },
+            signals: vec![],
+            histories: vec![],
+        };
+
+        let data = WaveformData::from_loaded(&loaded);
+        assert_eq!(data.signal_count(), 0);
+        assert_eq!(data.max_time(), 0);
     }
 
     #[test]

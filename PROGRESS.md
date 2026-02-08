@@ -24,10 +24,10 @@
 | `aion_elaborate` | 🟢 Complete | 117 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, delay/forever preservation, all 3 languages |
 | `aion_lint` | 🟢 Complete | 91 | LintEngine, 15 rules (W101-W108, E102/E104/E105, C201-C204), IR traversal helpers |
 | `aion_cache` | 🟢 Complete | 47 | Content-hash caching: manifest, artifact store, source hasher, cache orchestrator |
-| `aion_cli` | 🟢 Complete | 88 | CLI: `init`, `lint`, `sim`, `test` commands with shared pipeline, `--interactive` mode |
-| `aion_sim` | 🟢 Complete | 229 | Event-driven HDL simulator: kernel, evaluator, VCD/FST waveform, delta cycles, delay scheduling, interactive REPL |
+| `aion_cli` | 🟢 Complete | 93 | CLI: `init`, `lint`, `sim`, `test`, `view` commands with shared pipeline, `--interactive` mode |
+| `aion_sim` | 🟢 Complete | 250 | Event-driven HDL simulator: kernel, evaluator, VCD/FST waveform, delta cycles, delay scheduling, interactive REPL, VCD loader |
 | `aion_conformance` | 🟢 Complete | 92 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 5 unit |
-| `aion_tui` | 🟢 Complete | 104 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping, bus expansion, cursor-time values |
+| `aion_tui` | 🟢 Complete | 117 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping, bus expansion, cursor-time values, viewer mode |
 
 ### Phase 0 Checklist
 
@@ -60,6 +60,40 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — VCD file loading and `aion view` command
+
+**Crates:** `aion_sim`, `aion_tui`, `aion_cli`
+
+**What:** Added VCD file loading support and an `aion view` CLI command, enabling users to open previously saved waveform files in the TUI viewer without re-running simulations.
+
+**New files:**
+- `crates/aion_sim/src/vcd_loader.rs` — Streaming line-based VCD parser with header phase (timescale, scope/upscope, var, enddefinitions) and value change phase (timestamps, single-bit, multi-bit binary values). Public types: `VcdLoadError`, `VcdTimescale`, `VcdSignalDef`, `LoadedWaveform`. Public functions: `load_vcd()`, `load_vcd_file()`. Supports hierarchical dotted signal names, X/Z values, multichar id codes, and timescale conversion to femtoseconds.
+- `crates/aion_cli/src/view.rs` — `aion view <file>` command implementation. Validates file exists, detects format from extension (.vcd supported), loads waveform, builds signal info, and launches TUI viewer.
+
+**Modified files:**
+- `crates/aion_sim/src/lib.rs` — Added `pub mod vcd_loader` and re-exports
+- `crates/aion_sim/src/error.rs` — Added `SimError::Other { message }` variant for viewer-mode errors
+- `crates/aion_tui/src/waveform_data.rs` — Added `WaveformData::from_loaded()` bridge method
+- `crates/aion_tui/src/app.rs` — Added `TuiMode` enum (Simulation/Viewer), changed `kernel: SimKernel` to `kernel: Option<SimKernel>`, added `from_waveform()` constructor, guarded kernel-dependent methods (initialize/step/run_for/signal_value_str/time_str/snapshot_signals/execute_sim_command), added `is_finished()` and `has_pending_events()` helpers
+- `crates/aion_tui/src/lib.rs` — Added `run_tui_viewer()` entry point, extracted `run_tui_loop()` shared event loop
+- `crates/aion_tui/src/widgets/status_bar.rs` — Shows "VIEWER" badge in viewer mode, guards kernel calls
+- `crates/aion_cli/src/main.rs` — Added `View(ViewArgs)` command variant, `ViewArgs` struct, dispatch
+
+**Tests added:** 39 new tests (1336 → 1375 total)
+- `aion_sim` vcd_loader (21): timescale parsing variants, minimal/multi-signal load, binary values, X/Z, hierarchical scopes, dumpvars, roundtrip (write+reload), empty signals, missing enddefinitions error, multichar id codes, large timestamps, single-bit values, real-world format
+- `aion_tui` waveform_data (2): `from_loaded_basic`, `from_loaded_empty`
+- `aion_tui` app (8): `viewer_mode_construction`, `viewer_mode_no_step`, `viewer_mode_signal_value_at_cursor`, `viewer_mode_key_handling_space`, `viewer_mode_time_str`, `viewer_mode_zoom_fit`, `viewer_mode_quit_works`, `viewer_mode_sim_command_rejected`
+- `aion_tui` lib (2): `viewer_app_can_be_constructed`, `viewer_key_handling_does_not_panic`
+- `aion_tui` status_bar (1): `render_status_bar_viewer_mode`
+- `aion_cli` view (3): `view_file_not_found`, `view_unsupported_extension`, `view_vcd_load_succeeds`
+- `aion_cli` main (2): `parse_view_basic`, `parse_view_with_path`
+
+**Test results:** 1375 passed, 0 failed
+**Clippy:** Clean (zero warnings with -D warnings)
+**Fmt:** Clean
+
+---
 
 #### 2026-02-08 — TUI bus expansion, cursor-time values, simulation fixes
 
@@ -888,6 +922,7 @@ Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construct
 - [x] Interactive TUI for simulation control (46 tests for REPL, 91 for TUI)
 - [x] Delay scheduling: `Delay`/`Forever` IR variants, continuation-based execution
 - [x] Ratatui-based TUI waveform viewer (`aion_tui`, 91 tests)
+- [x] VCD file loading and `aion view` command (21 loader tests, 16 viewer tests)
 - [ ] Conformance testing on real HDL designs
 
 ## Phase 2 — Synthesis (Months 8–14)

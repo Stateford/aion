@@ -29,6 +29,7 @@
 //! - `value` — Signal state, driver resolution, drive strength
 //! - `evaluator` — Expression evaluation and statement execution
 //! - `waveform` — Waveform recording (VCD format)
+//! - `vcd_loader` — VCD file loading/parsing
 //! - `kernel` — Simulation kernel with event queue and delta-cycle loop
 
 #![warn(missing_docs)]
@@ -40,6 +41,7 @@ pub mod interactive;
 pub mod kernel;
 pub mod time;
 pub mod value;
+pub mod vcd_loader;
 pub mod waveform;
 
 use std::fs::File;
@@ -55,6 +57,9 @@ pub use interactive::InteractiveSim;
 pub use kernel::{SimKernel, SimResult, StepResult};
 pub use time::SimTime;
 pub use value::{DriveStrength, Driver, SimSignalId, SimSignalState};
+pub use vcd_loader::{
+    load_vcd, load_vcd_file, LoadedWaveform, VcdLoadError, VcdSignalDef, VcdTimescale,
+};
 pub use waveform::{VcdRecorder, WaveformRecorder};
 
 /// Waveform output format selection.

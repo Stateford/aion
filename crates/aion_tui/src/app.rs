@@ -1,8 +1,9 @@
 //! TUI application core.
 //!
-//! [`TuiApp`] owns the simulation kernel, waveform data, and TUI state.
-//! It provides the main event loop and coordinates simulation stepping
-//! with UI rendering.
+//! [`TuiApp`] owns the simulation kernel (if in simulation mode), waveform
+//! data, and TUI state. It provides the main event loop and coordinates
+//! simulation stepping with UI rendering. In viewer mode, the kernel is
+//! absent and only pre-loaded waveform data is displayed.
 
 use aion_common::Interner;
 use aion_ir::Design;
@@ -25,14 +26,26 @@ pub struct SignalInfo {
     pub width: u32,
 }
 
+/// Operating mode for the TUI application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuiMode {
+    /// Live simulation with a kernel — stepping and running are available.
+    Simulation,
+    /// Read-only viewer for pre-loaded waveform data — no kernel present.
+    Viewer,
+}
+
 /// The core TUI application state.
 ///
-/// Owns the simulation kernel, waveform history, and UI state. Provides
-/// methods for stepping the simulation, handling key events, and executing
-/// commands.
+/// Owns the simulation kernel (if in simulation mode), waveform history,
+/// and UI state. Provides methods for stepping the simulation, handling
+/// key events, and executing commands. In viewer mode, simulation commands
+/// are unavailable and only waveform navigation is supported.
 pub struct TuiApp {
-    /// The simulation kernel.
-    pub kernel: SimKernel,
+    /// The simulation kernel, present only in simulation mode.
+    pub kernel: Option<SimKernel>,
+    /// The current operating mode.
+    pub mode: TuiMode,
     /// Waveform value change history.
     pub waveform: WaveformData,
     /// UI state (viewport, selection, mode, etc.).
@@ -69,7 +82,8 @@ impl TuiApp {
         let state = TuiState::new(signal_info.len());
 
         Ok(Self {
-            kernel,
+            kernel: Some(kernel),
+            mode: TuiMode::Simulation,
             waveform,
             state,
             signal_info,
@@ -78,21 +92,42 @@ impl TuiApp {
         })
     }
 
+    /// Creates a TUI application in viewer mode from pre-loaded waveform data.
+    ///
+    /// No simulation kernel is created. Simulation commands (step, run, etc.)
+    /// are unavailable; only waveform navigation and inspection are supported.
+    pub fn from_waveform(waveform: WaveformData, signal_info: Vec<SignalInfo>) -> Self {
+        let state = TuiState::new(signal_info.len());
+        Self {
+            kernel: None,
+            mode: TuiMode::Viewer,
+            waveform,
+            state,
+            signal_info,
+            initialized: true,
+            should_quit: false,
+        }
+    }
+
     /// Initializes the simulation kernel.
     ///
     /// Must be called once before stepping. Records the initial signal values.
+    /// No-op in viewer mode.
     pub fn initialize(&mut self) -> Result<(), SimError> {
         if self.initialized {
             return Ok(());
         }
-        self.kernel.initialize()?;
+        if let Some(ref mut kernel) = self.kernel {
+            kernel.initialize()?;
+        }
         self.initialized = true;
         self.snapshot_signals();
 
         // Collect initial display output
-        let output = self.kernel.take_display_output();
-        self.state.display_output.extend(output);
-
+        if let Some(ref mut kernel) = self.kernel {
+            let output = kernel.take_display_output();
+            self.state.display_output.extend(output);
+        }
         Ok(())
     }
 
@@ -100,16 +135,22 @@ impl TuiApp {
     ///
     /// Uses `run_until()` to process both events and suspended process wakeups,
     /// ensuring delay-based scheduling is honored.
+    ///
+    /// Returns an error in viewer mode since no simulation kernel is present.
     pub fn step(&mut self) -> Result<StepResult, SimError> {
-        let result = if let Some(next_t) = self.kernel.next_event_time_fs() {
-            self.kernel.run_until(next_t)?
+        let kernel = self.kernel.as_mut().ok_or_else(|| SimError::Other {
+            message: "not available in viewer mode".into(),
+        })?;
+
+        let result = if let Some(next_t) = kernel.next_event_time_fs() {
+            kernel.run_until(next_t)?
         } else {
             StepResult::Done
         };
         self.snapshot_signals();
 
         // Collect display output
-        let output = self.kernel.take_display_output();
+        let output = self.kernel.as_mut().unwrap().take_display_output();
         self.state.display_output.extend(output);
 
         Ok(result)
@@ -120,25 +161,40 @@ impl TuiApp {
     /// Steps through each event time up to the target, snapshotting signal
     /// values at every event so that the waveform captures all intermediate
     /// transitions (clock toggles, counter increments, etc.).
+    ///
+    /// Returns an error in viewer mode.
     pub fn run_for(&mut self, duration_fs: u64) -> Result<(), SimError> {
-        let target_fs = self.kernel.current_time().fs + duration_fs;
+        if self.kernel.is_none() {
+            return Err(SimError::Other {
+                message: "not available in viewer mode".into(),
+            });
+        }
+        let target_fs = self.kernel.as_ref().unwrap().current_time().fs + duration_fs;
 
-        while !self.kernel.is_finished() {
-            let next_t = match self.kernel.next_event_time_fs() {
+        loop {
+            let kernel = self.kernel.as_mut().unwrap();
+            if kernel.is_finished() {
+                break;
+            }
+            let next_t = match kernel.next_event_time_fs() {
                 Some(t) if t <= target_fs => t,
                 _ => break,
             };
-            self.kernel.run_until(next_t)?;
+            kernel.run_until(next_t)?;
             self.snapshot_signals();
         }
 
         // Advance time to target even if no more events
-        if self.kernel.current_time().fs < target_fs && !self.kernel.is_finished() {
-            self.kernel.run_until(target_fs)?;
-            self.snapshot_signals();
+        {
+            let kernel = self.kernel.as_mut().unwrap();
+            if kernel.current_time().fs < target_fs && !kernel.is_finished() {
+                kernel.run_until(target_fs)?;
+            }
         }
+        self.snapshot_signals();
 
-        let output = self.kernel.take_display_output();
+        let kernel = self.kernel.as_mut().unwrap();
+        let output = kernel.take_display_output();
         self.state.display_output.extend(output);
 
         Ok(())
@@ -149,7 +205,7 @@ impl TuiApp {
     /// Looks up the value from the waveform history at `cursor_fs` so the
     /// signal list panel shows the value at the cursor, not the final sim
     /// time. Falls back to the kernel's current value when no waveform data
-    /// exists yet.
+    /// exists yet (simulation mode only).
     pub fn signal_value_str(&self, signal_idx: usize) -> String {
         // Try waveform history at cursor time first
         if let Some(history) = self.waveform.signals.get(signal_idx) {
@@ -157,18 +213,39 @@ impl TuiApp {
                 return format_value(val);
             }
         }
-        // Fall back to current kernel value
-        if let Some(info) = self.signal_info.get(signal_idx) {
-            let val = self.kernel.signal_value(info.id);
-            format_value(val)
-        } else {
-            "?".into()
+        // Fall back to current kernel value (simulation mode only)
+        if let Some(ref kernel) = self.kernel {
+            if let Some(info) = self.signal_info.get(signal_idx) {
+                let val = kernel.signal_value(info.id);
+                return format_value(val);
+            }
         }
+        "?".into()
     }
 
     /// Returns the current simulation time as a formatted string.
+    ///
+    /// In viewer mode, shows the cursor time or waveform max time.
     pub fn time_str(&self) -> String {
-        format!("{}", self.kernel.current_time())
+        if let Some(ref kernel) = self.kernel {
+            format!("{}", kernel.current_time())
+        } else {
+            format!("{}", aion_sim::SimTime::from_fs(self.state.cursor_fs))
+        }
+    }
+
+    /// Returns whether the simulation is finished.
+    ///
+    /// In viewer mode, always returns `true`.
+    pub fn is_finished(&self) -> bool {
+        self.kernel.as_ref().is_none_or(|k| k.is_finished())
+    }
+
+    /// Returns whether the simulation has pending events.
+    ///
+    /// In viewer mode, always returns `false`.
+    pub fn has_pending_events(&self) -> bool {
+        self.kernel.as_ref().is_some_and(|k| k.has_pending_events())
     }
 
     /// Executes a TUI command.
@@ -186,9 +263,8 @@ impl TuiApp {
             }
             TuiCommand::ZoomFit => {
                 let max_t = self.waveform.max_time();
-                self.state
-                    .viewport
-                    .fit(max_t.max(self.kernel.current_time().fs));
+                let kernel_t = self.kernel.as_ref().map_or(0, |k| k.current_time().fs);
+                self.state.viewport.fit(max_t.max(kernel_t));
                 Ok("Fit to simulation range".into())
             }
             TuiCommand::Goto { time_fs } => {
@@ -210,6 +286,43 @@ impl TuiApp {
 
     /// Executes a simulation command and returns a status message.
     fn execute_sim_command(&mut self, cmd: &SimCommand) -> Result<String, String> {
+        if self.mode == TuiMode::Viewer {
+            return match cmd {
+                SimCommand::Quit => {
+                    self.should_quit = true;
+                    Ok("Quitting".into())
+                }
+                SimCommand::Help => Ok(help_text()),
+                SimCommand::Signals => {
+                    let mut s = format!("{} signal(s):\n", self.signal_info.len());
+                    for info in &self.signal_info {
+                        s.push_str(&format!("  {} [{} bit]\n", info.name, info.width));
+                    }
+                    Ok(s.trim_end().to_string())
+                }
+                SimCommand::Time => Ok(format!("Time: {}", self.time_str())),
+                SimCommand::Inspect { signals } => {
+                    let mut output = String::new();
+                    for name in signals {
+                        let mut found = false;
+                        for (i, info) in self.signal_info.iter().enumerate() {
+                            if info.name == *name || info.name.ends_with(&format!(".{name}")) {
+                                let val_str = self.signal_value_str(i);
+                                output.push_str(&format!("{} = {val_str}\n", info.name));
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            output.push_str(&format!("Signal not found: {name}\n"));
+                        }
+                    }
+                    Ok(output.trim_end().to_string())
+                }
+                _ => Err("not available in viewer mode".into()),
+            };
+        }
+
         match cmd {
             SimCommand::Run { duration_fs } => {
                 self.run_for(*duration_fs).map_err(|e| e.to_string())?;
@@ -223,11 +336,12 @@ impl TuiApp {
                 }
             }
             SimCommand::Inspect { signals } => {
+                let kernel = self.kernel.as_ref().unwrap();
                 let mut output = String::new();
                 for name in signals {
-                    match self.kernel.find_signal(name) {
+                    match kernel.find_signal(name) {
                         Some(id) => {
-                            let val = self.kernel.signal_value(id);
+                            let val = kernel.signal_value(id);
                             output.push_str(&format!("{name} = {}\n", format_value(val)));
                         }
                         None => {
@@ -250,14 +364,16 @@ impl TuiApp {
                 Ok("Quitting".into())
             }
             SimCommand::Help => Ok(help_text()),
-            SimCommand::Status => Ok(format!(
-                "Time: {}\nSignals: {}\nFinished: {}",
-                self.time_str(),
-                self.signal_info.len(),
-                self.kernel.is_finished()
-            )),
+            SimCommand::Status => {
+                let finished = self.is_finished();
+                Ok(format!(
+                    "Time: {}\nSignals: {}\nFinished: {finished}",
+                    self.time_str(),
+                    self.signal_info.len(),
+                ))
+            }
             SimCommand::Continue => {
-                while !self.kernel.is_finished() && self.kernel.has_pending_events() {
+                while !self.is_finished() && self.has_pending_events() {
                     let result = self.step().map_err(|e| e.to_string())?;
                     if result == StepResult::Done {
                         break;
@@ -300,10 +416,12 @@ impl TuiApp {
 
     /// Snapshots current signal values into waveform data.
     fn snapshot_signals(&mut self) {
-        let time_fs = self.kernel.current_time().fs;
-        for (i, info) in self.signal_info.iter().enumerate() {
-            let val = self.kernel.signal_value(info.id).clone();
-            self.waveform.record(i, time_fs, val);
+        if let Some(ref kernel) = self.kernel {
+            let time_fs = kernel.current_time().fs;
+            for (i, info) in self.signal_info.iter().enumerate() {
+                let val = kernel.signal_value(info.id).clone();
+                self.waveform.record(i, time_fs, val);
+            }
         }
     }
 
@@ -355,7 +473,11 @@ impl TuiApp {
                 self.state.viewport.zoom_out(self.state.cursor_fs);
             }
             KeyCode::Char(' ') => {
-                let _ = self.step();
+                if self.mode == TuiMode::Simulation {
+                    let _ = self.step();
+                } else {
+                    self.state.status_message = "Viewer mode: simulation not available".into();
+                }
             }
             KeyCode::Char(':') => {
                 self.state.mode = InputMode::Command;
@@ -372,9 +494,8 @@ impl TuiApp {
             }
             KeyCode::Char('f') => {
                 let max_t = self.waveform.max_time();
-                self.state
-                    .viewport
-                    .fit(max_t.max(self.kernel.current_time().fs));
+                let kernel_t = self.kernel.as_ref().map_or(0, |k| k.current_time().fs);
+                self.state.viewport.fit(max_t.max(kernel_t));
             }
             KeyCode::Enter => {
                 self.state.toggle_waveform_signal();
@@ -460,7 +581,7 @@ Commands:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aion_common::{ContentHash, Ident, Interner};
+    use aion_common::{ContentHash, Ident, Interner, LogicVec};
     use aion_ir::arena::Arena;
     use aion_ir::{
         Assignment, Design, Expr, Module, ModuleId, Signal, SignalId, SignalKind, SignalRef,
@@ -546,6 +667,8 @@ mod tests {
         assert!(!app.should_quit);
         assert_eq!(app.signal_info.len(), 2);
         assert_eq!(app.waveform.signal_count(), 2);
+        assert_eq!(app.mode, TuiMode::Simulation);
+        assert!(app.kernel.is_some());
     }
 
     #[test]
@@ -832,5 +955,103 @@ mod tests {
         let design = make_bus_design();
         let app = TuiApp::new(&design, &make_bus_interner()).unwrap();
         assert_eq!(app.bit_value_str(999, 0), "?");
+    }
+
+    // -- Viewer mode tests --
+
+    fn make_viewer_app() -> TuiApp {
+        let mut waveform = WaveformData::new();
+        let id0 = aion_sim::SimSignalId::from_raw(0);
+        let id1 = aion_sim::SimSignalId::from_raw(1);
+        waveform.register(id0, "top.clk".into(), 1);
+        waveform.register(id1, "top.data".into(), 4);
+        waveform.record(0, 0, LogicVec::from_bool(false));
+        waveform.record(0, 100, LogicVec::from_bool(true));
+        waveform.record(1, 0, LogicVec::from_u64(0, 4));
+        waveform.record(1, 100, LogicVec::from_u64(5, 4));
+
+        let signal_info = vec![
+            SignalInfo {
+                id: id0,
+                name: "top.clk".into(),
+                width: 1,
+            },
+            SignalInfo {
+                id: id1,
+                name: "top.data".into(),
+                width: 4,
+            },
+        ];
+
+        TuiApp::from_waveform(waveform, signal_info)
+    }
+
+    #[test]
+    fn viewer_mode_construction() {
+        let app = make_viewer_app();
+        assert_eq!(app.mode, TuiMode::Viewer);
+        assert!(app.kernel.is_none());
+        assert!(app.initialized);
+        assert_eq!(app.signal_info.len(), 2);
+    }
+
+    #[test]
+    fn viewer_mode_no_step() {
+        let mut app = make_viewer_app();
+        let result = app.step();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn viewer_mode_signal_value_at_cursor() {
+        let mut app = make_viewer_app();
+        app.state.cursor_fs = 0;
+        // clk = 0 at time 0
+        let val = app.signal_value_str(0);
+        assert_eq!(val, "0");
+
+        app.state.cursor_fs = 100;
+        // clk = 1 at time 100
+        let val = app.signal_value_str(0);
+        assert_eq!(val, "1");
+    }
+
+    #[test]
+    fn viewer_mode_key_handling_space() {
+        let mut app = make_viewer_app();
+        app.handle_normal_key(crossterm::event::KeyCode::Char(' '));
+        // Should show viewer mode message, not crash
+        assert!(app.state.status_message.contains("Viewer mode"));
+    }
+
+    #[test]
+    fn viewer_mode_zoom_fit() {
+        let mut app = make_viewer_app();
+        app.handle_normal_key(crossterm::event::KeyCode::Char('f'));
+        // Should not panic (no kernel to call current_time on)
+    }
+
+    #[test]
+    fn viewer_mode_sim_command_rejected() {
+        let mut app = make_viewer_app();
+        let result = app.execute_command("run 100ns");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not available"));
+    }
+
+    #[test]
+    fn viewer_mode_quit_works() {
+        let mut app = make_viewer_app();
+        let _ = app.execute_command("quit");
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn viewer_mode_time_str() {
+        let mut app = make_viewer_app();
+        app.state.cursor_fs = 100;
+        let t = app.time_str();
+        // Should use cursor time in viewer mode
+        assert!(t.contains("100"));
     }
 }

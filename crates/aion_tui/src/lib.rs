@@ -39,10 +39,11 @@ use aion_common::Interner;
 use aion_ir::Design;
 use aion_sim::SimError;
 
-use app::TuiApp;
+use app::{SignalInfo, TuiApp, TuiMode};
 use event::{poll_event, TuiEvent};
 use state::InputMode;
 use terminal::{init_terminal, install_panic_hook, restore_terminal};
+use waveform_data::WaveformData;
 
 /// Runs the TUI interactive simulator on an elaborated design.
 ///
@@ -66,13 +67,65 @@ pub fn run_tui(design: &Design, interner: &Interner) -> Result<(), SimError> {
     let mut app = TuiApp::new(design, interner)?;
     app.initialize()?;
 
-    // Main event loop
+    run_tui_loop(&mut app, &mut terminal)?;
+
+    restore_terminal().map_err(|e| {
+        SimError::WaveformIo(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+    })?;
+
+    Ok(())
+}
+
+/// Runs the TUI waveform viewer on pre-loaded waveform data.
+///
+/// Sets up the terminal, creates a `TuiApp` in viewer mode (no kernel),
+/// and runs the main event loop. Simulation commands are unavailable;
+/// only waveform navigation and inspection are supported.
+///
+/// # Errors
+///
+/// Returns `SimError` on I/O errors during terminal setup or rendering.
+pub fn run_tui_viewer(
+    waveform: WaveformData,
+    signal_info: Vec<SignalInfo>,
+) -> Result<(), SimError> {
+    install_panic_hook();
+
+    let mut terminal = init_terminal().map_err(|e| {
+        SimError::WaveformIo(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+    })?;
+
+    let mut app = TuiApp::from_waveform(waveform, signal_info);
+
+    run_tui_loop(&mut app, &mut terminal)?;
+
+    restore_terminal().map_err(|e| {
+        SimError::WaveformIo(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+    })?;
+
+    Ok(())
+}
+
+/// Shared event loop for both simulation and viewer modes.
+fn run_tui_loop(
+    app: &mut TuiApp,
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> Result<(), SimError> {
     let tick_rate = Duration::from_millis(50);
 
     loop {
         // Render
         terminal
-            .draw(|frame| render::render(&app, frame))
+            .draw(|frame| render::render(app, frame))
             .map_err(|e| {
                 SimError::WaveformIo(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -87,10 +140,11 @@ pub fn run_tui(design: &Design, interner: &Interner) -> Result<(), SimError> {
                 InputMode::Command => app.handle_command_key(key.code),
             },
             Ok(TuiEvent::Tick) => {
-                // Auto-run: step simulation if running
-                if app.state.auto_running
-                    && !app.kernel.is_finished()
-                    && app.kernel.has_pending_events()
+                // Auto-run: step simulation if running (simulation mode only)
+                if app.mode == TuiMode::Simulation
+                    && app.state.auto_running
+                    && !app.is_finished()
+                    && app.has_pending_events()
                 {
                     let _ = app.step();
                 }
@@ -112,20 +166,13 @@ pub fn run_tui(design: &Design, interner: &Interner) -> Result<(), SimError> {
         }
     }
 
-    restore_terminal().map_err(|e| {
-        SimError::WaveformIo(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aion_common::{ContentHash, Ident, Interner};
+    use aion_common::{ContentHash, Ident, Interner, LogicVec};
     use aion_ir::arena::Arena;
     use aion_ir::{
         Design, Module, ModuleId, Signal, SignalId, SignalKind, SourceMap, Type, TypeDb,
@@ -213,5 +260,45 @@ mod tests {
         app.handle_normal_key(KeyCode::Char('?'));
         app.handle_normal_key(KeyCode::Tab);
         app.handle_normal_key(KeyCode::Enter);
+    }
+
+    #[test]
+    fn viewer_app_can_be_constructed() {
+        let mut waveform = WaveformData::new();
+        let id = aion_sim::SimSignalId::from_raw(0);
+        waveform.register(id, "top.clk".into(), 1);
+        waveform.record(0, 0, LogicVec::from_bool(false));
+
+        let signal_info = vec![SignalInfo {
+            id,
+            name: "top.clk".into(),
+            width: 1,
+        }];
+
+        let app = TuiApp::from_waveform(waveform, signal_info);
+        assert_eq!(app.mode, TuiMode::Viewer);
+        assert!(app.initialized);
+        assert!(app.kernel.is_none());
+    }
+
+    #[test]
+    fn viewer_key_handling_does_not_panic() {
+        let mut waveform = WaveformData::new();
+        let id = aion_sim::SimSignalId::from_raw(0);
+        waveform.register(id, "top.clk".into(), 1);
+        waveform.record(0, 0, LogicVec::from_bool(false));
+
+        let signal_info = vec![SignalInfo {
+            id,
+            name: "top.clk".into(),
+            width: 1,
+        }];
+
+        let mut app = TuiApp::from_waveform(waveform, signal_info);
+        app.handle_normal_key(KeyCode::Char('j'));
+        app.handle_normal_key(KeyCode::Char('k'));
+        app.handle_normal_key(KeyCode::Char(' ')); // Should not crash in viewer mode
+        app.handle_normal_key(KeyCode::Char('f'));
+        app.handle_normal_key(KeyCode::Char('?'));
     }
 }

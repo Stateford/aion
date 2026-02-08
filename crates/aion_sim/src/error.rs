@@ -76,6 +76,13 @@ pub enum SimError {
         /// The maximum number of delta cycles allowed.
         max_deltas: u32,
     },
+
+    /// A general-purpose error for situations not covered by other variants.
+    #[error("{message}")]
+    Other {
+        /// Description of the error.
+        message: String,
+    },
 }
 
 #[cfg(test)]

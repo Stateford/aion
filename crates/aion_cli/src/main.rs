@@ -1,8 +1,9 @@
 //! Aion CLI — the command-line interface for the Aion FPGA toolchain.
 //!
 //! Provides `aion init` for project scaffolding, `aion lint` for static analysis,
-//! `aion sim` for running individual testbench simulations, and `aion test` for
-//! discovering and running all testbenches in a project.
+//! `aion sim` for running individual testbench simulations, `aion test` for
+//! discovering and running all testbenches, and `aion view` for viewing
+//! previously saved waveform files in the TUI.
 
 #![warn(missing_docs)]
 
@@ -11,6 +12,7 @@ mod lint;
 mod pipeline;
 mod sim;
 mod test;
+mod view;
 
 use std::process;
 
@@ -64,6 +66,8 @@ pub enum Command {
     Sim(SimArgs),
     /// Discover and run all testbenches.
     Test(TestArgs),
+    /// View a previously saved waveform file in the TUI.
+    View(ViewArgs),
 }
 
 /// Arguments for the `aion lint` subcommand.
@@ -134,6 +138,13 @@ pub struct TestArgs {
     /// Disable waveform recording for all testbenches.
     #[arg(long)]
     pub no_waveform: bool,
+}
+
+/// Arguments for the `aion view` subcommand.
+#[derive(Parser, Debug)]
+pub struct ViewArgs {
+    /// Path to the waveform file to view (e.g., output.vcd).
+    pub file: String,
 }
 
 /// Waveform output format.
@@ -212,6 +223,7 @@ fn main() {
         Command::Lint(ref args) => lint::run(args, &global),
         Command::Sim(ref args) => sim::run(args, &global),
         Command::Test(ref args) => test::run(args, &global),
+        Command::View(ref args) => view::run(args, &global),
     };
 
     match result {
@@ -535,6 +547,30 @@ mod tests {
                 assert!(args.interactive);
             }
             _ => panic!("expected Sim command"),
+        }
+    }
+
+    // -- View command parsing tests --
+
+    #[test]
+    fn parse_view_basic() {
+        let cli = Cli::parse_from(["aion", "view", "output.vcd"]);
+        match cli.command {
+            Command::View(ref args) => {
+                assert_eq!(args.file, "output.vcd");
+            }
+            _ => panic!("expected View command"),
+        }
+    }
+
+    #[test]
+    fn parse_view_with_path() {
+        let cli = Cli::parse_from(["aion", "view", "/tmp/sim/waves.vcd"]);
+        match cli.command {
+            Command::View(ref args) => {
+                assert_eq!(args.file, "/tmp/sim/waves.vcd");
+            }
+            _ => panic!("expected View command"),
         }
     }
 

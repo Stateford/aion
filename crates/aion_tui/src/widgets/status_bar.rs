@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
-use crate::app::TuiApp;
+use crate::app::{TuiApp, TuiMode};
 use crate::state::InputMode;
 
 /// Renders the status bar into the given area.
@@ -18,17 +18,22 @@ pub fn render_status_bar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let mode_str = match app.state.mode {
-        InputMode::Normal => "NORMAL",
-        InputMode::Command => "COMMAND",
+    let mode_str = match (&app.mode, &app.state.mode) {
+        (TuiMode::Viewer, _) => "VIEWER",
+        (_, InputMode::Normal) => "NORMAL",
+        (_, InputMode::Command) => "COMMAND",
     };
 
-    let mode_style = match app.state.mode {
-        InputMode::Normal => Style::default()
+    let mode_style = match (&app.mode, &app.state.mode) {
+        (TuiMode::Viewer, _) => Style::default()
+            .bg(Color::Green)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+        (_, InputMode::Normal) => Style::default()
             .bg(Color::Blue)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
-        InputMode::Command => Style::default()
+        (_, InputMode::Command) => Style::default()
             .bg(Color::Yellow)
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD),
@@ -36,12 +41,19 @@ pub fn render_status_bar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     let time_str = app.time_str();
     let signal_count = app.signal_info.len();
-    let finished = if app.kernel.is_finished() {
+
+    let finished = if app.mode == TuiMode::Viewer {
+        ""
+    } else if app.is_finished() {
         " [DONE]"
     } else {
         ""
     };
-    let auto = if app.state.auto_running { " [RUN]" } else { "" };
+    let auto = if app.mode == TuiMode::Simulation && app.state.auto_running {
+        " [RUN]"
+    } else {
+        ""
+    };
 
     let status_msg = if app.state.status_message.is_empty() {
         String::new()
@@ -77,12 +89,15 @@ pub fn render_status_bar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aion_common::{ContentHash, Ident, Interner};
+    use aion_common::{ContentHash, Ident, Interner, LogicVec};
     use aion_ir::arena::Arena;
     use aion_ir::{
         Design, Module, ModuleId, Signal, SignalId, SignalKind, SourceMap, Type, TypeDb,
     };
     use aion_source::Span as IrSpan;
+
+    use crate::app::SignalInfo;
+    use crate::waveform_data::WaveformData;
 
     fn make_test_interner() -> Interner {
         let interner = Interner::new();
@@ -178,5 +193,28 @@ mod tests {
         let area = Rect::new(0, 0, 80, 1);
         let mut buf = Buffer::empty(area);
         render_status_bar(&app, area, &mut buf);
+    }
+
+    #[test]
+    fn render_status_bar_viewer_mode() {
+        let mut waveform = WaveformData::new();
+        let id = aion_sim::SimSignalId::from_raw(0);
+        waveform.register(id, "top.clk".into(), 1);
+        waveform.record(0, 0, LogicVec::from_bool(false));
+
+        let signal_info = vec![SignalInfo {
+            id,
+            name: "top.clk".into(),
+            width: 1,
+        }];
+
+        let app = TuiApp::from_waveform(waveform, signal_info);
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&app, area, &mut buf);
+        let content: String = (0..80)
+            .map(|x| buf.get(x, 0u16).symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(content.contains("VIEWER"));
     }
 }
