@@ -24,7 +24,7 @@
 | `aion_elaborate` | 🟢 Complete | 113 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, all 3 languages |
 | `aion_lint` | 🟢 Complete | 91 | LintEngine, 15 rules (W101-W108, E102/E104/E105, C201-C204), IR traversal helpers |
 | `aion_cache` | 🟡 Stub only | — | Content-hash caching for parsed ASTs |
-| `aion_cli` | 🟡 Stub only | — | `init`, `lint` commands |
+| `aion_cli` | 🟢 Complete | 38 | CLI entry point: `init` (scaffolding) and `lint` (full pipeline) commands |
 
 ### Phase 0 Checklist
 
@@ -40,9 +40,9 @@
 - [x] `aion_ir` — core IR type definitions
 - [x] `aion_elaborate` — AST→IR elaboration engine
 - [x] `aion_lint` — lint rules and engine (15 rules)
-- [ ] `aion_cli` — `init` and `lint` commands
+- [x] `aion_cli` — `init` and `lint` commands
 - [ ] `aion_cache` — basic content-hash caching
-- [ ] Human-readable error output with source spans
+- [x] Human-readable error output with source spans
 - [ ] Parse + lint completes in <1s on test projects
 
 ### Milestone Criteria
@@ -57,6 +57,50 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-07 — aion_cli init and lint commands
+
+**Crate:** `aion_cli`
+
+**What:** Implemented the CLI entry point with two fully functional commands:
+
+- `main.rs` — Clap-based CLI with `Cli` struct (derive API), `Command` enum (`Init`/`Lint` variants), supporting enums (`ColorChoice`, `HdlLanguage`, `ReportFormat`), `GlobalArgs` for resolved settings, main dispatch loop with exit codes, basic terminal detection
+- `init.rs` — `aion init` project scaffolding:
+  - Creates standard directory structure: `src/`, `tests/`, `constraints/`, `ip/`
+  - Generates `aion.toml` with project metadata (parseable by `aion_config`)
+  - Generates template top module and testbench for all 3 languages (SystemVerilog, Verilog, VHDL)
+  - Optional `--target` flag adds `[targets.default]` section
+  - Cargo-style progress messages
+- `lint.rs` — `aion lint` full static analysis pipeline:
+  - Finds project root by walking up directories for `aion.toml`
+  - Loads config via `aion_config::load_config()`
+  - Discovers HDL source files recursively in `src/` (`.v`, `.sv`, `.vhd`, `.vhdl`)
+  - Parses each file with the correct language parser
+  - Elaborates into unified IR via `aion_elaborate::elaborate()`
+  - Merges CLI `--allow`/`--deny` flags with `aion.toml` lint config (CLI takes precedence)
+  - Runs `LintEngine` with 15 rules
+  - Renders diagnostics via `TerminalRenderer` (text) or JSON output
+  - Prints summary (error/warning counts), exits 1 on errors
+
+**Key design decisions:**
+- CLI flags: `--quiet`, `--verbose`, `--color`, `--config` as global args; subcommand-specific args under each command
+- `init` extracts project name from directory basename (not full path)
+- `lint` uses `find_project_root()` for Cargo-like discovery from any subdirectory
+- `merge_lint_config()` gives CLI flags precedence over `aion.toml` settings
+- JSON output via `serde_json` for machine-readable diagnostics
+- End-to-end test: `init` a project then `lint` it — verifying the full pipeline works
+
+**Tests added:** 38 tests
+- 13 main.rs tests (clap parsing: init default/with-args, lint default/with-args, global flags quiet/verbose/color variants, config path, language variants, multiple allow)
+- 10 init.rs tests (directory structure creation, VHDL/Verilog/SV file generation, valid toml generation, target section, existing dir error, current dir init, extension mappings)
+- 15 lint.rs tests (find_project_root current/parent/not-found, detect_language all variants/unknown, discover_files finds-hdl/recursive/empty, merge_config deny-overrides/allow-overrides/combines/empty, end-to-end init+lint)
+
+**Test results:** 808 passed, 0 failed (770 previous + 38 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Docs:** Clean (zero warnings from `cargo doc`)
+**Next:** CI/CD pipeline, `aion_cache` implementation, conformance testing on real HDL projects
+
+---
 
 #### 2026-02-08 — aion_lint lint rules and engine
 
