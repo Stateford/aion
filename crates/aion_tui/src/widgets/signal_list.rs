@@ -26,25 +26,58 @@ pub fn render_signal_list(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let items: Vec<ListItem> = app
-        .signal_info
-        .iter()
-        .enumerate()
-        .map(|(i, info)| {
-            let name = &info.name;
-            let width = info.width;
-            let val = app.signal_value_str(i);
-            let in_waveform = app.state.waveform_signals.contains(&i);
-            let marker = if in_waveform { "+" } else { " " };
-            let line = Line::from(vec![
-                Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
-                Span::styled(name.to_string(), Style::default().fg(Color::White)),
-                Span::styled(format!(" [{width}]"), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!(" = {val}"), Style::default().fg(Color::Yellow)),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut selected_display_row = 0;
+
+    for (i, info) in app.signal_info.iter().enumerate() {
+        if i == app.state.selected_signal {
+            selected_display_row = items.len();
+        }
+
+        let name = &info.name;
+        let width = info.width;
+        let val = app.signal_value_str(i);
+        let in_waveform = app.state.waveform_signals.contains(&i);
+        let marker = if in_waveform { "+" } else { " " };
+
+        // Show expand/collapse indicator for buses
+        let expand = if width > 1 {
+            if app.state.expanded_signals.contains(&i) {
+                "\u{25BC}" // ▼
+            } else {
+                "\u{25B6}" // ▶
+            }
+        } else {
+            " "
+        };
+
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{marker}{expand}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(name.to_string(), Style::default().fg(Color::White)),
+            Span::styled(format!(" [{width}]"), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" = {val}"), Style::default().fg(Color::Yellow)),
+        ]);
+        items.push(ListItem::new(line));
+
+        // Show bit sub-entries when expanded
+        if width > 1 && app.state.expanded_signals.contains(&i) {
+            for bit in (0..width).rev() {
+                let bit_val = app.bit_value_str(i, bit);
+                let bit_line = Line::from(vec![
+                    Span::styled("   ", Style::default()),
+                    Span::styled(
+                        format!("{name}[{bit}]"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(format!(" = {bit_val}"), Style::default().fg(Color::Yellow)),
+                ]);
+                items.push(ListItem::new(bit_line));
+            }
+        }
+    }
 
     let highlight_style = Style::default()
         .bg(Color::DarkGray)
@@ -56,7 +89,7 @@ pub fn render_signal_list(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     let mut list_state = ListState::default();
     if !app.signal_info.is_empty() {
-        list_state.select(Some(app.state.selected_signal));
+        list_state.select(Some(selected_display_row));
     }
 
     StatefulWidget::render(list, area, buf, &mut list_state);

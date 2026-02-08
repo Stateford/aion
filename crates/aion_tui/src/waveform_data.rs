@@ -4,7 +4,7 @@
 //! captures signal values after each simulation step, building a per-signal
 //! change log that supports efficient time-based lookup for waveform rendering.
 
-use aion_common::LogicVec;
+use aion_common::{Logic, LogicVec};
 use aion_sim::SimSignalId;
 
 /// A single value change event for a signal.
@@ -83,6 +83,14 @@ impl SignalHistory {
         };
 
         &self.changes[start_idx..end_idx]
+    }
+
+    /// Returns the value of a single bit at a given time.
+    ///
+    /// Extracts bit `bit` from the bus value at `time_fs`.
+    /// Returns `None` if no data exists before that time.
+    pub fn bit_value_at(&self, time_fs: u64, bit: u32) -> Option<Logic> {
+        self.value_at(time_fs).map(|v| v.get(bit))
     }
 
     /// Returns the maximum time recorded, or 0 if empty.
@@ -283,6 +291,25 @@ mod tests {
         assert_eq!(hist.value_at(0).unwrap().to_u64(), Some(0x00));
         assert_eq!(hist.value_at(150).unwrap().to_u64(), Some(0xFF));
         assert_eq!(hist.value_at(200).unwrap().to_u64(), Some(0x42));
+    }
+
+    #[test]
+    fn signal_history_bit_value_at() {
+        let mut hist = SignalHistory::new(make_id(0), "bus".into(), 8);
+        hist.record(0, LogicVec::from_u64(0x00, 8));
+        hist.record(100, LogicVec::from_u64(0x05, 8)); // bits: 0000_0101
+
+        // At time 100, bit 0 = 1, bit 1 = 0, bit 2 = 1, bit 3 = 0
+        assert_eq!(hist.bit_value_at(100, 0), Some(Logic::One));
+        assert_eq!(hist.bit_value_at(100, 1), Some(Logic::Zero));
+        assert_eq!(hist.bit_value_at(100, 2), Some(Logic::One));
+        assert_eq!(hist.bit_value_at(100, 3), Some(Logic::Zero));
+    }
+
+    #[test]
+    fn signal_history_bit_value_at_empty() {
+        let hist = SignalHistory::new(make_id(0), "bus".into(), 8);
+        assert_eq!(hist.bit_value_at(0, 0), None);
     }
 
     #[test]

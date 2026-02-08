@@ -3,6 +3,8 @@
 //! Contains the viewport (time window and zoom level), input mode,
 //! focus tracking, and signal selection state.
 
+use std::collections::HashSet;
+
 /// Which panel currently has keyboard focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusedPanel {
@@ -156,6 +158,8 @@ pub struct TuiState {
     pub waveform_signals: Vec<usize>,
     /// Whether help popup is visible.
     pub show_help: bool,
+    /// Set of signal indices whose bus bits are expanded in the waveform.
+    pub expanded_signals: HashSet<usize>,
 }
 
 /// How signal values are displayed.
@@ -198,6 +202,7 @@ impl TuiState {
             value_format: ValueFormat::Hex,
             waveform_signals,
             show_help: false,
+            expanded_signals: HashSet::new(),
         }
     }
 
@@ -415,6 +420,12 @@ mod tests {
         assert_eq!(ValueFormat::Hex.cycle(), ValueFormat::Binary);
         assert_eq!(ValueFormat::Binary.cycle(), ValueFormat::Decimal);
         assert_eq!(ValueFormat::Decimal.cycle(), ValueFormat::Hex);
+    }
+
+    #[test]
+    fn state_expanded_signals_default_empty() {
+        let state = TuiState::new(3);
+        assert!(state.expanded_signals.is_empty());
     }
 
     #[test]

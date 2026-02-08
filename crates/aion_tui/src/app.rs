@@ -269,6 +269,35 @@ impl TuiApp {
         }
     }
 
+    /// Toggles bus expansion for the currently selected signal.
+    ///
+    /// Only multi-bit signals can be expanded. When expanded, individual
+    /// bit traces are shown below the bus in the waveform panel.
+    pub fn toggle_expand(&mut self) {
+        let idx = self.state.selected_signal;
+        if let Some(info) = self.signal_info.get(idx) {
+            if info.width > 1 && !self.state.expanded_signals.remove(&idx) {
+                self.state.expanded_signals.insert(idx);
+            }
+        }
+    }
+
+    /// Returns the formatted value of a single bit at the current cursor time.
+    pub fn bit_value_str(&self, signal_idx: usize, bit: u32) -> String {
+        if let Some(history) = self.waveform.signals.get(signal_idx) {
+            if let Some(logic) = history.bit_value_at(self.state.cursor_fs, bit) {
+                return match logic {
+                    aion_common::Logic::Zero => "0",
+                    aion_common::Logic::One => "1",
+                    aion_common::Logic::X => "x",
+                    aion_common::Logic::Z => "z",
+                }
+                .into();
+            }
+        }
+        "?".into()
+    }
+
     /// Snapshots current signal values into waveform data.
     fn snapshot_signals(&mut self) {
         let time_fs = self.kernel.current_time().fs;
@@ -334,6 +363,9 @@ impl TuiApp {
             }
             KeyCode::Char('?') => {
                 self.state.show_help = !self.state.show_help;
+            }
+            KeyCode::Char('e') => {
+                self.toggle_expand();
             }
             KeyCode::Char('d') => {
                 self.state.value_format = self.state.value_format.cycle();
@@ -404,6 +436,7 @@ Navigation:
   f              Fit to time range
   Space          Step simulation
   Enter          Toggle signal in waveform
+  e              Expand/collapse bus bits
   Tab            Switch panel focus
   d              Cycle value format (hex/bin/dec)
   ?              Toggle help
@@ -662,5 +695,142 @@ mod tests {
         assert_eq!(app.state.focused, FocusedPanel::CommandInput);
         app.handle_normal_key(crossterm::event::KeyCode::Tab);
         assert_eq!(app.state.focused, FocusedPanel::SignalList);
+    }
+
+    fn make_bus_interner() -> Interner {
+        let interner = Interner::new();
+        interner.get_or_intern("__dummy__"); // 0
+        interner.get_or_intern("top"); // 1
+        interner.get_or_intern("clk"); // 2
+        interner.get_or_intern("count"); // 3
+        interner
+    }
+
+    fn make_bus_design() -> Design {
+        let mut types = TypeDb::new();
+        types.intern(Type::Bit); // 0
+        types.intern(Type::BitVec {
+            width: 8,
+            signed: false,
+        }); // 1
+        let bit_ty = aion_ir::TypeId::from_raw(0);
+        let bus_ty = aion_ir::TypeId::from_raw(1);
+
+        let mut top = Module {
+            id: ModuleId::from_raw(0),
+            name: Ident::from_raw(1),
+            span: Span::DUMMY,
+            params: Vec::new(),
+            ports: Vec::new(),
+            signals: Arena::new(),
+            cells: Arena::new(),
+            processes: Arena::new(),
+            assignments: Vec::new(),
+            clock_domains: Vec::new(),
+            content_hash: ContentHash::from_bytes(b"bus_test"),
+        };
+
+        top.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: Ident::from_raw(2), // clk
+            ty: bit_ty,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+
+        top.signals.alloc(Signal {
+            id: SignalId::from_raw(1),
+            name: Ident::from_raw(3), // count
+            ty: bus_ty,
+            kind: SignalKind::Reg,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+
+        let mut modules = Arena::new();
+        modules.alloc(top);
+
+        Design {
+            modules,
+            top: ModuleId::from_raw(0),
+            types,
+            source_map: SourceMap::new(),
+        }
+    }
+
+    #[test]
+    fn toggle_expand_bus_signal() {
+        let design = make_bus_design();
+        let mut app = TuiApp::new(&design, &make_bus_interner()).unwrap();
+
+        // Signal 1 is 8-bit bus, signal 0 is 1-bit
+        assert!(app.state.expanded_signals.is_empty());
+
+        // Select bus signal and expand
+        app.state.selected_signal = 1;
+        app.toggle_expand();
+        assert!(app.state.expanded_signals.contains(&1));
+
+        // Toggle again to collapse
+        app.toggle_expand();
+        assert!(!app.state.expanded_signals.contains(&1));
+    }
+
+    #[test]
+    fn toggle_expand_1bit_noop() {
+        let design = make_bus_design();
+        let mut app = TuiApp::new(&design, &make_bus_interner()).unwrap();
+
+        // Select 1-bit signal, expand should do nothing
+        app.state.selected_signal = 0;
+        app.toggle_expand();
+        assert!(app.state.expanded_signals.is_empty());
+    }
+
+    #[test]
+    fn expand_key_binding() {
+        let design = make_bus_design();
+        let mut app = TuiApp::new(&design, &make_bus_interner()).unwrap();
+
+        app.state.selected_signal = 1;
+        app.handle_normal_key(crossterm::event::KeyCode::Char('e'));
+        assert!(app.state.expanded_signals.contains(&1));
+
+        app.handle_normal_key(crossterm::event::KeyCode::Char('e'));
+        assert!(!app.state.expanded_signals.contains(&1));
+    }
+
+    #[test]
+    fn bit_value_str_with_data() {
+        let design = make_bus_design();
+        let mut app = TuiApp::new(&design, &make_bus_interner()).unwrap();
+        app.initialize().unwrap();
+
+        // Record a bus value: 0x05 = 0000_0101
+        app.waveform
+            .record(1, 0, aion_common::LogicVec::from_u64(0x05, 8));
+        app.state.cursor_fs = 0;
+
+        assert_eq!(app.bit_value_str(1, 0), "1");
+        assert_eq!(app.bit_value_str(1, 1), "0");
+        assert_eq!(app.bit_value_str(1, 2), "1");
+        assert_eq!(app.bit_value_str(1, 7), "0");
+    }
+
+    #[test]
+    fn bit_value_str_no_data() {
+        let design = make_bus_design();
+        let app = TuiApp::new(&design, &make_bus_interner()).unwrap();
+        assert_eq!(app.bit_value_str(1, 0), "?");
+    }
+
+    #[test]
+    fn bit_value_str_out_of_bounds() {
+        let design = make_bus_design();
+        let app = TuiApp::new(&design, &make_bus_interner()).unwrap();
+        assert_eq!(app.bit_value_str(999, 0), "?");
     }
 }

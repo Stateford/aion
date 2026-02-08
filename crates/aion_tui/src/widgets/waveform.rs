@@ -53,12 +53,23 @@ pub fn render_waveform(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 render_1bit_signal(app, sig_idx, inner.x, row, inner.width, buf);
                 row += 2;
             } else {
-                // Not enough room for 2-row waveform, skip
                 break;
             }
         } else {
             render_bus_signal(app, sig_idx, inner.x, row, inner.width, buf);
             row += 1;
+
+            // Render individual bit traces when bus is expanded
+            if app.state.expanded_signals.contains(&sig_idx) {
+                for bit in (0..width).rev() {
+                    let rows_available = (inner.y + inner.height).saturating_sub(row);
+                    if rows_available < 2 {
+                        break;
+                    }
+                    render_bus_bit(app, sig_idx, bit, inner.x, row, inner.width, buf);
+                    row += 2;
+                }
+            }
         }
     }
 
@@ -150,43 +161,90 @@ fn render_1bit_signal(
         None => return,
     };
 
+    render_1bit_trace(
+        |time_fs| history.value_at(time_fs).map(|v| v.get(0)),
+        &app.state.viewport,
+        Color::Green,
+        x_start,
+        row,
+        width,
+        buf,
+    );
+}
+
+/// Renders a single bit of a bus signal as a 1-bit waveform trace.
+fn render_bus_bit(
+    app: &TuiApp,
+    sig_idx: usize,
+    bit: u32,
+    x_start: u16,
+    row: u16,
+    width: u16,
+    buf: &mut Buffer,
+) {
+    let history = match app.waveform.signals.get(sig_idx) {
+        Some(h) => h,
+        None => return,
+    };
+
+    render_1bit_trace(
+        |time_fs| history.bit_value_at(time_fs, bit),
+        &app.state.viewport,
+        Color::Cyan,
+        x_start,
+        row,
+        width,
+        buf,
+    );
+}
+
+/// Core 1-bit trace renderer shared by standalone signals and bus bit views.
+///
+/// Takes a closure that maps a time (in fs) to an optional `Logic` value.
+/// Draws a 2-row waveform with box-drawing characters for transitions.
+fn render_1bit_trace<F>(
+    get_value: F,
+    viewport: &crate::state::ViewPort,
+    signal_color: Color,
+    x_start: u16,
+    row: u16,
+    width: u16,
+    buf: &mut Buffer,
+) where
+    F: Fn(u64) -> Option<Logic>,
+{
     let top_row = row;
     let bot_row = row + 1;
 
-    let style_signal = Style::default().fg(Color::Green);
+    let style_signal = Style::default().fg(signal_color);
     let style_xz = Style::default().fg(Color::Red);
     let style_dim = Style::default().fg(Color::DarkGray);
 
     for col in 0..width {
-        let time_fs = app.state.viewport.col_to_time(col, width);
+        let time_fs = viewport.col_to_time(col, width);
         let x = x_start + col;
         if x >= buf.area().right() {
             break;
         }
 
-        let val = history.value_at(time_fs);
+        let cur_bit = get_value(time_fs);
 
         // Detect transition from previous column
-        let prev_val = if col > 0 {
-            let prev_time = app.state.viewport.col_to_time(col - 1, width);
-            history.value_at(prev_time)
+        let prev_bit = if col > 0 {
+            let prev_time = viewport.col_to_time(col - 1, width);
+            get_value(prev_time)
         } else {
             None
         };
 
-        let is_transition = match (&prev_val, &val) {
+        let is_transition = match (&prev_bit, &cur_bit) {
             (Some(pv), Some(cv)) => pv != cv,
             _ => false,
         };
 
-        let prev_bit = prev_val.as_ref().map(|v| v.get(0));
-        let cur_bit = val.as_ref().map(|v| v.get(0));
-
         if top_row < buf.area().bottom() && bot_row < buf.area().bottom() {
             match cur_bit {
                 Some(Logic::One) if is_transition => {
-                    // Rising edge: └ on bottom, ┌ on top (but we draw at transition col)
-                    // Previous was low → this is high
                     buf.get_mut(x, top_row)
                         .set_char('\u{250C}') // ┌
                         .set_style(style_signal);
@@ -195,7 +253,6 @@ fn render_1bit_signal(
                         .set_style(style_signal);
                 }
                 Some(Logic::Zero) if is_transition => {
-                    // Falling edge: ┐ on top, └ on bottom
                     buf.get_mut(x, top_row)
                         .set_char('\u{2510}') // ┐
                         .set_style(style_signal);
@@ -224,7 +281,6 @@ fn render_1bit_signal(
                     buf.get_mut(x, bot_row).set_char('Z').set_style(style_xz);
                 }
                 None => {
-                    // Handle X→value or Z→value transitions
                     if is_transition && matches!(prev_bit, Some(Logic::X) | Some(Logic::Z)) {
                         buf.get_mut(x, top_row)
                             .set_char('\u{2502}') // │
@@ -484,6 +540,117 @@ mod tests {
             .record(0, 50_000_000, LogicVec::from_bool(true));
         app.state.viewport.fit(100_000_000);
 
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        render_waveform(&app, area, &mut buf);
+    }
+
+    fn make_bus_interner() -> Interner {
+        let interner = Interner::new();
+        interner.get_or_intern("__dummy__");
+        interner.get_or_intern("top");
+        interner.get_or_intern("clk");
+        interner.get_or_intern("count");
+        interner
+    }
+
+    fn make_bus_design() -> Design {
+        let mut types = TypeDb::new();
+        types.intern(Type::Bit);
+        types.intern(Type::BitVec {
+            width: 4,
+            signed: false,
+        });
+        let bit_ty = aion_ir::TypeId::from_raw(0);
+        let bus_ty = aion_ir::TypeId::from_raw(1);
+
+        let mut top = Module {
+            id: ModuleId::from_raw(0),
+            name: Ident::from_raw(1),
+            span: IrSpan::DUMMY,
+            params: Vec::new(),
+            ports: Vec::new(),
+            signals: Arena::new(),
+            cells: Arena::new(),
+            processes: Arena::new(),
+            assignments: Vec::new(),
+            clock_domains: Vec::new(),
+            content_hash: ContentHash::from_bytes(b"bus_test"),
+        };
+
+        top.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: Ident::from_raw(2),
+            ty: bit_ty,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: IrSpan::DUMMY,
+        });
+
+        top.signals.alloc(Signal {
+            id: SignalId::from_raw(1),
+            name: Ident::from_raw(3),
+            ty: bus_ty,
+            kind: SignalKind::Reg,
+            init: None,
+            clock_domain: None,
+            span: IrSpan::DUMMY,
+        });
+
+        let mut modules = Arena::new();
+        modules.alloc(top);
+
+        Design {
+            modules,
+            top: ModuleId::from_raw(0),
+            types,
+            source_map: SourceMap::new(),
+        }
+    }
+
+    #[test]
+    fn render_bus_expanded_does_not_panic() {
+        let design = make_bus_design();
+        let mut app = TuiApp::new(&design, &make_bus_interner()).unwrap();
+        app.initialize().unwrap();
+
+        // Record bus data
+        app.waveform.record(1, 0, LogicVec::from_u64(0x0, 4));
+        app.waveform
+            .record(1, 50_000_000, LogicVec::from_u64(0x5, 4));
+        app.state.viewport.fit(100_000_000);
+
+        // Expand bus signal
+        app.state.expanded_signals.insert(1);
+
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_waveform(&app, area, &mut buf);
+    }
+
+    #[test]
+    fn render_bus_expanded_small_area() {
+        let design = make_bus_design();
+        let mut app = TuiApp::new(&design, &make_bus_interner()).unwrap();
+        app.initialize().unwrap();
+        app.state.expanded_signals.insert(1);
+
+        // Very small area — should not panic even though bits can't fit
+        let area = Rect::new(0, 0, 20, 6);
+        let mut buf = Buffer::empty(area);
+        render_waveform(&app, area, &mut buf);
+    }
+
+    #[test]
+    fn render_bus_not_expanded() {
+        let design = make_bus_design();
+        let mut app = TuiApp::new(&design, &make_bus_interner()).unwrap();
+        app.initialize().unwrap();
+
+        app.waveform.record(1, 0, LogicVec::from_u64(0x0, 4));
+
+        // Bus NOT expanded — should render only bus row, no bit rows
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
         render_waveform(&app, area, &mut buf);

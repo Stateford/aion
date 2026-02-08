@@ -27,7 +27,7 @@
 | `aion_cli` | 🟢 Complete | 88 | CLI: `init`, `lint`, `sim`, `test` commands with shared pipeline, `--interactive` mode |
 | `aion_sim` | 🟢 Complete | 229 | Event-driven HDL simulator: kernel, evaluator, VCD/FST waveform, delta cycles, delay scheduling, interactive REPL |
 | `aion_conformance` | 🟢 Complete | 92 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 5 unit |
-| `aion_tui` | 🟢 Complete | 91 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping |
+| `aion_tui` | 🟢 Complete | 104 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping, bus expansion, cursor-time values |
 
 ### Phase 0 Checklist
 
@@ -60,6 +60,53 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — TUI bus expansion, cursor-time values, simulation fixes
+
+**Crates:** `aion_tui`, `aion_sim`
+
+**What:** Multiple TUI and simulator fixes plus a new bus expansion feature:
+
+**Fix 1: Counter not incrementing (kernel bug)**
+Root cause: `process_wakeups()` in `kernel.rs` applied signal updates immediately AND scheduled them as events. When `step_delta()` later processed those events, it saw no change (already applied) and never triggered sensitive processes (e.g., `always @(posedge clk)` counter logic).
+Fix: Removed `apply_update_immediate()` from `process_wakeups()` — updates now only flow through the event queue so `step_delta()` correctly detects changes and fires sensitivity.
+
+**Fix 2: $finish blocking pending events**
+`step_delta()` returned early when `self.finished` was true, preventing scheduled events from being applied after a continuation that does both `sig = 1; $finish`.
+Fix: Removed `self.finished` from `step_delta()`'s early-return guard.
+
+**Fix 3: Waveform showing flat lines after `:run`**
+`run_for()` called `kernel.run_until(target_fs)` in one shot, then only snapshotted once at the end. All intermediate transitions were lost.
+Fix: Step through each event time individually, snapshotting after each.
+
+**Fix 4: Verbose bus labels**
+Bus values displayed as `8'hff` (Verilog-style), unreadable when zoomed out.
+Fix: Replaced with compact hex format (`ff`). X/Z values use binary notation.
+
+**Fix 5: Signal values not tracking cursor position**
+`signal_value_str()` always read from `kernel.signal_value()` (final sim time), not the cursor position.
+Fix: Look up value from waveform history at `cursor_fs` first, fall back to kernel value.
+
+**Feature: Bus expansion ('e' key)**
+Multi-bit signals can now be expanded to show individual bit waveforms:
+- `waveform_data.rs`: Added `bit_value_at(time_fs, bit)` method to `SignalHistory`
+- `state.rs`: Added `expanded_signals: HashSet<usize>` to `TuiState`
+- `app.rs`: Added `toggle_expand()`, `bit_value_str()`, 'e' key binding
+- `signal_list.rs`: Shows ▶/▼ indicators for buses, renders bit sub-entries with values when expanded
+- `waveform.rs`: Refactored 1-bit rendering into shared `render_1bit_trace()` closure-based helper; added `render_bus_bit()` for expanded bit traces; expanded bits render as cyan 1-bit traces below the bus row (MSB first)
+
+**Tests added:** 13 new tests (91 → 104 for aion_tui)
+- `waveform_data`: `signal_history_bit_value_at`, `signal_history_bit_value_at_empty`
+- `state`: `state_expanded_signals_default_empty`
+- `app`: `toggle_expand_bus_signal`, `toggle_expand_1bit_noop`, `expand_key_binding`, `bit_value_str_with_data`, `bit_value_str_no_data`, `bit_value_str_out_of_bounds`
+- `waveform`: `render_bus_expanded_does_not_panic`, `render_bus_expanded_small_area`, `render_bus_not_expanded`
+- Updated: `format_bus_value_hex` (expects `"ff"` not `"8'hff"`), added `format_bus_value_xz`
+
+**Test results:** 1336 passed, 0 failed (1323 previous + 13 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Fmt:** Clean
+
+---
 
 #### 2026-02-08 — Fix TUI signal naming & simulation time advancement
 
