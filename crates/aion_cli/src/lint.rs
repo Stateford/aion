@@ -11,27 +11,12 @@
 //! 6. Run lint engine
 //! 7. Render diagnostics
 
-use std::path::{Path, PathBuf};
-
-use aion_common::Interner;
 use aion_config::{LintConfig, ProjectConfig};
 use aion_diagnostics::{DiagnosticRenderer, DiagnosticSink, Severity, TerminalRenderer};
-use aion_elaborate::ParsedDesign;
 use aion_lint::LintEngine;
-use aion_source::SourceDb;
 
+use crate::pipeline::{discover_source_files, parse_all_files, resolve_project_root};
 use crate::{GlobalArgs, LintArgs, ReportFormat};
-
-/// HDL language detected from a file extension.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SourceLanguage {
-    /// Verilog-2005 (`.v`).
-    Verilog,
-    /// SystemVerilog-2017 (`.sv`).
-    SystemVerilog,
-    /// VHDL-2008 (`.vhd`, `.vhdl`).
-    Vhdl,
-}
 
 /// Runs the `aion lint` command.
 ///
@@ -39,18 +24,7 @@ pub enum SourceLanguage {
 /// Returns exit code 0 if no errors, 1 if there are errors.
 pub fn run(args: &LintArgs, global: &GlobalArgs) -> Result<i32, Box<dyn std::error::Error>> {
     // Step 1: Find project root
-    let project_dir = if let Some(ref config_path) = global.config {
-        let p = PathBuf::from(config_path);
-        if p.is_file() {
-            p.parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            p
-        }
-    } else {
-        find_project_root(&std::env::current_dir()?)?
-    };
+    let project_dir = resolve_project_root(global)?;
 
     // Step 2: Load config
     let config = aion_config::load_config(&project_dir)?;
@@ -81,40 +55,13 @@ pub fn run(args: &LintArgs, global: &GlobalArgs) -> Result<i32, Box<dyn std::err
     }
 
     // Step 4: Load and parse source files
-    let mut source_db = SourceDb::new();
-    let interner = Interner::new();
+    let mut source_db = aion_source::SourceDb::new();
+    let interner = aion_common::Interner::new();
     let sink = DiagnosticSink::new();
 
-    let mut verilog_files = Vec::new();
-    let mut sv_files = Vec::new();
-    let mut vhdl_files = Vec::new();
-
-    for (path, lang) in &source_files {
-        let file_id = source_db.load_file(path)?;
-
-        match lang {
-            SourceLanguage::Verilog => {
-                let ast = aion_verilog_parser::parse_file(file_id, &source_db, &interner, &sink);
-                verilog_files.push(ast);
-            }
-            SourceLanguage::SystemVerilog => {
-                let ast = aion_sv_parser::parse_file(file_id, &source_db, &interner, &sink);
-                sv_files.push(ast);
-            }
-            SourceLanguage::Vhdl => {
-                let ast = aion_vhdl_parser::parse_file(file_id, &source_db, &interner, &sink);
-                vhdl_files.push(ast);
-            }
-        }
-    }
+    let parsed = parse_all_files(&source_files, &mut source_db, &interner, &sink)?;
 
     // Step 5: Elaborate
-    let parsed = ParsedDesign {
-        verilog_files,
-        sv_files,
-        vhdl_files,
-    };
-
     let design = aion_elaborate::elaborate(&parsed, &config, &source_db, &interner, &sink)?;
 
     // Step 6: Merge CLI args with config lint section and run lint
@@ -160,67 +107,6 @@ pub fn run(args: &LintArgs, global: &GlobalArgs) -> Result<i32, Box<dyn std::err
         Ok(1)
     } else {
         Ok(0)
-    }
-}
-
-/// Walks up from `start` looking for the nearest directory containing `aion.toml`.
-///
-/// Returns the directory containing `aion.toml`, or an error if none is found.
-pub fn find_project_root(start: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut current = start.to_path_buf();
-    loop {
-        if current.join("aion.toml").exists() {
-            return Ok(current);
-        }
-        if !current.pop() {
-            return Err(format!(
-                "could not find aion.toml in {} or any parent directory",
-                start.display()
-            )
-            .into());
-        }
-    }
-}
-
-/// Discovers HDL source files in the given directory (recursive).
-///
-/// Returns a list of `(path, language)` pairs for files with recognized
-/// HDL extensions (`.v`, `.sv`, `.vhd`, `.vhdl`).
-pub fn discover_source_files(
-    dir: &Path,
-) -> Result<Vec<(PathBuf, SourceLanguage)>, Box<dyn std::error::Error>> {
-    let mut files = Vec::new();
-    walk_dir(dir, &mut files)?;
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
-}
-
-/// Recursively walks a directory collecting HDL source files.
-fn walk_dir(
-    dir: &Path,
-    files: &mut Vec<(PathBuf, SourceLanguage)>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            walk_dir(&path, files)?;
-        } else if let Some(lang) = detect_language(&path) {
-            files.push((path, lang));
-        }
-    }
-    Ok(())
-}
-
-/// Detects the HDL language from a file's extension.
-///
-/// Returns `None` for unrecognized extensions.
-pub fn detect_language(path: &Path) -> Option<SourceLanguage> {
-    match path.extension()?.to_str()? {
-        "v" => Some(SourceLanguage::Verilog),
-        "sv" => Some(SourceLanguage::SystemVerilog),
-        "vhd" | "vhdl" => Some(SourceLanguage::Vhdl),
-        _ => None,
     }
 }
 
@@ -279,7 +165,11 @@ fn clone_naming_convention(nc: &aion_config::NamingConvention) -> aion_config::N
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{
+        detect_language, discover_source_files, find_project_root, SourceLanguage,
+    };
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     #[test]
@@ -401,7 +291,6 @@ mod tests {
             target: None,
         };
         let merged = merge_lint_config(&config, &args);
-        // Should be in deny, not allow
         assert!(merged.deny.contains(&"unused-signal".to_string()));
         assert!(!merged.allow.contains(&"unused-signal".to_string()));
     }
@@ -416,7 +305,6 @@ mod tests {
             target: None,
         };
         let merged = merge_lint_config(&config, &args);
-        // Should be in allow, not deny
         assert!(merged.allow.contains(&"magic-number".to_string()));
         assert!(!merged.deny.contains(&"magic-number".to_string()));
     }

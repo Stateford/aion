@@ -12,6 +12,7 @@ aion_ir = { workspace = true }
 aion_source = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

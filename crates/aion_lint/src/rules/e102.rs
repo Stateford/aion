@@ -94,6 +94,9 @@ fn check_non_synth_stmts(stmt: &Statement, code: DiagnosticCode, sink: &Diagnost
                 check_non_synth_stmts(s, code, sink);
             }
         }
+        Statement::Delay { body, .. } | Statement::Forever { body, .. } => {
+            check_non_synth_stmts(body, code, sink);
+        }
         Statement::Assign { .. } | Statement::Assertion { .. } | Statement::Nop => {}
     }
 }

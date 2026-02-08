@@ -103,7 +103,9 @@ fn stmt_span(stmt: &Statement) -> Option<aion_source::Span> {
         | Statement::Wait { span, .. }
         | Statement::Assertion { span, .. }
         | Statement::Display { span, .. }
-        | Statement::Finish { span } => Some(*span),
+        | Statement::Finish { span }
+        | Statement::Delay { span, .. }
+        | Statement::Forever { span, .. } => Some(*span),
         Statement::Nop => None,
     }
 }

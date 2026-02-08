@@ -163,6 +163,9 @@ pub fn stmt_has_full_else_coverage(stmt: &Statement) -> bool {
         | Statement::Assertion { .. }
         | Statement::Display { .. }
         | Statement::Finish { .. } => true,
+        Statement::Delay { body, .. } | Statement::Forever { body, .. } => {
+            stmt_has_full_else_coverage(body)
+        }
     }
 }
 
@@ -219,6 +222,7 @@ pub fn has_assign(stmt: &Statement) -> bool {
                 || default.as_ref().is_some_and(|d| has_assign(d))
         }
         Statement::Block { stmts, .. } => stmts.iter().any(has_assign),
+        Statement::Delay { body, .. } | Statement::Forever { body, .. } => has_assign(body),
         _ => false,
     }
 }
@@ -385,6 +389,9 @@ fn collect_read_signals_into(stmt: &Statement, result: &mut HashSet<SignalId>) {
                 collect_expr_signals_into(arg, result);
             }
         }
+        Statement::Delay { body, .. } | Statement::Forever { body, .. } => {
+            collect_read_signals_into(body, result);
+        }
         Statement::Finish { .. } | Statement::Nop => {}
     }
 }
@@ -416,6 +423,9 @@ fn collect_written_signals_into(stmt: &Statement, result: &mut HashSet<SignalId>
             for s in stmts {
                 collect_written_signals_into(s, result);
             }
+        }
+        Statement::Delay { body, .. } | Statement::Forever { body, .. } => {
+            collect_written_signals_into(body, result);
         }
         Statement::Wait { .. }
         | Statement::Assertion { .. }

@@ -107,6 +107,28 @@ pub enum Statement {
         /// Source location.
         span: Span,
     },
+    /// A time delay statement (`#5`, `wait for 10 ns`).
+    ///
+    /// Suspends process execution for `duration_fs` femtoseconds, then
+    /// resumes with `body`. Used by initial blocks and testbenches.
+    Delay {
+        /// Delay duration in femtoseconds (pre-evaluated at elaboration time).
+        duration_fs: u64,
+        /// The statement to execute after the delay elapses.
+        body: Box<Statement>,
+        /// Source location.
+        span: Span,
+    },
+    /// An infinite loop (`forever`) wrapping a body statement.
+    ///
+    /// Typically contains a delay to generate periodic signals (e.g. clocks).
+    /// A forever loop without any delay inside is a simulation error.
+    Forever {
+        /// The loop body (usually contains a delay).
+        body: Box<Statement>,
+        /// Source location.
+        span: Span,
+    },
     /// A no-operation (placeholder for empty branches).
     Nop,
 }
@@ -181,6 +203,45 @@ mod tests {
         assert_ne!(AssertionKind::Assert, AssertionKind::Assume);
         assert_ne!(AssertionKind::Assert, AssertionKind::Cover);
         assert_ne!(AssertionKind::Assume, AssertionKind::Cover);
+    }
+
+    #[test]
+    fn delay_statement() {
+        let stmt = Statement::Delay {
+            duration_fs: 5_000_000,
+            body: Box::new(Statement::Assign {
+                target: SignalRef::Signal(SignalId::from_raw(0)),
+                value: Expr::Literal(LogicVec::all_one(1)),
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+        if let Statement::Delay {
+            duration_fs, body, ..
+        } = &stmt
+        {
+            assert_eq!(*duration_fs, 5_000_000);
+            assert!(matches!(**body, Statement::Assign { .. }));
+        } else {
+            panic!("expected Delay");
+        }
+    }
+
+    #[test]
+    fn forever_statement() {
+        let stmt = Statement::Forever {
+            body: Box::new(Statement::Delay {
+                duration_fs: 5_000_000,
+                body: Box::new(Statement::Nop),
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+        if let Statement::Forever { body, .. } = &stmt {
+            assert!(matches!(**body, Statement::Delay { .. }));
+        } else {
+            panic!("expected Forever");
+        }
     }
 
     #[test]

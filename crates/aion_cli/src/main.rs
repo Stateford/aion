@@ -1,12 +1,16 @@
 //! Aion CLI — the command-line interface for the Aion FPGA toolchain.
 //!
-//! Provides `aion init` for project scaffolding and `aion lint` for
-//! static analysis of VHDL, Verilog, and SystemVerilog designs.
+//! Provides `aion init` for project scaffolding, `aion lint` for static analysis,
+//! `aion sim` for running individual testbench simulations, and `aion test` for
+//! discovering and running all testbenches in a project.
 
 #![warn(missing_docs)]
 
 mod init;
 mod lint;
+mod pipeline;
+mod sim;
+mod test;
 
 use std::process;
 
@@ -56,6 +60,10 @@ pub enum Command {
     },
     /// Run lint checks on the current project.
     Lint(LintArgs),
+    /// Run a single testbench simulation.
+    Sim(SimArgs),
+    /// Discover and run all testbenches.
+    Test(TestArgs),
 }
 
 /// Arguments for the `aion lint` subcommand.
@@ -76,6 +84,67 @@ pub struct LintArgs {
     /// Target name to select from `aion.toml`.
     #[arg(short, long)]
     pub target: Option<String>,
+}
+
+/// Arguments for the `aion sim` subcommand.
+#[derive(Parser, Debug)]
+pub struct SimArgs {
+    /// Testbench file path or module name.
+    pub testbench: String,
+
+    /// Simulation time limit (e.g., "100ns", "1us", "10ms").
+    #[arg(long)]
+    pub time: Option<String>,
+
+    /// Waveform output format.
+    #[arg(long, value_enum)]
+    pub waveform: Option<WaveformFormat>,
+
+    /// Output path for waveform file.
+    #[arg(short, long)]
+    pub output: Option<String>,
+
+    /// Disable waveform recording.
+    #[arg(long)]
+    pub no_waveform: bool,
+
+    /// Override top module name (default: inferred from file stem).
+    #[arg(long)]
+    pub top: Option<String>,
+
+    /// Launch interactive REPL debugger instead of running to completion.
+    #[arg(short, long)]
+    pub interactive: bool,
+}
+
+/// Arguments for the `aion test` subcommand.
+#[derive(Parser, Debug)]
+pub struct TestArgs {
+    /// Specific testbench name to run (optional).
+    pub name: Option<String>,
+
+    /// Substring filter for testbench names.
+    #[arg(long)]
+    pub filter: Option<String>,
+
+    /// Waveform output format for all testbenches.
+    #[arg(long, value_enum)]
+    pub waveform: Option<WaveformFormat>,
+
+    /// Disable waveform recording for all testbenches.
+    #[arg(long)]
+    pub no_waveform: bool,
+}
+
+/// Waveform output format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum WaveformFormat {
+    /// Value Change Dump (IEEE 1364).
+    Vcd,
+    /// Fast Signal Trace (GTKWave).
+    Fst,
+    /// GHDL Waveform.
+    Ghw,
 }
 
 /// Controls whether colored output is produced.
@@ -141,6 +210,8 @@ fn main() {
     let result = match cli.command {
         Command::Init { name, lang, target } => init::run(name, lang, target),
         Command::Lint(ref args) => lint::run(args, &global),
+        Command::Sim(ref args) => sim::run(args, &global),
+        Command::Test(ref args) => test::run(args, &global),
     };
 
     match result {
@@ -309,5 +380,170 @@ mod tests {
         assert_eq!(format!("{:?}", HdlLanguage::Vhdl), "Vhdl");
         assert_eq!(format!("{:?}", HdlLanguage::Verilog), "Verilog");
         assert_eq!(format!("{:?}", HdlLanguage::SystemVerilog), "SystemVerilog");
+    }
+
+    // -- Sim command parsing tests --
+
+    #[test]
+    fn parse_sim_basic() {
+        let cli = Cli::parse_from(["aion", "sim", "tests/counter_tb.sv"]);
+        match cli.command {
+            Command::Sim(ref args) => {
+                assert_eq!(args.testbench, "tests/counter_tb.sv");
+                assert!(args.time.is_none());
+                assert!(args.waveform.is_none());
+                assert!(args.output.is_none());
+                assert!(!args.no_waveform);
+                assert!(args.top.is_none());
+            }
+            _ => panic!("expected Sim command"),
+        }
+    }
+
+    #[test]
+    fn parse_sim_with_time() {
+        let cli = Cli::parse_from(["aion", "sim", "tb.sv", "--time", "100ns"]);
+        match cli.command {
+            Command::Sim(ref args) => {
+                assert_eq!(args.testbench, "tb.sv");
+                assert_eq!(args.time.as_deref(), Some("100ns"));
+            }
+            _ => panic!("expected Sim command"),
+        }
+    }
+
+    #[test]
+    fn parse_sim_with_waveform() {
+        let cli = Cli::parse_from(["aion", "sim", "tb.sv", "--waveform", "vcd"]);
+        match cli.command {
+            Command::Sim(ref args) => {
+                assert_eq!(args.waveform, Some(WaveformFormat::Vcd));
+            }
+            _ => panic!("expected Sim command"),
+        }
+    }
+
+    #[test]
+    fn parse_sim_with_output() {
+        let cli = Cli::parse_from(["aion", "sim", "tb.sv", "--output", "out/tb.vcd"]);
+        match cli.command {
+            Command::Sim(ref args) => {
+                assert_eq!(args.output.as_deref(), Some("out/tb.vcd"));
+            }
+            _ => panic!("expected Sim command"),
+        }
+    }
+
+    #[test]
+    fn parse_sim_no_waveform() {
+        let cli = Cli::parse_from(["aion", "sim", "tb.sv", "--no-waveform"]);
+        match cli.command {
+            Command::Sim(ref args) => {
+                assert!(args.no_waveform);
+            }
+            _ => panic!("expected Sim command"),
+        }
+    }
+
+    #[test]
+    fn parse_sim_with_top() {
+        let cli = Cli::parse_from(["aion", "sim", "tb.sv", "--top", "my_tb"]);
+        match cli.command {
+            Command::Sim(ref args) => {
+                assert_eq!(args.top.as_deref(), Some("my_tb"));
+            }
+            _ => panic!("expected Sim command"),
+        }
+    }
+
+    // -- Test command parsing tests --
+
+    #[test]
+    fn parse_test_default() {
+        let cli = Cli::parse_from(["aion", "test"]);
+        match cli.command {
+            Command::Test(ref args) => {
+                assert!(args.name.is_none());
+                assert!(args.filter.is_none());
+                assert!(args.waveform.is_none());
+                assert!(!args.no_waveform);
+            }
+            _ => panic!("expected Test command"),
+        }
+    }
+
+    #[test]
+    fn parse_test_with_name() {
+        let cli = Cli::parse_from(["aion", "test", "counter_tb"]);
+        match cli.command {
+            Command::Test(ref args) => {
+                assert_eq!(args.name.as_deref(), Some("counter_tb"));
+            }
+            _ => panic!("expected Test command"),
+        }
+    }
+
+    #[test]
+    fn parse_test_with_filter() {
+        let cli = Cli::parse_from(["aion", "test", "--filter", "counter"]);
+        match cli.command {
+            Command::Test(ref args) => {
+                assert_eq!(args.filter.as_deref(), Some("counter"));
+            }
+            _ => panic!("expected Test command"),
+        }
+    }
+
+    #[test]
+    fn parse_test_no_waveform() {
+        let cli = Cli::parse_from(["aion", "test", "--no-waveform"]);
+        match cli.command {
+            Command::Test(ref args) => {
+                assert!(args.no_waveform);
+            }
+            _ => panic!("expected Test command"),
+        }
+    }
+
+    #[test]
+    fn parse_test_with_waveform() {
+        let cli = Cli::parse_from(["aion", "test", "--waveform", "vcd"]);
+        match cli.command {
+            Command::Test(ref args) => {
+                assert_eq!(args.waveform, Some(WaveformFormat::Vcd));
+            }
+            _ => panic!("expected Test command"),
+        }
+    }
+
+    #[test]
+    fn parse_sim_interactive() {
+        let cli = Cli::parse_from(["aion", "sim", "tb.sv", "--interactive"]);
+        match cli.command {
+            Command::Sim(ref args) => {
+                assert!(args.interactive);
+            }
+            _ => panic!("expected Sim command"),
+        }
+    }
+
+    #[test]
+    fn parse_sim_interactive_short() {
+        let cli = Cli::parse_from(["aion", "sim", "tb.sv", "-i"]);
+        match cli.command {
+            Command::Sim(ref args) => {
+                assert!(args.interactive);
+            }
+            _ => panic!("expected Sim command"),
+        }
+    }
+
+    // -- WaveformFormat tests --
+
+    #[test]
+    fn waveform_format_debug() {
+        assert_eq!(format!("{:?}", WaveformFormat::Vcd), "Vcd");
+        assert_eq!(format!("{:?}", WaveformFormat::Fst), "Fst");
+        assert_eq!(format!("{:?}", WaveformFormat::Ghw), "Ghw");
     }
 }

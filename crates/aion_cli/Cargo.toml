@@ -19,6 +19,7 @@ aion_verilog_parser = { workspace = true }
 aion_sv_parser = { workspace = true }
 aion_elaborate = { workspace = true }
 aion_lint = { workspace = true }
+aion_sim = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 

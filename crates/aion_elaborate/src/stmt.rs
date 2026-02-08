@@ -12,10 +12,16 @@ use aion_ir::ids::TypeId;
 use aion_ir::stmt::{CaseArm as IrCaseArm, Statement as IrStmt};
 use aion_source::SourceDb;
 
+use crate::const_eval;
 use crate::expr::{
     self, lower_sv_expr, lower_sv_to_signal_ref, lower_to_signal_ref, lower_verilog_expr,
     lower_vhdl_expr, lower_vhdl_to_signal_ref, SignalEnv,
 };
+
+/// Default timescale: 1 time unit = 1 ns = 1,000,000 fs.
+///
+/// Applied to delay literal values when no explicit `timescale is specified.
+const DEFAULT_TIMESCALE_FS: u64 = 1_000_000;
 
 /// Lowers a Verilog AST statement to an IR statement.
 pub fn lower_verilog_stmt(
@@ -120,8 +126,12 @@ pub fn lower_verilog_stmt(
         Statement::While { body, .. } => {
             lower_verilog_stmt(body, sig_env, source_db, interner, sink)
         }
-        Statement::Forever { body, .. } => {
-            lower_verilog_stmt(body, sig_env, source_db, interner, sink)
+        Statement::Forever { body, span } => {
+            let ir_body = lower_verilog_stmt(body, sig_env, source_db, interner, sink);
+            IrStmt::Forever {
+                body: Box::new(ir_body),
+                span: *span,
+            }
         }
         Statement::Repeat { body, .. } => {
             lower_verilog_stmt(body, sig_env, source_db, interner, sink)
@@ -134,8 +144,17 @@ pub fn lower_verilog_stmt(
             // Sensitivity is captured at the Process level; lower the body
             lower_verilog_stmt(body, sig_env, source_db, interner, sink)
         }
-        Statement::Delay { body, .. } => {
-            lower_verilog_stmt(body, sig_env, source_db, interner, sink)
+        Statement::Delay {
+            delay, body, span, ..
+        } => {
+            let ir_body = lower_verilog_stmt(body, sig_env, source_db, interner, sink);
+            // Try to evaluate the delay expression as a compile-time constant
+            let duration_fs = eval_delay_expr_verilog(delay, source_db, interner, sink);
+            IrStmt::Delay {
+                duration_fs,
+                body: Box::new(ir_body),
+                span: *span,
+            }
         }
         Statement::SystemTaskCall {
             name, args, span, ..
@@ -322,7 +341,13 @@ pub fn lower_sv_stmt(
         Statement::For { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
         Statement::While { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
         Statement::DoWhile { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
-        Statement::Forever { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
+        Statement::Forever { body, span } => {
+            let ir_body = lower_sv_stmt(body, sig_env, source_db, interner, sink);
+            IrStmt::Forever {
+                body: Box::new(ir_body),
+                span: *span,
+            }
+        }
         Statement::Repeat { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
         Statement::Foreach { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
         Statement::Wait { span, .. } => IrStmt::Wait {
@@ -332,7 +357,17 @@ pub fn lower_sv_stmt(
         Statement::EventControl { body, .. } => {
             lower_sv_stmt(body, sig_env, source_db, interner, sink)
         }
-        Statement::Delay { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
+        Statement::Delay {
+            delay, body, span, ..
+        } => {
+            let ir_body = lower_sv_stmt(body, sig_env, source_db, interner, sink);
+            let duration_fs = eval_delay_expr_sv(delay, source_db, interner, sink);
+            IrStmt::Delay {
+                duration_fs,
+                body: Box::new(ir_body),
+                span: *span,
+            }
+        }
         Statement::SystemTaskCall {
             name, args, span, ..
         } => {
@@ -628,6 +663,44 @@ fn lower_vhdl_stmt_list(
     }
 }
 
+/// Evaluates a Verilog delay expression to femtoseconds.
+///
+/// Tries to const-evaluate the expression; if it resolves to an integer,
+/// multiplies by `DEFAULT_TIMESCALE_FS` (1 ns). Falls back to 0 fs if
+/// the expression cannot be evaluated.
+fn eval_delay_expr_verilog(
+    expr: &aion_verilog_parser::ast::Expr,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> u64 {
+    let env = crate::const_eval::ConstEnv::default();
+    if let Some(val) = const_eval::eval_verilog_expr(expr, source_db, interner, &env, sink) {
+        if let Some(v) = const_eval::const_to_i64(&val) {
+            return (v.unsigned_abs()) * DEFAULT_TIMESCALE_FS;
+        }
+    }
+    0
+}
+
+/// Evaluates a SystemVerilog delay expression to femtoseconds.
+///
+/// Same approach as [`eval_delay_expr_verilog`] but uses the SV const evaluator.
+fn eval_delay_expr_sv(
+    expr: &aion_sv_parser::ast::Expr,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> u64 {
+    let env = crate::const_eval::ConstEnv::default();
+    if let Some(val) = const_eval::eval_sv_expr(expr, source_db, interner, &env, sink) {
+        if let Some(v) = const_eval::const_to_i64(&val) {
+            return (v.unsigned_abs()) * DEFAULT_TIMESCALE_FS;
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +903,97 @@ mod tests {
             assert_eq!(stmts.len(), 2);
         } else {
             panic!("expected Block");
+        }
+    }
+
+    #[test]
+    fn verilog_delay_preserved() {
+        let mut sdb = SourceDb::new();
+        let file_id = sdb.add_source("test.v", "5".into());
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let env = SignalEnv::new();
+        // Span covering "5" in the source
+        let lit_span = aion_source::Span {
+            file: file_id,
+            start: 0,
+            end: 1,
+        };
+        let stmt = aion_verilog_parser::ast::Statement::Delay {
+            delay: aion_verilog_parser::ast::Expr::Literal { span: lit_span },
+            body: Box::new(aion_verilog_parser::ast::Statement::Null { span: Span::DUMMY }),
+            span: Span::DUMMY,
+        };
+        let ir = lower_verilog_stmt(&stmt, &env, &sdb, &interner, &sink);
+        if let IrStmt::Delay {
+            duration_fs, body, ..
+        } = &ir
+        {
+            // 5 * 1_000_000 fs = 5_000_000 fs (5 ns)
+            assert_eq!(*duration_fs, 5_000_000);
+            assert!(matches!(**body, IrStmt::Nop));
+        } else {
+            panic!("expected Delay, got {:?}", ir);
+        }
+    }
+
+    #[test]
+    fn verilog_forever_preserved() {
+        let (sdb, interner, sink, env) = setup();
+        let stmt = aion_verilog_parser::ast::Statement::Forever {
+            body: Box::new(aion_verilog_parser::ast::Statement::Null { span: Span::DUMMY }),
+            span: Span::DUMMY,
+        };
+        let ir = lower_verilog_stmt(&stmt, &env, &sdb, &interner, &sink);
+        if let IrStmt::Forever { body, .. } = &ir {
+            assert!(matches!(**body, IrStmt::Nop));
+        } else {
+            panic!("expected Forever, got {:?}", ir);
+        }
+    }
+
+    #[test]
+    fn sv_delay_preserved() {
+        let mut sdb = SourceDb::new();
+        let file_id = sdb.add_source("test.sv", "20".into());
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let env = SignalEnv::new();
+        let lit_span = aion_source::Span {
+            file: file_id,
+            start: 0,
+            end: 2,
+        };
+        let stmt = aion_sv_parser::ast::Statement::Delay {
+            delay: aion_sv_parser::ast::Expr::Literal { span: lit_span },
+            body: Box::new(aion_sv_parser::ast::Statement::Null { span: Span::DUMMY }),
+            span: Span::DUMMY,
+        };
+        let ir = lower_sv_stmt(&stmt, &env, &sdb, &interner, &sink);
+        if let IrStmt::Delay {
+            duration_fs, body, ..
+        } = &ir
+        {
+            // 20 * 1_000_000 fs = 20_000_000 fs (20 ns)
+            assert_eq!(*duration_fs, 20_000_000);
+            assert!(matches!(**body, IrStmt::Nop));
+        } else {
+            panic!("expected Delay, got {:?}", ir);
+        }
+    }
+
+    #[test]
+    fn sv_forever_preserved() {
+        let (sdb, interner, sink, env) = setup();
+        let stmt = aion_sv_parser::ast::Statement::Forever {
+            body: Box::new(aion_sv_parser::ast::Statement::Null { span: Span::DUMMY }),
+            span: Span::DUMMY,
+        };
+        let ir = lower_sv_stmt(&stmt, &env, &sdb, &interner, &sink);
+        if let IrStmt::Forever { body, .. } = &ir {
+            assert!(matches!(**body, IrStmt::Nop));
+        } else {
+            panic!("expected Forever, got {:?}", ir);
         }
     }
 }

@@ -17,21 +17,21 @@
 | `aion_source` | 🟢 Complete | 22 | FileId, Span, SourceFile, SourceDb, ResolvedSpan |
 | `aion_diagnostics` | 🟢 Complete | 22 | Severity, DiagnosticCode, Label, Diagnostic, DiagnosticSink, TerminalRenderer |
 | `aion_config` | 🟢 Complete | 22 | ProjectConfig, all config types, loader, validator, target resolver |
-| `aion_ir` | 🟢 Complete | 77 | Arena, IDs, TypeDb, Design, Module, Signal, Cell, Process, Expr, Statement, SourceMap |
+| `aion_ir` | 🟢 Complete | 79 | Arena, IDs, TypeDb, Design, Module, Signal, Cell, Process, Expr, Statement (incl Delay/Forever), SourceMap |
 | `aion_vhdl_parser` | 🟢 Complete | 85 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_verilog_parser` | 🟢 Complete | 127 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_sv_parser` | 🟢 Complete | 166 | Lexer, Pratt parser, full AST, error recovery, serde |
-| `aion_elaborate` | 🟢 Complete | 113 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, all 3 languages |
+| `aion_elaborate` | 🟢 Complete | 117 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, delay/forever preservation, all 3 languages |
 | `aion_lint` | 🟢 Complete | 91 | LintEngine, 15 rules (W101-W108, E102/E104/E105, C201-C204), IR traversal helpers |
 | `aion_cache` | 🟢 Complete | 47 | Content-hash caching: manifest, artifact store, source hasher, cache orchestrator |
-| `aion_cli` | 🟢 Complete | 38 | CLI entry point: `init` (scaffolding) and `lint` (full pipeline) commands |
-| `aion_sim` | 🟢 Complete | 136 | Event-driven HDL simulator: kernel, evaluator, VCD waveform, delta cycles |
+| `aion_cli` | 🟢 Complete | 88 | CLI: `init`, `lint`, `sim`, `test` commands with shared pipeline, `--interactive` mode |
+| `aion_sim` | 🟢 Complete | 229 | Event-driven HDL simulator: kernel, evaluator, VCD/FST waveform, delta cycles, delay scheduling, interactive REPL |
 | `aion_conformance` | 🟢 Complete | 92 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 5 unit |
 
 ### Phase 0 Checklist
 
 - [x] Rust workspace with Cargo.toml configured
-- [ ] CI/CD pipeline (GitHub Actions)
+- [x] CI/CD pipeline (GitHub Actions)
 - [x] `aion_common` — all foundational types
 - [x] `aion_source` — source file management and spans
 - [x] `aion_diagnostics` — diagnostic types and terminal renderer
@@ -42,7 +42,7 @@
 - [x] `aion_ir` — core IR type definitions
 - [x] `aion_elaborate` — AST→IR elaboration engine
 - [x] `aion_lint` — lint rules and engine (15 rules)
-- [x] `aion_cli` — `init` and `lint` commands
+- [x] `aion_cli` — `init`, `lint`, `sim`, and `test` commands
 - [x] `aion_cache` — basic content-hash caching
 - [x] Human-readable error output with source spans
 - [x] Parse + lint completes in <1s on test projects
@@ -59,6 +59,177 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — Delay scheduling + FST spec-compliance rewrite
+
+**Crates:** `aion_ir`, `aion_elaborate`, `aion_sim`, `aion_lint`
+
+**What:** Two major changes: (1) Continuation-based delay scheduling enabling behavioral testbenches with `#delay` and `forever` loops, and (2) FST waveform format rewritten to match the GTKWave FST spec.
+
+**Task 1: Delay Scheduling (Continuation-Based Execution)**
+
+Previously, `Delay` and `Forever` statements were discarded by the elaborator, causing all simulations to finish at 0 fs. Now they are fully preserved and executed.
+
+IR changes (`aion_ir/src/stmt.rs`):
+- Added `Delay { duration_fs: u64, body: Box<Statement>, span: Span }` variant
+- Added `Forever { body: Box<Statement>, span: Span }` variant
+
+Elaborator changes (`aion_elaborate/src/stmt.rs`):
+- `Forever { body }` → `IrStmt::Forever { body: lower(body) }`
+- `Delay { delay, body }` → const-evaluate delay expr, multiply by timescale (1ns), produce `IrStmt::Delay { duration_fs, body }`
+- Added `eval_delay_expr_verilog()` and `eval_delay_expr_sv()` helpers
+- `DEFAULT_TIMESCALE_FS = 1_000_000` (1ns)
+
+Evaluator changes (`aion_sim/src/evaluator.rs`):
+- Added `ExecResult::Suspend { delay_fs, continuation }` variant
+- Removed `Copy`/`PartialEq` from `ExecResult` (Box isn't Copy)
+- `Delay` → returns `Suspend` immediately with body as continuation
+- `Forever` → executes body; on `Suspend`, wraps continuation + re-entry into `Block`
+- `Block` → on `Suspend` mid-block, captures remaining statements as continuation
+
+Kernel changes (`aion_sim/src/kernel.rs`):
+- Added `SuspendedProcess { process_idx, continuation }` struct
+- Added `suspended_processes: Vec<(SimTime, SuspendedProcess)>` to `SimKernel`
+- `execute_initial_processes()` handles `Suspend` by queuing wakeups
+- Main loop computes `next_time = min(event_queue, suspended_wakeups)`
+- `process_wakeups()` executes continuations, applies updates, re-queues if suspended again
+- `has_pending_events()` includes suspended processes
+
+Lint/helper changes:
+- Added `Delay`/`Forever` match arms to 6 functions across `helpers.rs`, `e102.rs`, `w108.rs`, `kernel.rs`
+
+**Task 2: FST Spec-Compliance Rewrite**
+
+Rewrote `aion_sim/src/fst.rs` to match the Tim Hutt FST spec:
+
+| Fix | Before | After |
+|-----|--------|-------|
+| Section length | `8 + 1 + payload` | `8 + payload` (excludes type byte) |
+| Endianness | `to_le_bytes()` | `to_ne_bytes()` (native) |
+| Scope tag | `0x00` | `0xFE` (FST_ST_VCD_SCOPE) |
+| Upscope tag | `0x01` | `0xFF` (FST_ST_VCD_UPSCOPE) |
+| Var entry | `[2, type, dir, name, width, id]` | `[type, dir, name\0, varint(width), varint(alias)]` |
+| Date field | 119 bytes | 26 bytes |
+| Header layout | Custom | Spec-compliant (329-byte payload) |
+| Geometry block | No headers | `uncomp_length(u64) + count(u64) + compressed` |
+| Hierarchy block | No headers | `uncomp_length(u64) + compressed` |
+| VcData block | Custom format | Spec: bits + waves + position + time tables |
+
+**Tests added:** 23 new tests (1209 → 1232 total)
+- IR (2): delay_statement, forever_statement
+- Elaborator (4): verilog_delay_preserved, verilog_forever_preserved, sv_delay_preserved, sv_forever_preserved
+- Evaluator (8): delay_suspends, forever_with_delay_suspends, forever_without_delay_continues, block_suspends_captures_remaining, delay_zero_suspends, nested_delay_in_if, block_finish_after_delay_unreachable
+- Kernel (5): initial_delay_resumes, forever_generates_clock, multiple_initial_delays, full_testbench_pattern, suspended_process_tracking
+- FST (5): block_section_length_excludes_type_byte, header_endianness_is_native, hierarchy_uses_correct_tags, geometry_has_headers, vcdata_has_start_end_times, blocks_parseable_sequentially
+
+**Test results:** 1232 passed, 0 failed
+**Clippy:** Clean (zero warnings with -D warnings)
+**Fmt:** Clean
+
+---
+
+#### 2026-02-08 — CI/CD pipeline, FST waveform format, Interactive TUI
+
+**Crates:** `aion_sim`, `aion_cli`
+
+**What:** Completed Phase 1 remaining items: CI/CD pipeline, FST waveform format, and interactive simulation debugger.
+
+**Task 1: CI/CD Pipeline (GitHub Actions)**
+
+Created `.github/workflows/ci.yml` with a single job running on `ubuntu-latest`:
+1. `cargo fmt --check` — formatting validation
+2. `cargo clippy --all-targets -- -D warnings` — lint with zero warnings
+3. `cargo build --all-targets` — full workspace build
+4. `cargo test` — all 1209 tests
+5. `cargo doc --no-deps` — documentation build
+
+Uses `dtolnay/rust-toolchain@stable` with rustfmt+clippy, `actions/cache@v4` for Cargo registry/target caching keyed by `Cargo.lock` hash.
+
+**Task 2: FST Waveform Format**
+
+New files:
+- `crates/aion_sim/src/fst.rs` — `FstRecorder<W: Write + Seek>` implementing `WaveformRecorder` trait
+
+Design:
+- Buffers hierarchy entries and value changes in memory, assembles complete FST binary on `finalize()`
+- Four block types: Header (type 0, 329-byte metadata), VcData (type 1, ZLib-compressed), Geometry (type 3, ZLib-compressed), Hierarchy (type 4, GZip-compressed)
+- LEB128 varint encoding for variable-length integers, big-endian u64 for fixed-width fields
+- Delta-encoded timestamps in VcData block
+- Timescale = -15 (femtoseconds), writer string = "Aion HDL Simulator"
+
+Modified files:
+- `Cargo.toml` (root) — Added `flate2 = "1"` to workspace dependencies
+- `crates/aion_sim/Cargo.toml` — Added `flate2 = { workspace = true }`
+- `crates/aion_sim/src/lib.rs` — Added `pub mod fst`, `WaveformOutputFormat` enum (Vcd/Fst), `waveform_format` field in `SimConfig`, branching in `simulate()` to use `FstRecorder` or `VcdRecorder`
+- `crates/aion_cli/src/sim.rs` — Wire FST format: maps `WaveformFormat::Fst` → `WaveformOutputFormat::Fst`, generates `.fst` extension, only GHW falls back with warning
+- `crates/aion_cli/src/test.rs` — Wire FST format mapping for test runner
+
+**Task 3: Interactive TUI (REPL Simulation Debugger)**
+
+New files:
+- `crates/aion_sim/src/interactive.rs` — `InteractiveSim`, `SimCommand`, `CommandResult`, `parse_command()`, REPL loop
+
+Design:
+- `SimCommand` enum: Run, Step, Inspect, BreakpointTime, Watch, Unwatch, Continue, Time, Signals, Status, Help, Quit
+- `InteractiveSim` wraps `SimKernel` with breakpoints, watches, command history
+- `run_repl<R: BufRead, W: Write>()` — testable REPL loop with `aion>` prompt
+- Command shortcuts: `r`=run, `s`=step, `i`=inspect, `c`=continue, `t`=time, `q`=quit, `h`=help, `bp`=breakpoint, `w`=watch, `sig`=signals
+- Case-insensitive command parsing, partial signal name matching in `inspect`
+- Signal values displayed in hex (no X/Z) or binary (with X/Z)
+- Duration parsing reuses `FS_PER_*` constants from `time` module
+
+Modified files:
+- `crates/aion_sim/src/kernel.rs` — Added `all_signals()`, `has_pending_events()`, `is_finished()`, `initialize()`, `take_display_output()`, `take_assertion_failures()` public methods
+- `crates/aion_sim/src/lib.rs` — Added `pub mod interactive`, re-exported `InteractiveSim`
+- `crates/aion_cli/src/main.rs` — Added `--interactive`/`-i` flag to `SimArgs`, 2 new CLI parsing tests
+- `crates/aion_cli/src/sim.rs` — Added interactive mode branch before waveform setup
+
+**Tests added:** 78 new tests (1131 → 1209 total)
+- FST (30 tests): varint encoding (4), u64_be, hierarchy entries (3), gzip/zlib roundtrip (2), recorder unit (8), finalization (7), integration (3), format helpers (2)
+- Interactive (46 tests): command parsing (16), duration parsing (6), construction (3), command execution (10), REPL integration (3), format helpers (3), finish design (1), CLI parsing (2 in main.rs), plus 2 additional kernel method tests
+**Test results:** 1209 passed, 0 failed
+**Clippy:** Clean (zero warnings with -D warnings)
+**Fmt:** Clean
+
+---
+
+#### 2026-02-08 — CLI sim and test commands
+
+**Crate:** `aion_cli`
+
+**What:** Added `aion sim` and `aion test` CLI commands for running HDL simulations, plus refactored shared pipeline code into a new `pipeline.rs` module. The CLI now has 4 commands: `init`, `lint`, `sim`, `test`.
+
+**New files:**
+- `pipeline.rs` — Shared pipeline helpers extracted from `lint.rs`: `SourceLanguage`, `find_project_root()`, `discover_source_files()`, `detect_language()`, `resolve_project_root()`, `parse_all_files()`, `render_diagnostics()`, `parse_duration()` (human-readable time parsing: "100ns", "1us", "10ms" → femtoseconds)
+- `sim.rs` — `aion sim <testbench>` command: resolves testbench (file path, relative path, or name search in `tests/`), infers top module from file stem (overridable with `--top`), parses src/ + testbench, elaborates with testbench as top, builds `SimConfig`, runs simulation, prints `$display` to stdout and assertion failures to stderr, optional VCD waveform output
+- `test.rs` — `aion test` command: discovers all testbenches in `tests/`, filters by `--filter` substring or positional name, parses all files once, elaborates and simulates each testbench independently, prints per-test PASS/FAIL status with timing, prints summary (N passed, M failed), exit code 0/1
+
+**Modified files:**
+- `main.rs` — Added `WaveformFormat` enum (Vcd/Fst/Ghw), `SimArgs`, `TestArgs` structs, `Command::Sim` and `Command::Test` variants, dispatch arms
+- `lint.rs` — Refactored to import shared code from `pipeline.rs` instead of defining it locally
+- `Cargo.toml` — Added `aion_sim` dependency
+
+**Key design decisions:**
+- Shared pipeline: `pipeline.rs` centralizes file discovery, parsing, and project root resolution to avoid duplication across `lint`/`sim`/`test`
+- Testbench resolution: `aion sim foo` tries (1) file path, (2) relative to project, (3) search `tests/` by stem
+- Top module inference: file stem (e.g., `counter_tb.sv` → `counter_tb`), overridable with `--top`
+- Config override: creates a minimal `ProjectConfig` with modified `top` field for each testbench elaboration
+- Waveform: only VCD supported; FST/GHW emit warning and fall back to VCD
+- Test reuses parsed ASTs: parse once, elaborate per-testbench (different top module)
+- Duration parsing: supports fs/ps/ns/us/ms/s units
+
+**Tests added:** 48 new tests (38 → 86 total for `aion_cli`)
+- `pipeline.rs` (14 tests): parse_duration (ns/us/ms/ps/fs/s/zero/invalid_unit/no_number/empty/missing_unit/whitespace), resolve_project_root (file/dir), plus relocated find_project_root/detect_language/discover_files tests
+- `main.rs` (12 new tests): sim parsing (basic/time/waveform/output/no-waveform/top), test parsing (default/name/filter/no-waveform/waveform), waveform_format_debug
+- `sim.rs` (7 tests): infer_top_module (from_path/explicit), resolve_testbench (file_path/by_name/not_found), make_config_with_top, end-to-end sim on init project
+- `test.rs` (5 tests): filter_testbenches (by_name/by_substring/no_match/all), end-to-end test on init project
+- `lint.rs` (10 tests): existing tests preserved, now importing from pipeline
+
+**Test results:** 1131 passed, 0 failed (1083 previous + 48 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Fmt:** Clean
+
+---
 
 #### 2026-02-08 — Performance benchmark: <1s milestone verified
 
@@ -567,10 +738,11 @@ Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construct
 
 ### Phase 1 Checklist
 
-- [x] `aion_sim` — Core simulation kernel (136 tests)
-- [ ] CLI integration (`aion sim` / `aion test` commands)
-- [ ] FST waveform format support
-- [ ] Interactive TUI for simulation control
+- [x] `aion_sim` — Core simulation kernel (229 tests, incl delay scheduling)
+- [x] CLI integration (`aion sim` / `aion test` commands)
+- [x] FST waveform format support (spec-compliant rewrite)
+- [x] Interactive TUI for simulation control (46 tests)
+- [x] Delay scheduling: `Delay`/`Forever` IR variants, continuation-based execution
 - [ ] Conformance testing on real HDL designs
 
 ## Phase 2 — Synthesis (Months 8–14)

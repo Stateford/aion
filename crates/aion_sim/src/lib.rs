@@ -35,6 +35,8 @@
 
 pub mod error;
 pub mod evaluator;
+pub mod fst;
+pub mod interactive;
 pub mod kernel;
 pub mod time;
 pub mod value;
@@ -47,10 +49,23 @@ use std::path::PathBuf;
 use aion_ir::Design;
 
 pub use error::SimError;
+pub use fst::FstRecorder;
+pub use interactive::InteractiveSim;
 pub use kernel::{SimKernel, SimResult, StepResult};
 pub use time::SimTime;
 pub use value::{DriveStrength, Driver, SimSignalId, SimSignalState};
 pub use waveform::{VcdRecorder, WaveformRecorder};
+
+/// Waveform output format selection.
+///
+/// Controls which waveform recorder implementation is used during simulation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaveformOutputFormat {
+    /// Value Change Dump (IEEE 1364) — human-readable text format.
+    Vcd,
+    /// Fast Signal Trace — compressed binary format (GTKWave native).
+    Fst,
+}
 
 /// Configuration for a simulation run.
 ///
@@ -60,10 +75,12 @@ pub struct SimConfig {
     /// Optional simulation time limit in femtoseconds.
     /// If `None`, simulation runs until event queue empties or `$finish`.
     pub time_limit: Option<u64>,
-    /// Optional path for VCD waveform output.
+    /// Optional path for waveform output.
     pub waveform_path: Option<PathBuf>,
     /// Whether to record waveform data. Ignored if `waveform_path` is `None`.
     pub record_waveform: bool,
+    /// Waveform output format. Defaults to VCD if not specified.
+    pub waveform_format: Option<WaveformOutputFormat>,
 }
 
 /// High-level entry point: runs a simulation on an elaborated design.
@@ -81,8 +98,12 @@ pub fn simulate(design: &Design, config: &SimConfig) -> Result<SimResult, SimErr
         if let Some(path) = &config.waveform_path {
             let file = File::create(path)?;
             let writer = BufWriter::new(file);
-            let recorder = VcdRecorder::new(writer);
-            kernel.set_recorder(Box::new(recorder));
+            let format = config.waveform_format.unwrap_or(WaveformOutputFormat::Vcd);
+            let recorder: Box<dyn WaveformRecorder> = match format {
+                WaveformOutputFormat::Vcd => Box::new(VcdRecorder::new(writer)),
+                WaveformOutputFormat::Fst => Box::new(FstRecorder::new(writer)),
+            };
+            kernel.set_recorder(recorder);
         }
     }
 
@@ -143,6 +164,7 @@ mod tests {
         assert!(config.time_limit.is_none());
         assert!(config.waveform_path.is_none());
         assert!(!config.record_waveform);
+        assert!(config.waveform_format.is_none());
     }
 
     #[test]
@@ -665,6 +687,7 @@ mod tests {
             time_limit: Some(100 * time::FS_PER_NS),
             waveform_path: None,
             record_waveform: false,
+            waveform_format: None,
         };
         let result = simulate(&design, &config).unwrap();
         assert!(!result.finished_by_user);

@@ -30,12 +30,22 @@ pub struct PendingUpdate {
 }
 
 /// The result of executing a single statement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ExecResult {
     /// Continue executing subsequent statements.
     Continue,
     /// Stop simulation (`$finish` was encountered).
     Finish,
+    /// Suspend execution for a delay, resuming later with the continuation.
+    ///
+    /// The kernel saves the continuation and schedules a wakeup event
+    /// at `current_time + delay_fs`.
+    Suspend {
+        /// Delay in femtoseconds before resuming.
+        delay_fs: u64,
+        /// The remaining statements to execute after the delay.
+        continuation: Box<Statement>,
+    },
 }
 
 /// Context for expression evaluation and statement execution.
@@ -467,11 +477,36 @@ pub fn exec_statement(
             }
         }
 
-        Statement::Block { stmts, .. } => {
-            for s in stmts {
+        Statement::Block { stmts, span } => {
+            for (i, s) in stmts.iter().enumerate() {
                 let result = exec_statement(ctx, s, pending, display_output)?;
-                if result == ExecResult::Finish {
-                    return Ok(ExecResult::Finish);
+                match result {
+                    ExecResult::Finish => return Ok(ExecResult::Finish),
+                    ExecResult::Suspend {
+                        delay_fs,
+                        continuation,
+                    } => {
+                        // Build continuation: remaining stmts after the current one
+                        let remaining: Vec<Statement> = stmts[i + 1..].to_vec();
+                        if remaining.is_empty() {
+                            return Ok(ExecResult::Suspend {
+                                delay_fs,
+                                continuation,
+                            });
+                        }
+                        // Wrap: execute the delay's body, then the remaining stmts
+                        let mut combined = vec![*continuation];
+                        combined.extend(remaining);
+                        let cont = Statement::Block {
+                            stmts: combined,
+                            span: *span,
+                        };
+                        return Ok(ExecResult::Suspend {
+                            delay_fs,
+                            continuation: Box::new(cont),
+                        });
+                    }
+                    ExecResult::Continue => {}
                 }
             }
             Ok(ExecResult::Continue)
@@ -511,6 +546,44 @@ pub fn exec_statement(
             let output = format_display(format, &evaluated_args);
             display_output.push(output);
             Ok(ExecResult::Continue)
+        }
+
+        Statement::Delay {
+            duration_fs, body, ..
+        } => Ok(ExecResult::Suspend {
+            delay_fs: *duration_fs,
+            continuation: body.clone(),
+        }),
+
+        Statement::Forever { body, span } => {
+            // Execute the body once; if it suspends (has a delay), wrap the
+            // continuation back into the forever loop for re-entry
+            let result = exec_statement(ctx, body, pending, display_output)?;
+            match result {
+                ExecResult::Suspend {
+                    delay_fs,
+                    continuation,
+                } => {
+                    // After the delay, execute the continuation then re-enter forever
+                    let reentry = Statement::Forever {
+                        body: body.clone(),
+                        span: *span,
+                    };
+                    let cont = Statement::Block {
+                        stmts: vec![*continuation, reentry],
+                        span: *span,
+                    };
+                    Ok(ExecResult::Suspend {
+                        delay_fs,
+                        continuation: Box::new(cont),
+                    })
+                }
+                ExecResult::Finish => Ok(ExecResult::Finish),
+                ExecResult::Continue => {
+                    // Forever without delay → would loop infinitely, just continue
+                    Ok(ExecResult::Continue)
+                }
+            }
         }
 
         Statement::Finish { .. } => Ok(ExecResult::Finish),
@@ -1159,7 +1232,7 @@ mod tests {
         let mut pending = Vec::new();
         let mut display = Vec::new();
         let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
-        assert_eq!(result, ExecResult::Continue);
+        assert!(matches!(result, ExecResult::Continue));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].value.to_u64(), Some(0b1010));
     }
@@ -1308,7 +1381,7 @@ mod tests {
         let mut pending = Vec::new();
         let mut display = Vec::new();
         let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
-        assert_eq!(result, ExecResult::Finish);
+        assert!(matches!(result, ExecResult::Finish));
     }
 
     #[test]
@@ -1367,7 +1440,7 @@ mod tests {
         let mut pending = Vec::new();
         let mut display = Vec::new();
         let result = exec_statement(&ctx, &Statement::Nop, &mut pending, &mut display).unwrap();
-        assert_eq!(result, ExecResult::Continue);
+        assert!(matches!(result, ExecResult::Continue));
         assert!(pending.is_empty());
     }
 
@@ -1394,7 +1467,7 @@ mod tests {
         let mut pending = Vec::new();
         let mut display = Vec::new();
         let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
-        assert_eq!(result, ExecResult::Finish);
+        assert!(matches!(result, ExecResult::Finish));
         assert_eq!(pending.len(), 1); // Only first assign
     }
 
@@ -1470,5 +1543,186 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(pending[0].range.is_some());
         assert_eq!(pending[0].range.unwrap(), (3, 0));
+    }
+
+    // ---- delay/forever tests ----
+
+    #[test]
+    fn exec_delay_suspends() {
+        let (mut signals, map, types) = setup_one_signal(LogicVec::new(4));
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = Statement::Delay {
+            duration_fs: 5_000_000,
+            body: Box::new(Statement::Assign {
+                target: SignalRef::Signal(SignalId::from_raw(0)),
+                value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+        let mut pending = Vec::new();
+        let mut display = Vec::new();
+        let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
+        if let ExecResult::Suspend {
+            delay_fs,
+            continuation,
+        } = result
+        {
+            assert_eq!(delay_fs, 5_000_000);
+            assert!(matches!(*continuation, Statement::Assign { .. }));
+        } else {
+            panic!("expected Suspend");
+        }
+        // No pending updates yet (delay hasn't elapsed)
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn exec_forever_with_delay_suspends() {
+        let (mut signals, map, types) = setup_one_signal(LogicVec::new(4));
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = Statement::Forever {
+            body: Box::new(Statement::Delay {
+                duration_fs: 5_000_000,
+                body: Box::new(Statement::Assign {
+                    target: SignalRef::Signal(SignalId::from_raw(0)),
+                    value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                    span: Span::DUMMY,
+                }),
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+        let mut pending = Vec::new();
+        let mut display = Vec::new();
+        let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
+        if let ExecResult::Suspend { delay_fs, .. } = result {
+            assert_eq!(delay_fs, 5_000_000);
+        } else {
+            panic!("expected Suspend");
+        }
+    }
+
+    #[test]
+    fn exec_forever_without_delay_continues() {
+        let (mut signals, map, types) = setup_one_signal(LogicVec::new(4));
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = Statement::Forever {
+            body: Box::new(Statement::Nop),
+            span: Span::DUMMY,
+        };
+        let mut pending = Vec::new();
+        let mut display = Vec::new();
+        let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
+        assert!(matches!(result, ExecResult::Continue));
+    }
+
+    #[test]
+    fn exec_block_suspends_captures_remaining() {
+        let (mut signals, map, types) = setup_one_signal(LogicVec::new(4));
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = Statement::Block {
+            stmts: vec![
+                Statement::Assign {
+                    target: SignalRef::Signal(SignalId::from_raw(0)),
+                    value: Expr::Literal(LogicVec::from_u64(0, 4)),
+                    span: Span::DUMMY,
+                },
+                Statement::Delay {
+                    duration_fs: 10_000_000,
+                    body: Box::new(Statement::Assign {
+                        target: SignalRef::Signal(SignalId::from_raw(0)),
+                        value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                        span: Span::DUMMY,
+                    }),
+                    span: Span::DUMMY,
+                },
+                Statement::Finish { span: Span::DUMMY },
+            ],
+            span: Span::DUMMY,
+        };
+        let mut pending = Vec::new();
+        let mut display = Vec::new();
+        let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
+        // First assign should have been executed
+        assert_eq!(pending.len(), 1);
+        // Should be suspended at the delay
+        if let ExecResult::Suspend {
+            delay_fs,
+            continuation,
+        } = result
+        {
+            assert_eq!(delay_fs, 10_000_000);
+            // Continuation should be a block containing the assign body + Finish
+            assert!(matches!(*continuation, Statement::Block { .. }));
+        } else {
+            panic!("expected Suspend");
+        }
+    }
+
+    #[test]
+    fn exec_delay_zero_suspends() {
+        let (mut signals, map, types) = setup_one_signal(LogicVec::new(1));
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = Statement::Delay {
+            duration_fs: 0,
+            body: Box::new(Statement::Nop),
+            span: Span::DUMMY,
+        };
+        let mut pending = Vec::new();
+        let mut display = Vec::new();
+        let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
+        if let ExecResult::Suspend { delay_fs, .. } = result {
+            assert_eq!(delay_fs, 0);
+        } else {
+            panic!("expected Suspend even for zero delay");
+        }
+    }
+
+    #[test]
+    fn exec_nested_delay_in_if() {
+        let (mut signals, map, types) = setup_one_signal(LogicVec::new(4));
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = Statement::If {
+            condition: Expr::Literal(LogicVec::from_bool(true)),
+            then_body: Box::new(Statement::Delay {
+                duration_fs: 1_000_000,
+                body: Box::new(Statement::Nop),
+                span: Span::DUMMY,
+            }),
+            else_body: None,
+            span: Span::DUMMY,
+        };
+        let mut pending = Vec::new();
+        let mut display = Vec::new();
+        let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
+        if let ExecResult::Suspend { delay_fs, .. } = result {
+            assert_eq!(delay_fs, 1_000_000);
+        } else {
+            panic!("expected Suspend from nested delay");
+        }
+    }
+
+    #[test]
+    fn exec_block_finish_after_delay_unreachable() {
+        // When a block hits a delay, it suspends before reaching finish
+        let (mut signals, map, types) = setup_one_signal(LogicVec::new(1));
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = Statement::Block {
+            stmts: vec![
+                Statement::Delay {
+                    duration_fs: 100,
+                    body: Box::new(Statement::Nop),
+                    span: Span::DUMMY,
+                },
+                Statement::Finish { span: Span::DUMMY },
+            ],
+            span: Span::DUMMY,
+        };
+        let mut pending = Vec::new();
+        let mut display = Vec::new();
+        let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
+        // Should suspend, not finish
+        assert!(matches!(result, ExecResult::Suspend { .. }));
     }
 }
