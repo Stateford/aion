@@ -18,7 +18,7 @@
 //! use aion_sim::{simulate, SimConfig};
 //!
 //! let config = SimConfig::default();
-//! let result = simulate(&design, &config)?;
+//! let result = simulate(&design, &config, &interner)?;
 //! println!("Simulation ended at {}", result.final_time);
 //! ```
 //!
@@ -46,6 +46,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 
+use aion_common::Interner;
 use aion_ir::Design;
 
 pub use error::SimError;
@@ -86,9 +87,14 @@ pub struct SimConfig {
 /// High-level entry point: runs a simulation on an elaborated design.
 ///
 /// Creates a `SimKernel`, optionally attaches a VCD recorder, configures
-/// time limits, and executes the simulation to completion.
-pub fn simulate(design: &Design, config: &SimConfig) -> Result<SimResult, SimError> {
-    let mut kernel = SimKernel::new(design)?;
+/// time limits, and executes the simulation to completion. The `interner`
+/// is used to resolve interned signal names for waveform output.
+pub fn simulate(
+    design: &Design,
+    config: &SimConfig,
+    interner: &Interner,
+) -> Result<SimResult, SimError> {
+    let mut kernel = SimKernel::new(design, interner)?;
 
     if let Some(limit) = config.time_limit {
         kernel.set_time_limit(limit);
@@ -117,7 +123,7 @@ pub fn simulate(design: &Design, config: &SimConfig) -> Result<SimResult, SimErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aion_common::{ContentHash, Ident, LogicVec};
+    use aion_common::{ContentHash, Ident, Interner, LogicVec};
     use aion_ir::arena::Arena;
     use aion_ir::{
         Assignment, CellKind, Connection, ConstValue, Design, Edge, EdgeSensitivity, Expr, Module,
@@ -125,6 +131,27 @@ mod tests {
         SignalId, SignalKind, SignalRef, SourceMap, Statement, Type, TypeDb,
     };
     use aion_source::Span;
+
+    /// Creates a test interner pre-populated with names matching `Ident::from_raw()` indices.
+    fn make_test_interner() -> Interner {
+        let interner = Interner::new();
+        interner.get_or_intern("__dummy__"); // 0
+        interner.get_or_intern("top"); // 1
+        interner.get_or_intern("clk"); // 2
+        interner.get_or_intern("out"); // 3
+        interner.get_or_intern("sel"); // 4
+        interner.get_or_intern("rst"); // 5
+        interner.get_or_intern("count"); // 6
+        interner.get_or_intern("q"); // 7
+        interner.get_or_intern("a"); // 8
+        interner.get_or_intern("b"); // 9
+        interner.get_or_intern("child"); // 10
+        interner.get_or_intern("in_sig"); // 11
+        interner.get_or_intern("out_sig"); // 12
+        interner.get_or_intern("in_port"); // 13
+        interner.get_or_intern("out_port"); // 14
+        interner
+    }
 
     fn make_type_db() -> TypeDb {
         let mut types = TypeDb::new();
@@ -181,7 +208,7 @@ mod tests {
         };
 
         let config = SimConfig::default();
-        let result = simulate(&design, &config).unwrap();
+        let result = simulate(&design, &config, &make_test_interner()).unwrap();
         assert!(!result.finished_by_user);
     }
 
@@ -248,12 +275,12 @@ mod tests {
         };
 
         let config = SimConfig::default();
-        let _result = simulate(&design, &config).unwrap();
+        let _result = simulate(&design, &config, &make_test_interner()).unwrap();
 
         // Create kernel to inspect values
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let _ = kernel.run_to_completion().unwrap();
-        let out = kernel.find_signal("top.sig2").unwrap();
+        let out = kernel.find_signal("top.sel").unwrap();
         // a=1, b=1, out = 1&1 = 1
         assert_eq!(kernel.signal_value(out).to_u64(), Some(1));
     }
@@ -320,8 +347,8 @@ mod tests {
             source_map: SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
-        let clk_id = kernel.find_signal("top.sig0").unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        let clk_id = kernel.find_signal("top.clk").unwrap();
 
         // Generate 3 clock cycles
         for cycle in 0..3 {
@@ -332,7 +359,7 @@ mod tests {
         }
 
         let _result = kernel.run(50 * time::FS_PER_NS).unwrap();
-        let count_id = kernel.find_signal("top.sig1").unwrap();
+        let count_id = kernel.find_signal("top.out").unwrap();
         // After 3 posedges, count should be 3
         assert_eq!(kernel.signal_value(count_id).to_u64(), Some(3));
     }
@@ -383,7 +410,7 @@ mod tests {
         };
 
         let config = SimConfig::default();
-        let result = simulate(&design, &config).unwrap();
+        let result = simulate(&design, &config, &make_test_interner()).unwrap();
         assert!(result.finished_by_user);
         assert_eq!(result.display_output.len(), 1);
         assert_eq!(result.display_output[0], "Hello, simulation!");
@@ -434,7 +461,7 @@ mod tests {
             source_map: SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let result = kernel.run_to_completion().unwrap();
         assert_eq!(result.assertion_failures.len(), 1);
         assert!(result.assertion_failures[0].contains("expected true"));
@@ -549,11 +576,11 @@ mod tests {
             source_map: SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let _result = kernel.run_to_completion().unwrap();
 
         // wire_in = 1, child inverts, wire_out should be 0
-        let out_id = kernel.find_signal("top.sig1").unwrap();
+        let out_id = kernel.find_signal("top.out").unwrap();
         assert_eq!(kernel.signal_value(out_id).to_u64(), Some(0));
     }
 
@@ -583,8 +610,8 @@ mod tests {
         };
 
         // Test VCD recording via kernel directly
-        let kernel = SimKernel::new(&design).unwrap();
-        let sig = kernel.find_signal("top.sig0").unwrap();
+        let kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        let sig = kernel.find_signal("top.clk").unwrap();
 
         let mut vcd_buf: Vec<u8> = Vec::new();
         // We can't easily set up the recorder without a reference issue,
@@ -664,9 +691,9 @@ mod tests {
             source_map: SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let _result = kernel.run_to_completion().unwrap();
-        let out_id = kernel.find_signal("top.sig1").unwrap();
+        let out_id = kernel.find_signal("top.out").unwrap();
         assert_eq!(kernel.signal_value(out_id).to_u64(), Some(1));
     }
 
@@ -689,7 +716,7 @@ mod tests {
             record_waveform: false,
             waveform_format: None,
         };
-        let result = simulate(&design, &config).unwrap();
+        let result = simulate(&design, &config, &make_test_interner()).unwrap();
         assert!(!result.finished_by_user);
     }
 
@@ -757,9 +784,9 @@ mod tests {
             source_map: SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let _ = kernel.run_to_completion().unwrap();
-        let out_id = kernel.find_signal("top.sig1").unwrap();
+        let out_id = kernel.find_signal("top.out").unwrap();
         assert_eq!(kernel.signal_value(out_id).to_u64(), Some(1));
     }
 }

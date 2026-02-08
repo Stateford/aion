@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use aion_common::Interner;
 use aion_config::ProjectConfig;
 use aion_diagnostics::DiagnosticSink;
-use aion_sim::{InteractiveSim, SimConfig, SimTime, WaveformOutputFormat};
+use aion_sim::{SimConfig, SimTime, WaveformOutputFormat};
 use aion_source::SourceDb;
 
 use crate::pipeline::{
@@ -76,17 +76,12 @@ pub fn run(args: &SimArgs, global: &GlobalArgs) -> Result<i32, Box<dyn std::erro
         return Ok(1);
     }
 
-    // Step 7: Interactive mode
+    // Step 7: Interactive mode — launch TUI
     if args.interactive {
         if !global.quiet {
-            eprintln!("   Entering interactive mode...");
+            eprintln!("   Entering interactive TUI...");
         }
-        let mut isim = InteractiveSim::new(&design)?;
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        let mut input = stdin.lock();
-        let mut output = stdout.lock();
-        isim.run_repl(&mut input, &mut output)?;
+        aion_tui::run_tui(&design, &interner)?;
         return Ok(0);
     }
 
@@ -133,7 +128,7 @@ pub fn run(args: &SimArgs, global: &GlobalArgs) -> Result<i32, Box<dyn std::erro
     };
 
     // Step 8: Run simulation
-    let result = aion_sim::simulate(&design, &sim_config)?;
+    let result = aion_sim::simulate(&design, &sim_config, &interner)?;
 
     // Step 9: Print $display output to stdout
     for line in &result.display_output {

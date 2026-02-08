@@ -251,7 +251,7 @@ fn run_single_testbench(
     };
 
     // Run simulation
-    match aion_sim::simulate(&design, &sim_config) {
+    match aion_sim::simulate(&design, &sim_config, interner) {
         Ok(result) => TestResult {
             name: tb_name.to_string(),
             passed: result.assertion_failures.is_empty(),

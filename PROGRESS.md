@@ -27,6 +27,7 @@
 | `aion_cli` | 🟢 Complete | 88 | CLI: `init`, `lint`, `sim`, `test` commands with shared pipeline, `--interactive` mode |
 | `aion_sim` | 🟢 Complete | 229 | Event-driven HDL simulator: kernel, evaluator, VCD/FST waveform, delta cycles, delay scheduling, interactive REPL |
 | `aion_conformance` | 🟢 Complete | 92 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 5 unit |
+| `aion_tui` | 🟢 Complete | 91 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping |
 
 ### Phase 0 Checklist
 
@@ -59,6 +60,102 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — Fix TUI signal naming & simulation time advancement
+
+**Crates:** `aion_sim`, `aion_tui`, `aion_cli`
+
+**What:** Fixed two critical bugs in the TUI: (1) signals displayed as `top.sig0` instead of real names like `top.clk`, and (2) simulation time never advanced past T=0 because `run_for()` only called `step_delta()` which doesn't process delay wakeups.
+
+**Problem 1: Signal names use raw IDs**
+
+Root cause: `SimKernel::flatten_module()` used `format!("{prefix}.sig{}", sig_id.as_raw())` because the kernel had no access to the `Interner` to resolve `Ident` values.
+
+Fix: Threaded `&Interner` through the entire call chain:
+- `SimKernel::new(design, interner)` — added interner parameter
+- `flatten_module()` — uses `interner.resolve(signal.name)` for signal names and `interner.resolve(cell.name)` for instance names
+- `simulate(design, config, interner)` — updated public API
+- `InteractiveSim::new(design, interner)` — updated constructor
+- `TuiApp::new(design, interner)` — updated constructor
+- `run_tui(design, interner)` — updated entry point
+- CLI `sim.rs` and `test.rs` — pass `&interner` to all simulation calls
+
+**Problem 2: Simulation time never advances**
+
+Root cause: `TuiApp::run_for()` only called `step_delta()`, which processes events from the event queue. But delay-based scheduling (e.g., `forever #5 clk = ~clk`) creates suspended processes, not events. `step_delta()` returns `Done` immediately when the event queue is empty.
+
+Fix: Added two new public methods to `SimKernel`:
+- `run_until(target_fs)` — loops processing both event queue and suspended process wakeups until target time, mirroring the internal `run_simulation()` loop
+- `next_event_time_fs()` — returns earliest pending event/wakeup time
+
+Updated `TuiApp`:
+- `step()` — calls `kernel.run_until(next_event_time)` to advance one meaningful time step
+- `run_for()` — calls `kernel.run_until(target_fs)` to advance by a duration
+
+**Modified files:**
+- `crates/aion_sim/src/kernel.rs` — Interner threading + `run_until()` + `next_event_time_fs()`
+- `crates/aion_sim/src/lib.rs` — Updated `simulate()` signature
+- `crates/aion_sim/src/interactive.rs` — Updated `InteractiveSim::new()` signature
+- `crates/aion_tui/src/app.rs` — Updated `TuiApp::new()`, rewrote `step()` and `run_for()`
+- `crates/aion_tui/src/lib.rs` — Updated `run_tui()` signature
+- `crates/aion_cli/src/sim.rs` — Pass interner to TUI and simulator
+- `crates/aion_cli/src/test.rs` — Pass interner to simulator
+- All test files updated with `make_test_interner()` helpers
+
+**Tests:** All existing tests updated to pass interner; signal name assertions updated from `"top.sig0"` to `"top.clk"` etc. No new test count change — all 1323 tests pass.
+**Clippy:** Clean (zero warnings with -D warnings)
+**Fmt:** Clean
+
+---
+
+#### 2026-02-08 — aion_tui ratatui-based waveform viewer & interactive simulator
+
+**Crate:** `aion_tui`
+
+**What:** Implemented a full terminal-based waveform viewer and interactive simulator replacing the line-based REPL (`InteractiveSim`) with a graphical ratatui TUI.
+
+**New crate:** `crates/aion_tui/` with 12 source files:
+- `lib.rs` — Crate root, `run_tui()` entry point, main event loop (50ms tick)
+- `app.rs` — `TuiApp` owns `SimKernel` + `WaveformData` + `TuiState`, `SignalInfo` struct; methods for step/run/command execution/key handling
+- `state.rs` — `TuiState`, `ViewPort` (zoom/scroll/time↔col mapping), `InputMode` (Normal/Command), `FocusedPanel`, `ValueFormat` (Hex/Binary/Decimal)
+- `waveform_data.rs` — `ValueChange`, `SignalHistory` (binary-search value lookup), `WaveformData` (in-memory change database)
+- `commands.rs` — `TuiCommand` enum extending `SimCommand` with zoom/goto/add/remove/format/help; `parse_tui_command()` with sim fallback
+- `event.rs` — `TuiEvent` enum (Key/Mouse/Tick/Resize), `poll_event()` via crossterm
+- `terminal.rs` — `init_terminal()`, `restore_terminal()`, `install_panic_hook()`
+- `render.rs` — Layout assembly (30/70 signal/waveform split), help popup
+- `widgets/signal_list.rs` — Signal names, widths, current values, waveform membership markers
+- `widgets/waveform.rs` — 1-bit traces (▀/▁/│), bus traces (═/╫ + hex labels), time ruler, cursor line
+- `widgets/status_bar.rs` — Mode indicator, simulation time, signal count, status message
+- `widgets/command_input.rs` — Key hints (normal mode) or `:` prompt (command mode)
+
+**Modified files:**
+- `aion_sim/src/interactive.rs` — Made `format_value()` and `parse_sim_duration()` public
+- `aion_cli/src/sim.rs` — Replaced `InteractiveSim::run_repl()` with `aion_tui::run_tui()`
+- Root `Cargo.toml` — Added `ratatui = "0.27"`, `crossterm = "0.27"`, `aion_tui` to workspace
+
+**Key design decisions:**
+- `TuiApp` owns `SimKernel` directly — does NOT reuse `InteractiveSim` (incompatible with immediate-mode rendering)
+- `WaveformData` captures signal history: kernel only exposes current values, so WaveformData snapshots after each `step_delta()` with binary-search lookup
+- Single-threaded event loop: poll crossterm → step sim if auto-running → render
+- Vim-like keybindings: j/k navigate, h/l scroll, +/- zoom, Space step, : command mode, q quit, f fit, d cycle format, ? help, Tab focus
+- All widgets testable via `ratatui::buffer::Buffer` — no real terminal needed
+
+**Tests added:** 91 tests
+- app (16): construction, init, step, signal values, time, commands (step/time/quit/zoom), key handling (quit/nav/command mode/enter/backspace/tab)
+- commands (14): zoom in/out/fit, goto/shortcut/missing arg, add/remove signal, format, sim passthrough (step/run), empty/unknown errors
+- state (20): viewport (defaults/span/time_to_col/col_to_time/zoom in/out/min/scroll/fit), state (defaults/select/bounds/toggle/cursor), value format, enums
+- waveform_data (14): signal history (record/lookup/boundary/before/changes/range/dedup/max_time/multi_bit), waveform data (default/register/count/max_time/snapshot/out_of_bounds)
+- widgets (15): signal_list (2), waveform (6: render/small/time_format/bus_value/1bit_data), status_bar (4: normal/command/zero/message), command_input (3: normal/command/zero)
+- render (4): full layout, small terminal, command mode, help popup
+- event (3): tick timeout, debug, resize
+- terminal (2): panic hook, restore idempotent
+- lib (3): construction, init+step, key handling
+
+**Test results:** 1323 passed, 0 failed (1232 previous + 91 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Fmt:** Clean
+
+---
 
 #### 2026-02-08 — Delay scheduling + FST spec-compliance rewrite
 
@@ -741,8 +838,9 @@ Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construct
 - [x] `aion_sim` — Core simulation kernel (229 tests, incl delay scheduling)
 - [x] CLI integration (`aion sim` / `aion test` commands)
 - [x] FST waveform format support (spec-compliant rewrite)
-- [x] Interactive TUI for simulation control (46 tests)
+- [x] Interactive TUI for simulation control (46 tests for REPL, 91 for TUI)
 - [x] Delay scheduling: `Delay`/`Forever` IR variants, continuation-based execution
+- [x] Ratatui-based TUI waveform viewer (`aion_tui`, 91 tests)
 - [ ] Conformance testing on real HDL designs
 
 ## Phase 2 — Synthesis (Months 8–14)

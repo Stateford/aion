@@ -8,7 +8,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use aion_common::{Logic, LogicVec};
+use aion_common::{Interner, Logic, LogicVec};
 use aion_ir::arena::Arena;
 use aion_ir::{
     CellKind, ConstValue, Design, Edge, Expr, ModuleId, Process, ProcessKind, Sensitivity,
@@ -143,8 +143,9 @@ impl SimKernel {
     /// Creates a new simulation kernel from an elaborated design.
     ///
     /// Flattens the module hierarchy, allocating flat signal IDs and creating
-    /// simulation processes with their signal mappings.
-    pub fn new(design: &Design) -> Result<Self, SimError> {
+    /// simulation processes with their signal mappings. The `interner` is used
+    /// to resolve interned signal and instance names into human-readable strings.
+    pub fn new(design: &Design, interner: &Interner) -> Result<Self, SimError> {
         let top_id = design.top;
         if design.modules.is_empty() {
             return Err(SimError::NoTopModule);
@@ -169,7 +170,7 @@ impl SimKernel {
 
         // Flatten the hierarchy starting at top
         let mut signal_map = HashMap::new();
-        kernel.flatten_module(design, top_id, "top", &mut signal_map)?;
+        kernel.flatten_module(design, top_id, "top", &mut signal_map, interner)?;
 
         // Build sensitivity map
         kernel.build_sensitivity_map();
@@ -234,7 +235,7 @@ impl SimKernel {
 
     /// Executes a single delta-cycle step.
     pub fn step_delta(&mut self) -> Result<StepResult, SimError> {
-        if self.finished || self.event_queue.is_empty() {
+        if self.event_queue.is_empty() {
             return Ok(StepResult::Done);
         }
 
@@ -356,6 +357,7 @@ impl SimKernel {
         module_id: ModuleId,
         prefix: &str,
         parent_signal_map: &mut HashMap<SignalId, SimSignalId>,
+        interner: &Interner,
     ) -> Result<HashMap<SignalId, SimSignalId>, SimError> {
         let module = design.modules.get(module_id);
         let mut signal_map = HashMap::new();
@@ -368,7 +370,7 @@ impl SimKernel {
                 continue;
             }
 
-            let name = format!("{prefix}.sig{}", sig_id.as_raw());
+            let name = format!("{prefix}.{}", interner.resolve(signal.name));
             let width = self.types.bit_width(signal.ty).unwrap_or(1);
 
             let init_value = match &signal.init {
@@ -425,7 +427,7 @@ impl SimKernel {
             } = &cell.kind
             {
                 let child_module = design.modules.get(*child_mod);
-                let child_prefix = format!("{prefix}.{}", cell.id.as_raw());
+                let child_prefix = format!("{prefix}.{}", interner.resolve(cell.name));
 
                 // Build parent-to-child signal binding
                 let mut child_port_map = HashMap::new();
@@ -443,7 +445,13 @@ impl SimKernel {
                     }
                 }
 
-                self.flatten_module(design, *child_mod, &child_prefix, &mut child_port_map)?;
+                self.flatten_module(
+                    design,
+                    *child_mod,
+                    &child_prefix,
+                    &mut child_port_map,
+                    interner,
+                )?;
             }
         }
 
@@ -742,11 +750,12 @@ impl SimKernel {
                 }
             }
 
-            // Apply updates immediately and also schedule events for sensitive processes
-            for update in &pending {
-                self.apply_update_immediate(update);
-            }
-            // Schedule as events for the next delta so sensitive processes see the change
+            // Schedule updates as events for the next delta cycle so that
+            // step_delta() can properly detect the change (comparing previous_value
+            // vs new value) and trigger sensitive processes (e.g. posedge clk →
+            // sequential counter).  We must NOT apply updates immediately here,
+            // because that would make step_delta see no difference and skip the
+            // sensitivity check.
             let next_delta = self.current_time.next_delta();
             for update in pending {
                 let value = if let Some((high, low)) = update.range {
@@ -767,12 +776,6 @@ impl SimKernel {
                     value,
                     _strength: DriveStrength::Strong,
                 }));
-            }
-
-            // Record waveform changes from wakeups
-            if self.recorder.is_some() {
-                // We already applied updates; record current signal values
-                // (handled by step_delta when the events fire)
             }
 
             match result {
@@ -966,6 +969,86 @@ impl SimKernel {
     /// Returns collected assertion failures and clears the buffer.
     pub fn take_assertion_failures(&mut self) -> Vec<String> {
         std::mem::take(&mut self.assertion_failures)
+    }
+
+    /// Runs the simulation until the given target time in femtoseconds.
+    ///
+    /// Unlike `step_delta()`, this method processes both queued events and
+    /// suspended process wakeups (delays), mirroring the main `run_simulation()`
+    /// loop. Use this for advancing simulation time in the TUI or interactive
+    /// mode where delay-based scheduling must be honored.
+    pub fn run_until(&mut self, target_fs: u64) -> Result<StepResult, SimError> {
+        let mut deltas_at_current_time = 0u32;
+
+        while !self.finished {
+            let next_event_time = self.event_queue.peek().map(|e| e.0.time.fs);
+            let next_wakeup_time = self.next_wakeup_time();
+            let next_time_fs = match (next_event_time, next_wakeup_time) {
+                (Some(e), Some(w)) => Some(e.min(w)),
+                (Some(e), None) => Some(e),
+                (None, Some(w)) => Some(w),
+                (None, None) => None,
+            };
+
+            let next_time_fs = match next_time_fs {
+                Some(t) => t,
+                None => return Ok(StepResult::Done),
+            };
+
+            if next_time_fs > target_fs {
+                // Nothing left to do before target time — advance time
+                self.current_time = SimTime {
+                    fs: target_fs,
+                    delta: 0,
+                };
+                return Ok(StepResult::Continued);
+            }
+
+            // Reset delta counter on time change
+            if next_time_fs != self.current_time.fs {
+                deltas_at_current_time = 0;
+            }
+
+            // Process suspended wakeups at this time (before events)
+            self.process_wakeups(next_time_fs)?;
+
+            // Process signal events at this time
+            if self
+                .event_queue
+                .peek()
+                .is_some_and(|e| e.0.time.fs <= next_time_fs)
+            {
+                let result = self.step_delta()?;
+                deltas_at_current_time += 1;
+
+                if deltas_at_current_time >= self.max_delta_per_step {
+                    return Err(SimError::DeltaCycleLimit {
+                        fs: self.current_time.fs,
+                        max_deltas: self.max_delta_per_step,
+                    });
+                }
+
+                if result == StepResult::Done && !self.has_pending_events() {
+                    return Ok(StepResult::Done);
+                }
+            }
+        }
+
+        Ok(StepResult::Done)
+    }
+
+    /// Returns the earliest time at which a pending event or wakeup is scheduled.
+    ///
+    /// Returns `None` if no events or wakeups are pending.
+    pub fn next_event_time_fs(&self) -> Option<u64> {
+        let next_event = self.event_queue.peek().map(|e| e.0.time.fs);
+        let next_wakeup = self.next_wakeup_time();
+        match (next_event, next_wakeup) {
+            (Some(e), Some(w)) => Some(e.min(w)),
+            (Some(e), None) => Some(e),
+            (None, Some(w)) => Some(w),
+            (None, None) => None,
+        }
     }
 
     /// Schedules an event at a future time.
@@ -1170,7 +1253,7 @@ fn collect_stmt_reads_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aion_common::{ContentHash, Ident};
+    use aion_common::{ContentHash, Ident, Interner};
     use aion_ir::{
         Arena, Assignment, BinaryOp, EdgeSensitivity, Module, Port, PortDirection, Signal, Type,
     };
@@ -1191,6 +1274,42 @@ mod tests {
             signed: false,
         });
         types
+    }
+
+    /// Creates a test interner pre-populated with names matching `Ident::from_raw()` indices.
+    ///
+    /// Indices: 0="__dummy__", 1="top", 2="clk", 3="out", 4="sel",
+    /// 5="rst", 6="count", 7="q", 8="a", 9="b", 10="child",
+    /// 11="in_sig", 12="in_port", 13="in_port", 14="out_port"
+    fn make_test_interner() -> Interner {
+        let interner = Interner::new();
+        // Index 0
+        interner.get_or_intern("__dummy__");
+        // Index 1
+        interner.get_or_intern("top");
+        // Index 2
+        interner.get_or_intern("clk");
+        // Index 3
+        interner.get_or_intern("out");
+        // Index 4
+        interner.get_or_intern("sel");
+        // Index 5
+        interner.get_or_intern("rst");
+        // Index 6
+        interner.get_or_intern("count");
+        // Index 7
+        interner.get_or_intern("q");
+        // Index 8
+        interner.get_or_intern("a");
+        // Index 9
+        interner.get_or_intern("b");
+        // Index 10
+        interner.get_or_intern("child");
+        // Index 11
+        interner.get_or_intern("in_sig");
+        // Index 12
+        interner.get_or_intern("in_port_name");
+        interner
     }
 
     fn empty_module(id: u32, name: Ident) -> Module {
@@ -1258,7 +1377,7 @@ mod tests {
     #[test]
     fn kernel_construction() {
         let design = make_simple_design();
-        let kernel = SimKernel::new(&design).unwrap();
+        let kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         assert!(kernel.signal_count() >= 2);
         assert!(kernel.process_count() >= 1); // implicit comb process
     }
@@ -1266,15 +1385,15 @@ mod tests {
     #[test]
     fn kernel_find_signal() {
         let design = make_simple_design();
-        let kernel = SimKernel::new(&design).unwrap();
-        let sig = kernel.find_signal("top.sig0");
+        let kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        let sig = kernel.find_signal("top.clk");
         assert!(sig.is_some());
     }
 
     #[test]
     fn kernel_current_time_starts_zero() {
         let design = make_simple_design();
-        let kernel = SimKernel::new(&design).unwrap();
+        let kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         assert_eq!(kernel.current_time(), SimTime::zero());
     }
 
@@ -1308,14 +1427,14 @@ mod tests {
     #[test]
     fn combinational_propagation() {
         let design = make_simple_design();
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
 
         // Set clk = 1
-        let clk_id = kernel.find_signal("top.sig0").unwrap();
+        let clk_id = kernel.find_signal("top.clk").unwrap();
         kernel.schedule_event(SimTime::from_ns(1), clk_id, LogicVec::from_bool(true));
 
         let _result = kernel.run(10 * crate::time::FS_PER_NS).unwrap();
-        let out_id = kernel.find_signal("top.sig1").unwrap();
+        let out_id = kernel.find_signal("top.out").unwrap();
         // After propagation, out should follow clk
         assert_eq!(kernel.signal_value(out_id).to_u64(), Some(1));
     }
@@ -1359,9 +1478,9 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let _result = kernel.run_to_completion().unwrap();
-        let sig = kernel.find_signal("top.sig0").unwrap();
+        let sig = kernel.find_signal("top.clk").unwrap();
         assert_eq!(kernel.signal_value(sig).to_u64(), Some(1));
     }
 
@@ -1400,7 +1519,7 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let result = kernel.run_to_completion().unwrap();
         assert!(result.finished_by_user);
     }
@@ -1449,7 +1568,7 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let result = kernel.run_to_completion().unwrap();
         assert_eq!(result.display_output.len(), 1);
         assert_eq!(result.display_output[0], "value = 42");
@@ -1508,14 +1627,14 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
 
         // Schedule posedge on clk
-        let clk_id = kernel.find_signal("top.sig0").unwrap();
+        let clk_id = kernel.find_signal("top.clk").unwrap();
         kernel.schedule_event(SimTime::from_ns(10), clk_id, LogicVec::from_bool(true));
 
         let _result = kernel.run(20 * crate::time::FS_PER_NS).unwrap();
-        let q_id = kernel.find_signal("top.sig1").unwrap();
+        let q_id = kernel.find_signal("top.out").unwrap();
         assert_eq!(kernel.signal_value(q_id).to_u64(), Some(1));
     }
 
@@ -1529,7 +1648,7 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
         assert!(matches!(
-            SimKernel::new(&design),
+            SimKernel::new(&design, &make_test_interner()),
             Err(SimError::NoTopModule)
         ));
     }
@@ -1537,8 +1656,8 @@ mod tests {
     #[test]
     fn schedule_event_works() {
         let design = make_simple_design();
-        let mut kernel = SimKernel::new(&design).unwrap();
-        let sig = kernel.find_signal("top.sig0").unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        let sig = kernel.find_signal("top.clk").unwrap();
         kernel.schedule_event(SimTime::from_ns(5), sig, LogicVec::from_bool(true));
         // Event queue should have at least 1 event
         assert!(!kernel.event_queue.is_empty());
@@ -1627,7 +1746,7 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let kernel = SimKernel::new(&design).unwrap();
+        let kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         // Parent signal + child's port signal should share the same SimSignalId
         assert!(kernel.signal_count() >= 1);
     }
@@ -1635,10 +1754,10 @@ mod tests {
     #[test]
     fn time_limit_stops_run() {
         let design = make_simple_design();
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
 
         // Schedule events far in the future
-        let sig = kernel.find_signal("top.sig0").unwrap();
+        let sig = kernel.find_signal("top.clk").unwrap();
         kernel.schedule_event(SimTime::from_ns(100), sig, LogicVec::from_bool(true));
         kernel.schedule_event(SimTime::from_ns(200), sig, LogicVec::from_bool(false));
 
@@ -1651,7 +1770,7 @@ mod tests {
     #[test]
     fn sim_result_fields() {
         let design = make_simple_design();
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let result = kernel.run_to_completion().unwrap();
         assert!(!result.finished_by_user);
         assert!(result.display_output.is_empty());
@@ -1661,7 +1780,7 @@ mod tests {
     #[test]
     fn step_delta_done_on_empty() {
         let design = make_simple_design();
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         // After initial propagation, run to settle
         let _ = kernel.run_to_completion().unwrap();
         // Now step should return Done
@@ -1672,7 +1791,7 @@ mod tests {
     #[test]
     fn set_max_delta() {
         let design = make_simple_design();
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         kernel.set_max_delta(5000);
         assert_eq!(kernel.max_delta_per_step, 5000);
     }
@@ -1702,8 +1821,8 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let kernel = SimKernel::new(&design).unwrap();
-        let sig = kernel.find_signal("top.sig0").unwrap();
+        let kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        let sig = kernel.find_signal("top.clk").unwrap();
         assert_eq!(kernel.signal_value(sig).get(0), Logic::X);
     }
 
@@ -1732,8 +1851,8 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let kernel = SimKernel::new(&design).unwrap();
-        let sig = kernel.find_signal("top.sig0").unwrap();
+        let kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        let sig = kernel.find_signal("top.clk").unwrap();
         assert_eq!(kernel.signal_value(sig).get(0), Logic::Zero);
     }
 
@@ -1788,12 +1907,12 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let result = kernel.run(100 * crate::time::FS_PER_NS).unwrap();
         // Should finish at 20ns
         assert!(result.finished_by_user);
         assert!(result.final_time.fs >= 20_000_000);
-        let sig = kernel.find_signal("top.sig0").unwrap();
+        let sig = kernel.find_signal("top.clk").unwrap();
         assert_eq!(kernel.signal_value(sig).to_u64(), Some(1));
     }
 
@@ -1861,14 +1980,14 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let result = kernel.run(50 * crate::time::FS_PER_NS).unwrap();
         // Should have run to 50ns
         assert!(!result.finished_by_user);
         // The clock should have toggled multiple times
         // At 50ns, we've had toggles at 5, 10, 15, 20, 25, 30, 35, 40, 45, 50 ns
         // Starting from 0, after 10 toggles the clock should be back to 0
-        let clk_id = kernel.find_signal("top.sig0").unwrap();
+        let clk_id = kernel.find_signal("top.clk").unwrap();
         // Just verify the simulation ran past 0 fs
         assert!(result.final_time.fs > 0);
         // Value alternates — exact value depends on timing
@@ -1935,12 +2054,12 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let result = kernel.run(200 * crate::time::FS_PER_NS).unwrap();
         // Should finish at 120 ns (20 + 100)
         assert!(result.finished_by_user);
         assert!(result.final_time.fs >= 120_000_000);
-        let rst = kernel.find_signal("top.sig0").unwrap();
+        let rst = kernel.find_signal("top.clk").unwrap();
         assert_eq!(kernel.signal_value(rst).to_u64(), Some(1));
     }
 
@@ -2052,13 +2171,13 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         let result = kernel.run(200 * crate::time::FS_PER_NS).unwrap();
         // Should finish by user at 120ns
         assert!(result.finished_by_user);
         assert!(result.final_time.fs >= 120_000_000);
         // rst_n should be 1 (was set at 20ns)
-        let rst = kernel.find_signal("top.sig1").unwrap();
+        let rst = kernel.find_signal("top.out").unwrap();
         assert_eq!(kernel.signal_value(rst).to_u64(), Some(1));
     }
 
@@ -2101,7 +2220,7 @@ mod tests {
             source_map: aion_ir::SourceMap::new(),
         };
 
-        let mut kernel = SimKernel::new(&design).unwrap();
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
         // After executing initial processes, there should be a suspended process
         kernel.execute_initial_processes().unwrap();
         assert_eq!(kernel.suspended_processes.len(), 1);

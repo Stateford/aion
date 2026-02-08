@@ -9,13 +9,14 @@
 //! ```ignore
 //! use aion_sim::interactive::InteractiveSim;
 //!
-//! let mut isim = InteractiveSim::new(&design)?;
+//! let mut isim = InteractiveSim::new(&design, &interner)?;
 //! isim.initialize()?;
 //! isim.run_repl(&mut std::io::stdin().lock(), &mut std::io::stdout())?;
 //! ```
 
 use std::io::{BufRead, Write};
 
+use aion_common::Interner;
 use aion_ir::Design;
 
 use crate::error::SimError;
@@ -116,8 +117,10 @@ pub struct InteractiveSim {
 
 impl InteractiveSim {
     /// Creates a new interactive simulation from an elaborated design.
-    pub fn new(design: &Design) -> Result<Self, SimError> {
-        let kernel = SimKernel::new(design)?;
+    ///
+    /// The `interner` is used to resolve interned signal names.
+    pub fn new(design: &Design, interner: &Interner) -> Result<Self, SimError> {
+        let kernel = SimKernel::new(design, interner)?;
         Ok(Self {
             kernel,
             breakpoints: Vec::new(),
@@ -519,7 +522,8 @@ pub fn parse_command(input: &str) -> Result<SimCommand, String> {
 /// Parses a duration string into femtoseconds.
 ///
 /// Supports units: `fs`, `ps`, `ns`, `us`, `ms`, `s`.
-fn parse_sim_duration(s: &str) -> Result<u64, String> {
+/// Returns the duration value in femtoseconds.
+pub fn parse_sim_duration(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty duration".to_string());
@@ -549,8 +553,12 @@ fn parse_sim_duration(s: &str) -> Result<u64, String> {
     Ok(number * multiplier)
 }
 
-/// Formats a LogicVec for display.
-fn format_value(val: &aion_common::LogicVec) -> String {
+/// Formats a `LogicVec` for display.
+///
+/// Single-bit values render as `0`, `1`, `x`, or `z`.
+/// Multi-bit values without X/Z render as hex (e.g., `8'hff`).
+/// Multi-bit values with X/Z render as binary (e.g., `4'bz0x1`).
+pub fn format_value(val: &aion_common::LogicVec) -> String {
     use aion_common::Logic;
     let w = val.width();
     if w == 1 {
@@ -612,13 +620,23 @@ Duration units: fs, ps, ns, us, ms, s"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aion_common::{ContentHash, Ident, LogicVec};
+    use aion_common::{ContentHash, Ident, Interner, LogicVec};
     use aion_ir::arena::Arena;
     use aion_ir::{
         Assignment, Design, Expr, Module, ModuleId, Process, ProcessId, ProcessKind, Sensitivity,
         Signal, SignalId, SignalKind, SignalRef, SourceMap, Statement, Type, TypeDb,
     };
     use aion_source::Span;
+
+    /// Creates a test interner pre-populated with names matching `Ident::from_raw()` indices.
+    fn make_test_interner() -> Interner {
+        let interner = Interner::new();
+        interner.get_or_intern("__dummy__"); // 0
+        interner.get_or_intern("top"); // 1
+        interner.get_or_intern("clk"); // 2
+        interner.get_or_intern("out"); // 3
+        interner
+    }
 
     fn make_type_db() -> TypeDb {
         let mut types = TypeDb::new();
@@ -929,7 +947,7 @@ mod tests {
     #[test]
     fn interactive_from_simple_design() {
         let design = make_simple_design();
-        let isim = InteractiveSim::new(&design).unwrap();
+        let isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         assert!(!isim.initialized);
         assert!(isim.breakpoints.is_empty());
         assert!(isim.watches.is_empty());
@@ -938,7 +956,7 @@ mod tests {
     #[test]
     fn interactive_initialize() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         assert!(isim.initialized);
         // Double-init should be ok
@@ -954,7 +972,7 @@ mod tests {
             types,
             source_map: SourceMap::new(),
         };
-        assert!(InteractiveSim::new(&design).is_err());
+        assert!(InteractiveSim::new(&design, &make_test_interner()).is_err());
     }
 
     // -- Command execution tests --
@@ -962,7 +980,7 @@ mod tests {
     #[test]
     fn execute_time_command() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         let result = isim.execute(&SimCommand::Time).unwrap();
         match result {
@@ -974,7 +992,7 @@ mod tests {
     #[test]
     fn execute_step_command() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         // After init, combinational propagation may have queued events
         let result = isim.execute(&SimCommand::Step).unwrap();
@@ -988,15 +1006,15 @@ mod tests {
     #[test]
     fn execute_inspect_known_signal() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         let result = isim
             .execute(&SimCommand::Inspect {
-                signals: vec!["top.sig0".to_string()],
+                signals: vec!["top.clk".to_string()],
             })
             .unwrap();
         match result {
-            CommandResult::Output(s) => assert!(s.contains("top.sig0")),
+            CommandResult::Output(s) => assert!(s.contains("top.clk")),
             _ => panic!("expected Output"),
         }
     }
@@ -1004,7 +1022,7 @@ mod tests {
     #[test]
     fn execute_inspect_unknown_signal() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         let result = isim
             .execute(&SimCommand::Inspect {
@@ -1020,13 +1038,13 @@ mod tests {
     #[test]
     fn execute_signals_list() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         let result = isim.execute(&SimCommand::Signals).unwrap();
         match result {
             CommandResult::Output(s) => {
                 assert!(s.contains("signal(s)"));
-                assert!(s.contains("top.sig0"));
+                assert!(s.contains("top.clk"));
             }
             _ => panic!("expected Output"),
         }
@@ -1035,7 +1053,7 @@ mod tests {
     #[test]
     fn execute_breakpoint_add() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         let result = isim
             .execute(&SimCommand::BreakpointTime { time_fs: 100 })
@@ -1050,11 +1068,11 @@ mod tests {
     #[test]
     fn execute_watch_add() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         let result = isim
             .execute(&SimCommand::Watch {
-                signal: "top.sig0".to_string(),
+                signal: "top.clk".to_string(),
             })
             .unwrap();
         match result {
@@ -1067,7 +1085,7 @@ mod tests {
     #[test]
     fn execute_help_text() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         let result = isim.execute(&SimCommand::Help).unwrap();
         match result {
             CommandResult::Output(s) => {
@@ -1082,7 +1100,7 @@ mod tests {
     #[test]
     fn execute_quit_command() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         let result = isim.execute(&SimCommand::Quit).unwrap();
         assert!(matches!(result, CommandResult::Quit));
     }
@@ -1090,7 +1108,7 @@ mod tests {
     #[test]
     fn execute_status_command() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         let result = isim.execute(&SimCommand::Status).unwrap();
         match result {
@@ -1106,7 +1124,7 @@ mod tests {
     #[test]
     fn execute_on_finish_design() {
         let design = make_finish_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         isim.initialize().unwrap();
         // Should be finished since initial block called $finish
         assert!(isim.kernel.is_finished());
@@ -1117,7 +1135,7 @@ mod tests {
     #[test]
     fn repl_quit_exits() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         let input = b"quit\n";
         let mut output = Vec::new();
         isim.run_repl(&mut &input[..], &mut output).unwrap();
@@ -1128,7 +1146,7 @@ mod tests {
     #[test]
     fn repl_multiple_commands() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         let input = b"time\nstatus\nquit\n";
         let mut output = Vec::new();
         isim.run_repl(&mut &input[..], &mut output).unwrap();
@@ -1141,7 +1159,7 @@ mod tests {
     #[test]
     fn repl_unknown_command_recovers() {
         let design = make_simple_design();
-        let mut isim = InteractiveSim::new(&design).unwrap();
+        let mut isim = InteractiveSim::new(&design, &make_test_interner()).unwrap();
         let input = b"badcmd\ntime\nquit\n";
         let mut output = Vec::new();
         isim.run_repl(&mut &input[..], &mut output).unwrap();

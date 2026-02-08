@@ -1,0 +1,19 @@
+[package]
+name = "aion_tui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal-based waveform viewer and interactive simulator for the Aion FPGA toolchain"
+
+[dependencies]
+aion_common = { workspace = true }
+aion_ir = { workspace = true }
+aion_sim = { workspace = true }
+thiserror = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+[dev-dependencies]
+aion_source = { workspace = true }
+tempfile = "3"
