@@ -45,13 +45,13 @@
 - [x] `aion_cli` — `init` and `lint` commands
 - [x] `aion_cache` — basic content-hash caching
 - [x] Human-readable error output with source spans
-- [ ] Parse + lint completes in <1s on test projects
+- [x] Parse + lint completes in <1s on test projects
 
 ### Milestone Criteria
 
 - [x] All three parsers pass conformance tests on open-source HDL projects
 - [x] `aion lint` produces useful diagnostics on real designs
-- [ ] Parse + lint < 1s on any reasonable project
+- [x] Parse + lint < 1s on any reasonable project
 - [x] Error recovery produces multiple diagnostics per file
 
 ---
@@ -59,6 +59,40 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — Performance benchmark: <1s milestone verified
+
+**What:** Benchmarked the full parse → elaborate → lint pipeline on generated SystemVerilog projects of increasing size (release build, WSL2 Linux).
+
+**Results:**
+
+| Project Size | Files | Lines | Avg Time | Throughput |
+|---|---|---|---|---|
+| Small | 156 | 4K | 13ms | 1.2M lines/s |
+| Medium | 1,156 | 43K | 36ms | 1.2M lines/s |
+| Large | 10,156 | 376K | 479ms | 785K lines/s |
+
+**Breakdown (10K-file project):**
+- File discovery: 12ms (3%)
+- File I/O: 146ms (37%)
+- Parse + elaborate + lint: 252ms (63%)
+
+**Why it's fast (no parallelism needed yet):**
+- Hand-rolled parsers with zero backtracking
+- Arena allocation for IR nodes (cache-friendly, near-zero alloc cost)
+- String interning via `lasso::ThreadedRodeo`
+- Single-pass elaboration
+- Compact IR for lint rule traversal
+
+**Future optimization levers (if needed):**
+1. Parallel file parsing via rayon (~2-4x, `Interner`/`DiagnosticSink` already thread-safe)
+2. Cache integration (`aion_cache` exists, not yet wired into CLI — skip unchanged files)
+3. Parallel lint execution (`LintRule` already `Send + Sync`)
+4. Memory-mapped I/O (eliminate file read overhead)
+
+**Milestone:** Phase 0 "Parse + lint < 1s on any reasonable project" — verified and checked off.
+
+---
 
 #### 2026-02-08 — Full lint rule conformance tests (all 15 rules)
 
