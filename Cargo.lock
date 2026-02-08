@@ -67,6 +67,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aion_conformance"
+version = "0.1.0"
+dependencies = [
+ "aion_common",
+ "aion_config",
+ "aion_diagnostics",
+ "aion_elaborate",
+ "aion_ir",
+ "aion_lint",
+ "aion_source",
+ "aion_sv_parser",
+ "aion_verilog_parser",
+ "aion_vhdl_parser",
+ "toml",
+]
+
+[[package]]
 name = "aion_diagnostics"
 version = "0.1.0"
 dependencies = [

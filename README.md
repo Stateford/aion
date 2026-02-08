@@ -115,6 +115,7 @@ Source Files (.v, .sv, .vhd)
 | `aion_cache` | Content-hash-based incremental compilation cache |
 | `aion_cli` | CLI entry point (`init`, `lint` commands) |
 | `aion_sim` | Event-driven HDL simulator with VCD output |
+| `aion_conformance` | Integration/conformance tests: full pipeline (parse→elaborate→lint) for all 3 languages |
 
 ### Design Principles
 
@@ -150,12 +151,30 @@ Source Files (.v, .sv, .vhd)
 
 ```bash
 cargo build                                  # Build all crates
-cargo test                                   # Run all 991 tests
+cargo test                                   # Run all 1058 tests
 cargo test -p aion_sim                       # Run tests for a specific crate
 cargo clippy --all-targets -- -D warnings    # Lint (zero warnings enforced)
 cargo fmt --check                            # Check formatting
 cargo doc --no-deps                          # Build documentation
 ```
+
+### Conformance Tests
+
+The `aion_conformance` crate runs 67 integration tests that exercise the full parse → elaborate → lint pipeline on realistic HDL designs across all three languages.
+
+```bash
+cargo test -p aion_conformance                              # Run all 67 conformance tests
+cargo test -p aion_conformance --test verilog_conformance   # Verilog-2005 designs (15 tests)
+cargo test -p aion_conformance --test sv_conformance        # SystemVerilog-2017 designs (15 tests)
+cargo test -p aion_conformance --test vhdl_conformance      # VHDL-2008 designs (12 tests)
+cargo test -p aion_conformance --test error_recovery        # Error recovery & graceful degradation (10 tests)
+cargo test -p aion_conformance --test lint_detection        # Lint rule detection through full pipeline (10 tests)
+```
+
+Test categories:
+- **Language conformance** — Counters, FSMs, ALUs, RAMs, shift registers, module hierarchies, generate blocks, gate primitives, functions, packages, structs
+- **Error recovery** — Malformed input handling, multi-error reporting, bad-then-good module recovery, empty source safety
+- **Lint detection** — Unused signals (W101), latch inference (W106), initial blocks (E102), deny/allow configuration
 
 ## Roadmap
 

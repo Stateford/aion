@@ -14,6 +14,7 @@ members = [
     "crates/aion_cache",
     "crates/aion_cli",
     "crates/aion_sim",
+    "crates/aion_conformance",
 ]
 
 [workspace.package]
