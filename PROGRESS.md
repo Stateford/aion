@@ -23,7 +23,7 @@
 | `aion_sv_parser` | 🟢 Complete | 166 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_elaborate` | 🟢 Complete | 113 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, all 3 languages |
 | `aion_lint` | 🟢 Complete | 91 | LintEngine, 15 rules (W101-W108, E102/E104/E105, C201-C204), IR traversal helpers |
-| `aion_cache` | 🟡 Stub only | — | Content-hash caching for parsed ASTs |
+| `aion_cache` | 🟢 Complete | 47 | Content-hash caching: manifest, artifact store, source hasher, cache orchestrator |
 | `aion_cli` | 🟢 Complete | 38 | CLI entry point: `init` (scaffolding) and `lint` (full pipeline) commands |
 
 ### Phase 0 Checklist
@@ -41,7 +41,7 @@
 - [x] `aion_elaborate` — AST→IR elaboration engine
 - [x] `aion_lint` — lint rules and engine (15 rules)
 - [x] `aion_cli` — `init` and `lint` commands
-- [ ] `aion_cache` — basic content-hash caching
+- [x] `aion_cache` — basic content-hash caching
 - [x] Human-readable error output with source spans
 - [ ] Parse + lint completes in <1s on test projects
 
@@ -57,6 +57,40 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-07 — aion_cache incremental compilation cache
+
+**Crate:** `aion_cache`
+
+**What:** Implemented content-hash-based caching for incremental rebuilds across 5 modules:
+
+- `error.rs` — `CacheError` enum with 6 variants: `Io`, `ManifestParse`, `InvalidHeader`, `ChecksumMismatch`, `VersionMismatch`, `Serialization`. All using `thiserror` derives
+- `manifest.rs` — `CacheManifest` (JSON manifest with per-file and per-module state), `FileCache` (content hash, AST cache key, module names), `ModuleCacheEntry` (interface/body hashes, dependencies, Phase 1+), `TargetCache` (device P&R state, Phase 1+). Methods: `new()`, `load()` (fail-safe), `save()`, `is_compatible()`
+- `artifact.rs` — `ArtifactHeader` (magic `b"AION"`, format version, checksum), `ArtifactStore` (content-addressed binary I/O). Binary format: 4-byte header length prefix + bincode header + raw payload. Validation: magic bytes, format version, XXH3-128 checksum. Methods: `write_artifact()`, `read_artifact()` (fail-safe), `gc()` (removes unreferenced artifacts)
+- `hasher.rs` — `ChangeSet` (new/modified/deleted/unchanged categorization), `SourceHasher` utility. Methods: `hash_file()`, `hash_files()`, `detect_changes()` (compares current hashes against manifest)
+- `cache.rs` — `Cache` high-level orchestrator. Methods: `load_or_create()` (fail-safe, version-aware), `detect_changes()`, `store_ast()`, `load_ast()`, `remove_deleted()`, `save()`, `gc()`
+- `lib.rs` — Module declarations, public re-exports, crate-level docs
+
+**Key design decisions:**
+- JSON manifest (human-readable) + bincode artifacts (fast, compact)
+- Raw bytes API (`&[u8]`/`Vec<u8>`) — avoids depending on parser crates
+- All reads fail-safe: corruption/missing/version mismatch = cache miss, not error
+- String keys for module names (not `Ident`, which is session-local)
+- `ModuleCacheEntry` and `TargetCache` types defined for Phase 1+ but maps stay empty
+- Relative paths in manifest for portability
+
+**Tests added:** 47 tests
+- 6 error tests (display format for all 6 variants)
+- 10 manifest tests (new empty, save/load roundtrip, nonexistent, corrupt JSON, version compat same/different, serde file/module/target cache, save creates dir)
+- 12 artifact tests (write/read roundtrip, missing, corrupt, wrong magic, wrong version, checksum mismatch, truncated header, path format, GC removes stale/preserves live/nonexistent dir, large payload)
+- 8 hasher tests (deterministic, different content, nonexistent error, multiple files, all-new/all-unchanged/modified/deleted change detection)
+- 11 cache tests (fresh/existing/version-mismatch load, detect changes new/deleted, store/load AST, cache miss, remove deleted, save persists, GC removes stale, full workflow)
+
+**Test results:** 855 passed, 0 failed (808 previous + 47 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Next:** CI/CD pipeline (GitHub Actions), conformance testing on real HDL projects, Phase 1 planning
+
+---
 
 #### 2026-02-07 — aion_cli init and lint commands
 
