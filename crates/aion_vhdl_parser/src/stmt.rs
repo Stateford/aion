@@ -10,7 +10,7 @@ use crate::token::VhdlToken;
 use aion_common::Ident;
 use aion_source::Span;
 
-impl<'src> VhdlParser<'src> {
+impl VhdlParser<'_> {
     // ========================================================================
     // Concurrent statements
     // ========================================================================

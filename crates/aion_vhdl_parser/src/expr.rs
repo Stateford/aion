@@ -63,7 +63,7 @@ fn prefix_binding_power(_op: &UnaryOp) -> u8 {
     11
 }
 
-impl<'src> VhdlParser<'src> {
+impl VhdlParser<'_> {
     /// Parses an expression.
     pub fn parse_expr(&mut self) -> Expr {
         self.parse_expr_bp(0)

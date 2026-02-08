@@ -32,7 +32,7 @@ struct Lexer<'a> {
     sink: &'a DiagnosticSink,
 }
 
-impl<'a> Lexer<'a> {
+impl Lexer<'_> {
     fn lex_all(&mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
         loop {

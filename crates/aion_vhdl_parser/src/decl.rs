@@ -8,7 +8,7 @@ use crate::parser::VhdlParser;
 use crate::token::VhdlToken;
 use aion_common::Ident;
 
-impl<'src> VhdlParser<'src> {
+impl VhdlParser<'_> {
     /// Parses declarations until a terminating keyword is reached.
     pub fn parse_declarations(&mut self) -> Vec<Declaration> {
         let mut decls = Vec::new();

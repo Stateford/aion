@@ -7,7 +7,7 @@ use crate::ast::*;
 use crate::parser::VhdlParser;
 use crate::token::VhdlToken;
 
-impl<'src> VhdlParser<'src> {
+impl VhdlParser<'_> {
     /// Parses a type indication (type mark with optional constraint).
     ///
     /// ```text

@@ -19,7 +19,7 @@
 | `aion_config` | 🟢 Complete | 22 | ProjectConfig, all config types, loader, validator, target resolver |
 | `aion_ir` | 🟢 Complete | 77 | Arena, IDs, TypeDb, Design, Module, Signal, Cell, Process, Expr, Statement, SourceMap |
 | `aion_vhdl_parser` | 🟢 Complete | 85 | Lexer, Pratt parser, full AST, error recovery, serde |
-| `aion_verilog_parser` | 🟡 Stub only | — | Full Verilog-2005 recursive descent parser |
+| `aion_verilog_parser` | 🟢 Complete | 127 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_sv_parser` | 🟡 Stub only | — | SystemVerilog-2017 parser (synth subset priority) |
 | `aion_elaborate` | 🟡 Stub only | — | Basic elaboration (hierarchy resolution) |
 | `aion_lint` | 🟡 Stub only | — | W101-W108, E101-E105, C201-C204 rules |
@@ -35,7 +35,7 @@
 - [x] `aion_diagnostics` — diagnostic types and terminal renderer
 - [x] `aion_config` — aion.toml parser
 - [x] `aion_vhdl_parser` — full grammar coverage
-- [ ] `aion_verilog_parser` — full grammar coverage
+- [x] `aion_verilog_parser` — full grammar coverage
 - [ ] `aion_sv_parser` — synthesizable subset
 - [x] `aion_ir` — core IR type definitions
 - [ ] `aion_elaborate` — basic hierarchy resolution
@@ -57,6 +57,46 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-07 — aion_verilog_parser full Verilog-2005 parser
+
+**Crate:** `aion_verilog_parser`
+
+**What:** Implemented a complete hand-rolled recursive descent Verilog-2005 parser across 7 modules:
+- `token` — `VerilogToken` enum (~55 keywords + ~30 operators + literals + identifiers), `Token` struct, `lookup_keyword()` function (case-sensitive), `is_keyword()`, `is_direction()`, `is_net_type()` predicates
+- `lexer` — Full lexer with case-sensitive keyword matching, sized/based literals (`4'b1010`, `16'hFF`, `8'sb10101010`), unsized based literals (`'b1`, `'hFF`), real literals, `//` line comments, `/* */` block comments (non-nesting), escaped identifiers (`\my+signal `), system identifiers (`$display`), compiler directives (backtick — skipped with diagnostic), C-style string escapes
+- `ast` — ~45 AST node types with `Span` on every node, serde derives, `Error` variants for recovery in VerilogItem/ModuleItem/Statement/Expr. Covers: VerilogSourceFile, ModuleDecl (ANSI/non-ANSI ports), PortDecl, Direction, NetType, ParameterDecl, all module items (NetDecl, RegDecl, IntegerDecl, RealDecl, ContinuousAssign, AlwaysBlock, InitialBlock, Instantiation, GateInst, GenerateBlock, GenvarDecl, FunctionDecl, TaskDecl, DefparamDecl), all statements (Blocking, NonBlocking, Block, If, Case, For, While, Forever, Repeat, Wait, EventControl, Delay, TaskCall, SystemTaskCall, Disable, Null), full expression tree (Identifier, HierarchicalName, Literal, RealLiteral, StringLiteral, Index, RangeSelect, PartSelect, Concat, Repeat, Unary, Binary, Ternary, FuncCall, SystemCall, Paren), UnaryOp (10 variants incl. reduction), BinaryOp (23 variants)
+- `parser` — `VerilogParser` struct with primitives (advance/eat/expect/expect_ident/peek_is/peek_kind), error recovery (recover_to_semicolon), top-level rules (source file, module, ANSI/non-ANSI port detection, parameter port list)
+- `expr` — Pratt expression parser with 13 Verilog precedence levels (IEEE 1364-2005 Table 5-4), right-associative `**` and `?:`, concatenation `{a,b}` vs replication `{3{a}}` detection, postfix index/range/part-select (`[i]`, `[m:l]`, `[i+:w]`, `[i-:w]`), hierarchical names, function/system calls
+- `stmt` — All statement types: blocking/non-blocking assignments with `<=` disambiguation (LHS parsed as name expression to avoid Pratt consuming `<=` as comparison), begin/end blocks with labels and declarations, if/else, case/casex/casez, for/while/forever/repeat, wait, event control (`@(posedge clk or negedge rst)`, `@(*)`, `@*`), delay control, system task calls, disable
+- `decl` — All module items: net/reg/integer/real declarations with ranges and array dimensions, parameter/localparam, non-ANSI port declarations, continuous assign, always/initial blocks, module instantiation (named + positional ports, parameter overrides, multiple instances), gate primitives, generate for/if with begin/end labels, genvar, defparam, function/task declarations
+- `lib` — Public API `parse_file()` wiring lexer → parser
+
+**Key design decisions:**
+- Case-sensitive keywords (unlike VHDL which is case-insensitive)
+- `<=` disambiguation: statement parser uses `parse_name_or_lvalue()` to parse LHS without entering Pratt parser, then checks for `=` (blocking) or `<=` (non-blocking). In expression context (inside `if()` conditions), `<=` is the comparison operator handled by Pratt parser.
+- Sized literals (`4'b1010`) handled entirely in lexer — detect `'` after digits, consume base letter + base-specific digits (including x/z/?)
+- ANSI vs non-ANSI port detection by peeking for direction keyword after `(`
+- Instantiation detection: peek for second identifier or `#` after first ident at module-item level
+- Concatenation `{a,b}` vs replication `{3{a}}`: check for inner `{` after first expr in braces
+- Part-select disambiguation (`[i+:4]` vs `[a+b:0]`): parse first expression with restricted binding power (bp=18) to stop before `+`/`-`, then check for `+:` or `-:` pattern
+- Compiler directives (backtick) emit "not yet supported" diagnostic and skip to end of line
+
+**Tests added:** 127 tests
+- 6 token tests (keyword lookup case-sensitivity, all keywords, non-keywords, predicates)
+- 30 lexer tests (empty input, whitespace, keywords, identifiers, escaped/system identifiers, all literal types, sized literals with x/z, operators, comments, compiler directives, error cases, spans)
+- 8 AST serde roundtrip tests (expr, module, source file, statement, binary op, case arm, range, span accessor)
+- 11 parser tests (minimal module, empty ports, ANSI/non-ANSI ports, parameters, direction inheritance, error recovery, body items, signed ports, multiple modules)
+- 22 expression tests (identifiers, literals, binary ops, precedence, associativity, unary, reduction, ternary, concat, repeat, index, range/part-select, function/system calls, hierarchical names, strings, complex expressions)
+- 20 statement tests (blocking/non-blocking, if/else, case/casex, for/while/forever/repeat, wait, event control posedge/multiple/star/@*, delay, system task, disable, labeled blocks, null)
+- 17 declaration tests (wire, reg, integer, real, parameter, localparam, assign, always, initial, instantiation named/positional, gate, genvar, function, task, non-ANSI ports, generate for/if)
+- 13 integration tests (counter, mux, shift register, ALU, RAM, FSM, generate, testbench, instantiation chain, multi-module, error recovery, serde roundtrip)
+
+**Test results:** 400 passed, 0 failed (273 previous + 127 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Next:** Implement `aion_sv_parser` (SystemVerilog-2017 parser)
+
+---
 
 #### 2026-02-07 — aion_vhdl_parser full VHDL-2008 parser
 
