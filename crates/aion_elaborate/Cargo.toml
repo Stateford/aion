@@ -8,7 +8,12 @@ license.workspace = true
 aion_common = { workspace = true }
 aion_source = { workspace = true }
 aion_diagnostics = { workspace = true }
+aion_config = { workspace = true }
 aion_ir = { workspace = true }
 aion_vhdl_parser = { workspace = true }
 aion_verilog_parser = { workspace = true }
 aion_sv_parser = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
+toml = "0.8"

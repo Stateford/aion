@@ -76,12 +76,15 @@ name = "aion_elaborate"
 version = "0.1.0"
 dependencies = [
  "aion_common",
+ "aion_config",
  "aion_diagnostics",
  "aion_ir",
  "aion_source",
  "aion_sv_parser",
  "aion_verilog_parser",
  "aion_vhdl_parser",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

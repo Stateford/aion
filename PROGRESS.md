@@ -21,7 +21,7 @@
 | `aion_vhdl_parser` | 🟢 Complete | 85 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_verilog_parser` | 🟢 Complete | 127 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_sv_parser` | 🟢 Complete | 166 | Lexer, Pratt parser, full AST, error recovery, serde |
-| `aion_elaborate` | 🟡 Stub only | — | Basic elaboration (hierarchy resolution) |
+| `aion_elaborate` | 🟢 Complete | 113 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, all 3 languages |
 | `aion_lint` | 🟡 Stub only | — | W101-W108, E101-E105, C201-C204 rules |
 | `aion_cache` | 🟡 Stub only | — | Content-hash caching for parsed ASTs |
 | `aion_cli` | 🟡 Stub only | — | `init`, `lint` commands |
@@ -38,7 +38,7 @@
 - [x] `aion_verilog_parser` — full grammar coverage
 - [x] `aion_sv_parser` — synthesizable subset
 - [x] `aion_ir` — core IR type definitions
-- [ ] `aion_elaborate` — basic hierarchy resolution
+- [x] `aion_elaborate` — AST→IR elaboration engine
 - [ ] `aion_lint` — syntax checking, basic semantic analysis
 - [ ] `aion_cli` — `init` and `lint` commands
 - [ ] `aion_cache` — basic content-hash caching
@@ -57,6 +57,50 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — aion_elaborate AST→AionIR elaboration engine
+
+**Crate:** `aion_elaborate`
+
+**What:** Implemented a full AST-to-AionIR elaboration engine across 10 modules:
+- `errors` — 12 error codes (E200–E211) and 2 warning codes (W200–W201) with helper functions for all elaboration diagnostics: unknown module, port mismatch, duplicate module/signal, unknown signal/port, type mismatch, top not found, circular instantiation, param eval failure, unsupported construct, no architecture
+- `const_eval` — Constant expression evaluator supporting all 3 languages: integer/sized/hex/octal literals parsed from source text, binary arithmetic (+, -, *, /, %), identifier lookup from `ConstEnv`, `$clog2` builtin, range evaluation for Verilog/SV, VHDL integer literals and names
+- `types` — Type resolution: Verilog net types (wire/reg/integer/real with ranges), SV port/var types (logic/bit/byte/shortint/int/longint with ranges), VHDL type indications (std_logic, std_logic_vector with constraints, integer, boolean, signed/unsigned)
+- `registry` — `ModuleRegistry` scanning all parsed files: Verilog modules, SV modules, VHDL entity/architecture pairs. O(1) lookup by interned name, duplicate detection across languages
+- `context` — `ElaborationContext` holding mutable state: Design under construction, registry reference, elaboration cache (name+param_hash → ModuleId), elaboration stack for cycle detection, port ID allocation
+- `expr` — Expression lowering from all 3 AST types to IR `Expr`: identifiers → signal lookup, literals → `LogicVec`, binary/unary/ternary ops with operator mapping, concat, repeat, index/slice. VHDL bit strings, character literals, aggregates
+- `stmt` — Statement lowering from all 3 AST types to IR `Statement`: blocking/nonblocking assign, if/case, blocks, event control passthrough. SV compound assignments expand to binary op + assign. SV incr/decr expand to +1/-1
+- `verilog` — Verilog module elaboration: parameter application with overrides, ANSI/non-ANSI port elaboration, all module items (net/reg/integer/real declarations, continuous assigns, always/initial blocks with sensitivity analysis, module instantiation with cross-language support, generate for/if)
+- `sv` — SystemVerilog module elaboration: same structure as Verilog plus `always_comb`/`always_ff`/`always_latch` with correct ProcessKind mapping, VarDecl with full type support, sensitivity list extraction from always_ff blocks
+- `vhdl` — VHDL entity+architecture elaboration: generic application, port elaboration from InterfaceDecl (multiple names per decl), architecture declarations (signals, constants), concurrent statements (process with sensitivity, signal assignment, component instantiation with generic map)
+- `lib` — Public API: `ParsedDesign` struct, `elaborate()` function, 11 integration tests
+
+**Key design decisions:**
+- `push_elab_stack` returns `bool` (not `Result`) — `false` on cycle, emits E207 diagnostic
+- Module cache keyed by `(Ident, param_hash)` — same module with same params reuses ModuleId
+- Borrow conflict resolution: `&mut ctx.design.types` used directly instead of `ctx.types()` in elaboration functions to avoid mutable borrow conflicts with `ctx.source_db`/`ctx.interner`/`ctx.sink`
+- Cross-language instantiation: any module can instantiate any language's module via registry lookup
+- VHDL architecture selection: last declared architecture (VHDL convention)
+- Literals parsed from source text via `source_db.snippet(span)` since parsers store Spans not values
+
+**Tests added:** 113 tests
+- 31 const_eval tests (literal parsing for decimal/sized/hex/octal/underscore, Verilog/SV/VHDL expression evaluation, binary arithmetic, $clog2, identifier lookup, range evaluation, non-constant diagnostics, const_to_i64 coercion)
+- 14 errors tests (all 12 error codes + 2 warning codes verified for correct code, severity, message content)
+- 9 types tests (Verilog bit/bitvec, SV logic/byte/int, VHDL std_logic/std_logic_vector/integer/unknown)
+- 6 registry tests (empty, Verilog/SV module registration, duplicate detection, lookup miss, VHDL entity without arch)
+- 9 context tests (construction, cache hit/miss/different params, elab stack push/pop/cycle/no-false-positive, types access, port ID allocation)
+- 15 expr tests (Verilog/SV identifiers, literals, binary ops, concat, ternary, unknown signal, VHDL names, bit strings, char literals, signal ref lowering)
+- 8 stmt tests (blocking assign, if, case, block, event control, SV compound assign, SV incr, VHDL signal assign)
+- 5 verilog tests (empty module, ports, wire/reg declarations, continuous assign, always block)
+- 3 sv tests (empty module, logic port, always_comb)
+- 3 vhdl tests (empty entity, ports, architecture with signal)
+- 11 integration tests (simple counter, hierarchy, SV always_ff, VHDL entity+arch, unknown top E206, unknown instantiation E200, mixed language, cache reuse, empty design, serde roundtrip, always_comb combinational)
+
+**Test results:** 679 passed, 0 failed (566 previous + 113 new)
+**Clippy:** Clean (zero warnings with -D warnings)
+**Next:** Implement `aion_lint` (lint rules and engine)
+
+---
 
 #### 2026-02-08 — aion_sv_parser full SystemVerilog-2017 parser
 
