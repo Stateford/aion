@@ -1,7 +1,7 @@
 # Aion — Implementation Progress
 
 **Started:** 2026-02-07
-**Current Phase:** Phase 2 — Synthesis
+**Current Phase:** Phase 3 — Bitstream & Integration
 
 ---
 
@@ -32,6 +32,7 @@
 | `aion_synth` | 🟢 Complete | 113 | Synthesis engine: behavioral lowering, expression lowering, optimization (const prop + DCE + CSE), technology mapping, resource counting |
 | `aion_timing` | 🟢 Complete | 84 | Static timing analysis: TimingGraph, SDC parser, forward/backward propagation, slack computation, critical path extraction, timing reports |
 | `aion_pnr` | 🟢 Complete | 90 | Place & route: MappedDesign→PnrNetlist conversion, random + simulated annealing placement, PathFinder routing + A* search, timing bridge |
+| `aion_bitstream` | 🟢 Complete | 110 | Bitstream generation: Intel SOF/POF/RBF + Xilinx BIT formats, ConfigBitDatabase trait, CRC-16/CRC-32, simplified config databases |
 
 ### Phase 0 Checklist
 
@@ -64,6 +65,36 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-09 — Implement `aion_bitstream` crate (Phase 3 start)
+
+**Tests added:** 110
+**What:** Implemented bitstream generation for Intel (SOF/POF/RBF) and Xilinx (BIT) FPGA devices. This is the first Phase 3 crate, providing the final pipeline stage that converts placed-and-routed netlists into vendor-specific binary files.
+
+**Implementation details:**
+- `lib.rs` — `BitstreamGenerator` trait, `Bitstream` struct, `BitstreamFormat` enum, `create_generator()` factory, `generate_bitstream()` convenience API
+- `crc.rs` — CRC-16-CCITT (Intel) and CRC-32 (Xilinx) with precomputed lookup tables
+- `config_bits.rs` — `FrameAddress`, `ConfigBit`, `ConfigFrame`, `ConfigImage` (BTreeMap-based accumulator), `ConfigBitDatabase` trait
+- `intel/sof.rs` — SOF format writer (magic + device/design strings + frames + CRC-16)
+- `intel/pof.rs` — POF format writer (magic + CFI flash metadata + frames + CRC-16)
+- `intel/rbf.rs` — RBF format writer (headerless raw frame data)
+- `intel/config_db.rs` — `SimplifiedIntelDb` placeholder config bit database (40 words/frame × 100 frames)
+- `intel/mod.rs` — `IntelBitstreamGenerator` with config assembly and format dispatch
+- `xilinx/bit.rs` — BIT format writer (TLV header + sync word + RCRC/COR0/WCFG commands + FAR/FDRI + CRC-32 + GRESTORE/START/DESYNC)
+- `xilinx/config_db.rs` — `SimplifiedXilinxDb` placeholder config bit database (101 words/frame × 100 frames, matching real 7-series frame word count)
+- `xilinx/mod.rs` — `XilinxBitstreamGenerator` with config assembly and format dispatch
+
+**Key decisions:**
+- No circular dependency: `aion_bitstream` depends on `aion_arch`, not vice versa. Factory dispatch uses `arch.family_name()`
+- Simplified config databases produce structurally valid but not hardware-accurate bitstreams — ready for swap-in of real Mistral/Project X-Ray data
+- Stub routing (RouteResource::Direct) gracefully skipped with S502 warnings
+- Unplaced cells skipped with S501 warnings
+- Unsupported format requests produce S503 errors
+- All format writers are deterministic (BTreeMap-sorted frames)
+
+**Status:** Phase 3 started. 1977 total workspace tests, all passing.
+
+---
 
 #### 2026-02-09 — Implement `aion_timing` and `aion_pnr` crates (Phase 2 completion)
 
@@ -1169,9 +1200,19 @@ Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construct
 - [x] `aion_timing` — Static timing analysis, SDC/XDC parsing (84 tests)
 - [x] `aion_pnr` — Place & route: simulated annealing + PathFinder router (90 tests)
 
-## Phase 3 — Place & Route (Months 14–22)
+## Phase 3 — Bitstream & Integration (Months 14–22)
 
-_Not yet started._
+**Goal:** End-to-end HDL→bitstream compilation, LSP, advanced optimization, real routing graphs.
+
+### Phase 3 Checklist
+
+- [x] `aion_bitstream` — Bitstream generation: Intel SOF/POF/RBF + Xilinx BIT (110 tests)
+- [ ] `aion_lsp` — Language Server Protocol implementation
+- [ ] `aion_flash` — JTAG programming and device detection
+- [ ] `aion_deps` — Dependency resolution, fetching, lock file
+- [ ] `aion_report` — Report generation (text, JSON, SARIF, SVG)
+- [ ] Real routing graphs in `aion_arch` (replace Phase 2 stubs)
+- [ ] Real config bit databases (Mistral/Project X-Ray)
 
 ## Phase 4 — Polish & Ecosystem (Months 22–28)
 

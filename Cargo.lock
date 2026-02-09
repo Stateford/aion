@@ -32,6 +32,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aion_bitstream"
+version = "0.1.0"
+dependencies = [
+ "aion_arch",
+ "aion_common",
+ "aion_diagnostics",
+ "aion_ir",
+ "aion_pnr",
+ "aion_source",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "aion_cache"
 version = "0.1.0"
 dependencies = [

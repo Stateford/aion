@@ -1,0 +1,20 @@
+[package]
+name = "aion_bitstream"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bitstream generation for Intel (SOF/POF/RBF) and Xilinx (BIT) FPGA devices"
+
+[dependencies]
+aion_common = { workspace = true }
+aion_diagnostics = { path = "../aion_diagnostics" }
+aion_arch = { path = "../aion_arch" }
+aion_ir = { path = "../aion_ir" }
+aion_pnr = { path = "../aion_pnr" }
+aion_source = { path = "../aion_source" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
