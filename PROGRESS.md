@@ -1,7 +1,7 @@
 # Aion — Implementation Progress
 
 **Started:** 2026-02-07
-**Current Phase:** Phase 1 — Simulation
+**Current Phase:** Phase 2 — Synthesis
 
 ---
 
@@ -28,6 +28,7 @@
 | `aion_sim` | 🟢 Complete | 250 | Event-driven HDL simulator: kernel, evaluator, VCD/FST waveform, delta cycles, delay scheduling, interactive REPL, VCD loader |
 | `aion_conformance` | 🟢 Complete | 155 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 49 real-world designs, 13 project integration, 6 unit |
 | `aion_tui` | 🟢 Complete | 117 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping, bus expansion, cursor-time values, viewer mode |
+| `aion_arch` | 🟢 Complete | 124 | Architecture trait, TechMapper trait, Intel Cyclone IV E (5 devices), Cyclone V (3 devices), Xilinx Artix-7 (3 devices), load_architecture() factory |
 
 ### Phase 0 Checklist
 
@@ -60,6 +61,42 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — Implement `aion_arch` crate (Phase 2 foundation)
+
+**Crate:** `aion_arch` (new)
+
+**What:** Implemented the FPGA device architecture model crate that provides the `Architecture` trait, `TechMapper` trait, and concrete implementations for Intel Cyclone V and Xilinx Artix-7 families. This is the first crate of Phase 2 (Synthesis), required by `aion_synth` for device-specific resource counts and technology mapping.
+
+**Structure:**
+- `ids.rs` — Opaque IDs: `SiteId`, `BelId`, `WireId`, `PipId`
+- `types.rs` — `TileType`, `Tile`, `SiteType`, `BelType`, `Bel`, `Site`, `Wire`, `Pip`, `RoutingGraph`, `Delay`, `ResourceUsage`
+- `tech_map.rs` — `TechMapper` trait, `MemoryCell`, `ArithmeticPattern`, `LogicCone`, `MapResult`, `LutMapping`
+- `lib.rs` — `Architecture` trait (Phase 2 required + Phase 3 stubs), `load_architecture()` factory
+- `intel/cyclone_iv.rs` — `CycloneIv` (5 devices) + `CycloneIvMapper` (K=4 LUT, M9K, 18x18 DSP)
+- `intel/cyclone_v.rs` — `CycloneV` (3 devices) + `CycloneVMapper` (K=6 LUT, M10K, 18x18 DSP)
+- `xilinx/artix7.rs` — `Artix7` (3 devices) + `Artix7Mapper` (K=6 LUT, BRAM36, DSP48E1 25x18)
+
+**Key design decisions:**
+- Phase 3 methods (`grid_dimensions`, routing, timing) have default stub impls returning zero/empty
+- `cell_delay`/`setup_time` take `&str` to avoid circular deps with `aion_pnr`
+- `map_cell()` provides basic gate→LUT truth table mapping; complex decomposition deferred to `aion_synth`
+- Unknown devices fall back to smallest family member
+- Family name matching supports aliases (e.g., `cyclone_v`, `cyclonev`, `cyclone-v`)
+
+**Tests added:** 124 new tests + 1 doc-test
+- ids: 7 tests (roundtrip, equality, hash, serde, debug format)
+- types: 16 tests (construction, defaults, serde, all type variants)
+- tech_map: 10 tests (construction, serde, pattern variants)
+- intel: 3 family tests + 25 CycloneIV/mapper tests + 22 CycloneV/mapper tests
+- xilinx: 3 family tests + 22 Artix7/mapper tests
+- lib: 16 tests (factory, aliases, defaults, error cases)
+
+**Test results:** 1579 tests, all passing (was 1455, +124 new)
+**Clippy:** Clean (zero warnings)
+**Fmt:** Clean
+
+---
 
 #### 2026-02-08 — Fix bit-select assignments and slice update merging (two simulator bugs)
 
