@@ -18,6 +18,8 @@ members = [
     "crates/aion_tui",
     "crates/aion_arch",
     "crates/aion_synth",
+    "crates/aion_timing",
+    "crates/aion_pnr",
 ]
 
 [workspace.package]
@@ -57,3 +59,6 @@ aion_sim = { path = "crates/aion_sim" }
 aion_tui = { path = "crates/aion_tui" }
 aion_arch = { path = "crates/aion_arch" }
 aion_synth = { path = "crates/aion_synth" }
+aion_timing = { path = "crates/aion_timing" }
+aion_pnr = { path = "crates/aion_pnr" }
+rand = "0.8"

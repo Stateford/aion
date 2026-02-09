@@ -30,6 +30,8 @@
 | `aion_tui` | 🟢 Complete | 117 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping, bus expansion, cursor-time values, viewer mode |
 | `aion_arch` | 🟢 Complete | 124 | Architecture trait, TechMapper trait, Intel Cyclone IV E (5 devices), Cyclone V (3 devices), Xilinx Artix-7 (3 devices), load_architecture() factory |
 | `aion_synth` | 🟢 Complete | 113 | Synthesis engine: behavioral lowering, expression lowering, optimization (const prop + DCE + CSE), technology mapping, resource counting |
+| `aion_timing` | 🟢 Complete | 84 | Static timing analysis: TimingGraph, SDC parser, forward/backward propagation, slack computation, critical path extraction, timing reports |
+| `aion_pnr` | 🟢 Complete | 90 | Place & route: MappedDesign→PnrNetlist conversion, random + simulated annealing placement, PathFinder routing + A* search, timing bridge |
 
 ### Phase 0 Checklist
 
@@ -62,6 +64,43 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-09 — Implement `aion_timing` and `aion_pnr` crates (Phase 2 completion)
+
+**Crates:** `aion_timing` (new, 84 tests), `aion_pnr` (new, 90 tests)
+
+**What:** Implemented static timing analysis and place-and-route engine, completing Phase 2.
+
+**`aion_timing` structure:**
+- `ids.rs` — `TimingNodeId`, `TimingEdgeId` opaque IDs
+- `constraints.rs` — `TimingConstraints`, `ClockConstraint`, `IoDelay`, `FalsePath`, `MulticyclePath`, `MaxDelayPath`
+- `graph.rs` — `TimingGraph`, `TimingNode`, `TimingEdge`, `TimingNodeType`, `TimingEdgeType`
+- `report.rs` — `TimingReport`, `CriticalPath`, `PathElement`, `ClockDomainTiming`, `TimingEndpoint`
+- `sdc.rs` — SDC parser: `create_clock`, `set_input_delay`, `set_output_delay`, `set_false_path`, `set_multicycle_path`, `set_max_delay`
+- `sta.rs` — STA algorithm: forward/backward propagation, slack computation, critical path extraction, frequency calculation
+
+**`aion_pnr` structure:**
+- `ids.rs` — `PnrCellId`, `PnrNetId`, `PnrPinId` opaque IDs with Display
+- `data.rs` — `PnrNetlist`, `PnrCell`, `PnrCellType` (Lut/Dff/Carry/Bram/Dsp/Iobuf/Pll), `PnrNet`, `PnrPin`
+- `route_tree.rs` — `RouteTree`, `RouteNode`, `RouteResource` (Wire/Pip/SitePin/Direct)
+- `convert.rs` — `convert_to_pnr()`: MappedDesign → flat PnrNetlist with IO buffers
+- `placement/` — Random initial placement + simulated annealing (Metropolis criterion, HPWL cost)
+- `routing/` — PathFinder negotiated congestion + A* search + congestion tracking (stub routing for Phase 2)
+- `timing_bridge.rs` — `build_timing_graph()`: PnrNetlist → TimingGraph for STA feedback
+
+**Key decisions:**
+- `aion_timing` defines `TimingGraph` (no PnR dependency); `aion_pnr::timing_bridge` converts PnrNetlist → TimingGraph
+- Placement uses synthetic site IDs from architecture resource counts (Phase 2); real grid in Phase 3
+- Routing uses stub route trees when routing graph is empty (Phase 2); PathFinder ready for real graphs
+- Net delay estimated from Manhattan distance of placement (0.1 ns per unit distance)
+
+**Tests:** 174 new tests across both crates. Full workspace: 1867 tests passing.
+**Clippy:** Clean (zero warnings with `-D warnings`)
+**Format:** Clean
+
+**Status:** Phase 2 complete. All 4 Phase 2 crates done (aion_arch, aion_synth, aion_timing, aion_pnr).
+
+---
 
 #### 2026-02-08 — Implement `aion_arch` crate (Phase 2 foundation)
 
@@ -1127,8 +1166,8 @@ Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construct
 
 - [x] `aion_arch` — Architecture models, TechMapper trait, device databases (124 tests)
 - [x] `aion_synth` — Synthesis engine: behavioral lowering, optimization, tech mapping (113 tests)
-- [ ] `aion_pnr` — Place & route: simulated annealing + PathFinder router
-- [ ] `aion_timing` — Static timing analysis, SDC/XDC parsing
+- [x] `aion_timing` — Static timing analysis, SDC/XDC parsing (84 tests)
+- [x] `aion_pnr` — Place & route: simulated annealing + PathFinder router (90 tests)
 
 ## Phase 3 — Place & Route (Months 14–22)
 

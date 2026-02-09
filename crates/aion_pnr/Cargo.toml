@@ -1,0 +1,21 @@
+[package]
+name = "aion_pnr"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aion_common = { workspace = true }
+aion_source = { path = "../aion_source" }
+aion_diagnostics = { path = "../aion_diagnostics" }
+aion_ir = { path = "../aion_ir" }
+aion_arch = { path = "../aion_arch" }
+aion_synth = { path = "../aion_synth" }
+aion_timing = { path = "../aion_timing" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
