@@ -478,10 +478,11 @@ pub fn lower_vhdl_expr(
 }
 
 /// Converts a Verilog AST expression into a [`SignalRef`] for use as an
-/// assignment target.
+/// assignment target. Handles identifiers, bit/range selects, and concatenations.
 pub fn lower_to_signal_ref(
     expr: &aion_verilog_parser::ast::Expr,
     sig_env: &SignalEnv,
+    source_db: &SourceDb,
     interner: &Interner,
     sink: &DiagnosticSink,
 ) -> SignalRef {
@@ -495,10 +496,43 @@ pub fn lower_to_signal_ref(
                 SignalRef::Const(LogicVec::all_zero(1))
             }
         }
+        Expr::Index { base, index, .. } => {
+            if let Some(sid) = extract_base_signal_verilog(base, sig_env) {
+                if let Some(idx) = try_const_index_verilog(index, source_db) {
+                    SignalRef::Slice {
+                        signal: sid,
+                        high: idx,
+                        low: idx,
+                    }
+                } else {
+                    SignalRef::Signal(sid)
+                }
+            } else {
+                SignalRef::Const(LogicVec::all_zero(1))
+            }
+        }
+        Expr::RangeSelect { base, msb, lsb, .. } => {
+            if let Some(sid) = extract_base_signal_verilog(base, sig_env) {
+                if let (Some(hi), Some(lo)) = (
+                    try_const_index_verilog(msb, source_db),
+                    try_const_index_verilog(lsb, source_db),
+                ) {
+                    SignalRef::Slice {
+                        signal: sid,
+                        high: hi,
+                        low: lo,
+                    }
+                } else {
+                    SignalRef::Signal(sid)
+                }
+            } else {
+                SignalRef::Const(LogicVec::all_zero(1))
+            }
+        }
         Expr::Concat { elements, .. } => {
             let parts: Vec<_> = elements
                 .iter()
-                .map(|e| lower_to_signal_ref(e, sig_env, interner, sink))
+                .map(|e| lower_to_signal_ref(e, sig_env, source_db, interner, sink))
                 .collect();
             SignalRef::Concat(parts)
         }
@@ -507,9 +541,11 @@ pub fn lower_to_signal_ref(
 }
 
 /// Converts an SV AST expression into a [`SignalRef`] for assignment targets.
+/// Handles identifiers, bit/range selects, and concatenations.
 pub fn lower_sv_to_signal_ref(
     expr: &aion_sv_parser::ast::Expr,
     sig_env: &SignalEnv,
+    source_db: &SourceDb,
     interner: &Interner,
     sink: &DiagnosticSink,
 ) -> SignalRef {
@@ -523,14 +559,94 @@ pub fn lower_sv_to_signal_ref(
                 SignalRef::Const(LogicVec::all_zero(1))
             }
         }
+        Expr::Index { base, index, .. } => {
+            if let Some(sid) = extract_base_signal_sv(base, sig_env) {
+                if let Some(idx) = try_const_index_sv(index, source_db) {
+                    SignalRef::Slice {
+                        signal: sid,
+                        high: idx,
+                        low: idx,
+                    }
+                } else {
+                    SignalRef::Signal(sid)
+                }
+            } else {
+                SignalRef::Const(LogicVec::all_zero(1))
+            }
+        }
+        Expr::RangeSelect { base, msb, lsb, .. } => {
+            if let Some(sid) = extract_base_signal_sv(base, sig_env) {
+                if let (Some(hi), Some(lo)) = (
+                    try_const_index_sv(msb, source_db),
+                    try_const_index_sv(lsb, source_db),
+                ) {
+                    SignalRef::Slice {
+                        signal: sid,
+                        high: hi,
+                        low: lo,
+                    }
+                } else {
+                    SignalRef::Signal(sid)
+                }
+            } else {
+                SignalRef::Const(LogicVec::all_zero(1))
+            }
+        }
         Expr::Concat { elements, .. } => {
             let parts: Vec<_> = elements
                 .iter()
-                .map(|e| lower_sv_to_signal_ref(e, sig_env, interner, sink))
+                .map(|e| lower_sv_to_signal_ref(e, sig_env, source_db, interner, sink))
                 .collect();
             SignalRef::Concat(parts)
         }
         _ => SignalRef::Const(LogicVec::all_zero(1)),
+    }
+}
+
+/// Extracts the base [`SignalId`] from a Verilog `Identifier` expression.
+fn extract_base_signal_verilog(
+    expr: &aion_verilog_parser::ast::Expr,
+    sig_env: &SignalEnv,
+) -> Option<SignalId> {
+    if let aion_verilog_parser::ast::Expr::Identifier { name, .. } = expr {
+        sig_env.get(name).copied()
+    } else {
+        None
+    }
+}
+
+/// Extracts the base [`SignalId`] from an SV `Identifier` expression.
+fn extract_base_signal_sv(
+    expr: &aion_sv_parser::ast::Expr,
+    sig_env: &SignalEnv,
+) -> Option<SignalId> {
+    if let aion_sv_parser::ast::Expr::Identifier { name, .. } = expr {
+        sig_env.get(name).copied()
+    } else {
+        None
+    }
+}
+
+/// Tries to const-evaluate a Verilog expression to a `u32` index value.
+fn try_const_index_verilog(
+    expr: &aion_verilog_parser::ast::Expr,
+    source_db: &SourceDb,
+) -> Option<u32> {
+    if let aion_verilog_parser::ast::Expr::Literal { span } = expr {
+        let text = source_db.snippet(*span);
+        crate::const_eval::parse_verilog_literal(text).and_then(|v| u32::try_from(v).ok())
+    } else {
+        None
+    }
+}
+
+/// Tries to const-evaluate an SV expression to a `u32` index value.
+fn try_const_index_sv(expr: &aion_sv_parser::ast::Expr, source_db: &SourceDb) -> Option<u32> {
+    if let aion_sv_parser::ast::Expr::Literal { span } = expr {
+        let text = source_db.snippet(*span);
+        crate::const_eval::parse_verilog_literal(text).and_then(|v| u32::try_from(v).ok())
+    } else {
+        None
     }
 }
 
@@ -596,10 +712,15 @@ pub(crate) fn logic_vec_from_u64(width: u32, val: u64) -> LogicVec {
 }
 
 /// Parses a Verilog/SV numeric literal from source text into a `LogicVec`.
+///
+/// For sized literals like `24'h000000`, the explicit width is used.
+/// For unsized literals like `42`, width is inferred from the value.
 fn lower_verilog_literal(span: Span, source_db: &SourceDb) -> IrExpr {
     let text = source_db.snippet(span);
-    if let Some(val) = const_eval::parse_verilog_literal(text) {
-        let width = if val == 0 {
+    if let Some((explicit_width, val)) = const_eval::parse_verilog_literal_with_width(text) {
+        let width = if let Some(w) = explicit_width {
+            w
+        } else if val == 0 {
             1
         } else {
             64 - val.unsigned_abs().leading_zeros()
@@ -922,6 +1043,59 @@ mod tests {
     }
 
     #[test]
+    fn sized_literal_preserves_width_24bit_zero() {
+        let (mut sdb, _interner, _sink, _env) = setup();
+        let fid = sdb.add_source("test.v", "24'h000000".to_string());
+        let span = aion_source::Span::new(fid, 0, 10);
+        let ir = lower_verilog_literal(span, &sdb);
+        if let IrExpr::Literal(lv) = &ir {
+            assert_eq!(lv.width(), 24, "24'h000000 should produce 24-bit LogicVec");
+        } else {
+            panic!("expected Literal");
+        }
+    }
+
+    #[test]
+    fn sized_literal_preserves_width_8bit_zero() {
+        let (mut sdb, _interner, _sink, _env) = setup();
+        let fid = sdb.add_source("test.v", "8'h00".to_string());
+        let span = aion_source::Span::new(fid, 0, 5);
+        let ir = lower_verilog_literal(span, &sdb);
+        if let IrExpr::Literal(lv) = &ir {
+            assert_eq!(lv.width(), 8, "8'h00 should produce 8-bit LogicVec");
+        } else {
+            panic!("expected Literal");
+        }
+    }
+
+    #[test]
+    fn sized_literal_preserves_width_24bit_one() {
+        let (mut sdb, _interner, _sink, _env) = setup();
+        let fid = sdb.add_source("test.v", "24'h000001".to_string());
+        let span = aion_source::Span::new(fid, 0, 10);
+        let ir = lower_verilog_literal(span, &sdb);
+        if let IrExpr::Literal(lv) = &ir {
+            assert_eq!(lv.width(), 24, "24'h000001 should produce 24-bit LogicVec");
+        } else {
+            panic!("expected Literal");
+        }
+    }
+
+    #[test]
+    fn unsized_literal_infers_width() {
+        let (mut sdb, _interner, _sink, _env) = setup();
+        let fid = sdb.add_source("test.v", "42".to_string());
+        let span = aion_source::Span::new(fid, 0, 2);
+        let ir = lower_verilog_literal(span, &sdb);
+        if let IrExpr::Literal(lv) = &ir {
+            // 42 = 0b101010, needs 6 bits
+            assert_eq!(lv.width(), 6, "42 should produce 6-bit LogicVec");
+        } else {
+            panic!("expected Literal");
+        }
+    }
+
+    #[test]
     fn verilog_binary_op() {
         let (sdb, interner, sink, mut env) = setup();
         let a = interner.get_or_intern("a");
@@ -1053,7 +1227,7 @@ mod tests {
 
     #[test]
     fn signal_ref_lowering() {
-        let (_sdb, interner, sink, mut env) = setup();
+        let (sdb, interner, sink, mut env) = setup();
         let a = interner.get_or_intern("a");
         env.insert(a, SignalId::from_raw(5));
 
@@ -1061,22 +1235,160 @@ mod tests {
             name: a,
             span: Span::DUMMY,
         };
-        let sr = lower_to_signal_ref(&ast_expr, &env, &interner, &sink);
+        let sr = lower_to_signal_ref(&ast_expr, &env, &sdb, &interner, &sink);
         assert!(matches!(sr, SignalRef::Signal(s) if s == SignalId::from_raw(5)));
     }
 
     #[test]
     fn signal_ref_unknown_emits_error() {
-        let (_sdb, interner, sink, env) = setup();
+        let (sdb, interner, sink, env) = setup();
         let unknown = interner.get_or_intern("unknown");
 
         let ast_expr = aion_verilog_parser::ast::Expr::Identifier {
             name: unknown,
             span: Span::DUMMY,
         };
-        let sr = lower_to_signal_ref(&ast_expr, &env, &interner, &sink);
+        let sr = lower_to_signal_ref(&ast_expr, &env, &sdb, &interner, &sink);
         assert!(matches!(sr, SignalRef::Const(_)));
         assert!(sink.has_errors());
+    }
+
+    #[test]
+    fn signal_ref_verilog_index() {
+        let (mut sdb, interner, sink, mut env) = setup();
+        let fid = sdb.add_source("test.v", "3".to_string());
+        let a = interner.get_or_intern("a");
+        env.insert(a, SignalId::from_raw(2));
+
+        let ast_expr = aion_verilog_parser::ast::Expr::Index {
+            base: Box::new(aion_verilog_parser::ast::Expr::Identifier {
+                name: a,
+                span: Span::DUMMY,
+            }),
+            index: Box::new(aion_verilog_parser::ast::Expr::Literal {
+                span: aion_source::Span::new(fid, 0, 1),
+            }),
+            span: Span::DUMMY,
+        };
+        let sr = lower_to_signal_ref(&ast_expr, &env, &sdb, &interner, &sink);
+        assert!(matches!(
+            sr,
+            SignalRef::Slice {
+                signal,
+                high: 3,
+                low: 3,
+            } if signal == SignalId::from_raw(2)
+        ));
+    }
+
+    #[test]
+    fn signal_ref_verilog_range_select() {
+        let (mut sdb, interner, sink, mut env) = setup();
+        let fid = sdb.add_source("test.v", "7 0".to_string());
+        let a = interner.get_or_intern("a");
+        env.insert(a, SignalId::from_raw(1));
+
+        let ast_expr = aion_verilog_parser::ast::Expr::RangeSelect {
+            base: Box::new(aion_verilog_parser::ast::Expr::Identifier {
+                name: a,
+                span: Span::DUMMY,
+            }),
+            msb: Box::new(aion_verilog_parser::ast::Expr::Literal {
+                span: aion_source::Span::new(fid, 0, 1),
+            }),
+            lsb: Box::new(aion_verilog_parser::ast::Expr::Literal {
+                span: aion_source::Span::new(fid, 2, 3),
+            }),
+            span: Span::DUMMY,
+        };
+        let sr = lower_to_signal_ref(&ast_expr, &env, &sdb, &interner, &sink);
+        assert!(matches!(
+            sr,
+            SignalRef::Slice {
+                signal,
+                high: 7,
+                low: 0,
+            } if signal == SignalId::from_raw(1)
+        ));
+    }
+
+    #[test]
+    fn signal_ref_sv_index() {
+        let (mut sdb, interner, sink, mut env) = setup();
+        let fid = sdb.add_source("test.sv", "5".to_string());
+        let b = interner.get_or_intern("b");
+        env.insert(b, SignalId::from_raw(3));
+
+        let ast_expr = aion_sv_parser::ast::Expr::Index {
+            base: Box::new(aion_sv_parser::ast::Expr::Identifier {
+                name: b,
+                span: Span::DUMMY,
+            }),
+            index: Box::new(aion_sv_parser::ast::Expr::Literal {
+                span: aion_source::Span::new(fid, 0, 1),
+            }),
+            span: Span::DUMMY,
+        };
+        let sr = lower_sv_to_signal_ref(&ast_expr, &env, &sdb, &interner, &sink);
+        assert!(matches!(
+            sr,
+            SignalRef::Slice {
+                signal,
+                high: 5,
+                low: 5,
+            } if signal == SignalId::from_raw(3)
+        ));
+    }
+
+    #[test]
+    fn signal_ref_sv_range_select() {
+        let (mut sdb, interner, sink, mut env) = setup();
+        let fid = sdb.add_source("test.sv", "15 8".to_string());
+        let c = interner.get_or_intern("c");
+        env.insert(c, SignalId::from_raw(0));
+
+        let ast_expr = aion_sv_parser::ast::Expr::RangeSelect {
+            base: Box::new(aion_sv_parser::ast::Expr::Identifier {
+                name: c,
+                span: Span::DUMMY,
+            }),
+            msb: Box::new(aion_sv_parser::ast::Expr::Literal {
+                span: aion_source::Span::new(fid, 0, 2),
+            }),
+            lsb: Box::new(aion_sv_parser::ast::Expr::Literal {
+                span: aion_source::Span::new(fid, 3, 4),
+            }),
+            span: Span::DUMMY,
+        };
+        let sr = lower_sv_to_signal_ref(&ast_expr, &env, &sdb, &interner, &sink);
+        assert!(matches!(
+            sr,
+            SignalRef::Slice {
+                signal,
+                high: 15,
+                low: 8,
+            } if signal == SignalId::from_raw(0)
+        ));
+    }
+
+    #[test]
+    fn signal_ref_index_unknown_base() {
+        let (mut sdb, interner, sink, env) = setup();
+        let fid = sdb.add_source("test.v", "0".to_string());
+        let unknown = interner.get_or_intern("unknown");
+
+        let ast_expr = aion_verilog_parser::ast::Expr::Index {
+            base: Box::new(aion_verilog_parser::ast::Expr::Identifier {
+                name: unknown,
+                span: Span::DUMMY,
+            }),
+            index: Box::new(aion_verilog_parser::ast::Expr::Literal {
+                span: aion_source::Span::new(fid, 0, 1),
+            }),
+            span: Span::DUMMY,
+        };
+        let sr = lower_to_signal_ref(&ast_expr, &env, &sdb, &interner, &sink);
+        assert!(matches!(sr, SignalRef::Const(_)));
     }
 
     #[test]

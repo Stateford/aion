@@ -139,6 +139,45 @@ fn run_pipeline_verilog(source: &str, config: &ProjectConfig) -> PipelineResult 
     finish_pipeline(parsed, config, &source_db, &interner, &sink)
 }
 
+/// Runs the full pipeline on multiple SystemVerilog source files.
+///
+/// Each entry in `files` is `(filename, source_text)`. All files are parsed
+/// as SystemVerilog-2017, then elaborated together with the given top module
+/// and run through the default lint rules. This enables testing multi-file
+/// designs with module hierarchies split across files.
+pub fn full_pipeline_sv_multifile(files: &[(&str, &str)], top: &str) -> PipelineResult {
+    let config = make_config(top);
+    full_pipeline_sv_multifile_with_config(files, &config)
+}
+
+/// Runs the full pipeline on multiple SystemVerilog source files with custom config.
+///
+/// Like [`full_pipeline_sv_multifile`] but accepts an explicit [`ProjectConfig`]
+/// for lint allow/deny overrides.
+pub fn full_pipeline_sv_multifile_with_config(
+    files: &[(&str, &str)],
+    config: &ProjectConfig,
+) -> PipelineResult {
+    let mut source_db = SourceDb::new();
+    let interner = Interner::new();
+    let sink = DiagnosticSink::new();
+
+    let mut sv_files = Vec::with_capacity(files.len());
+    for (name, source) in files {
+        let file_id = source_db.add_source(name, source.to_string());
+        let ast = aion_sv_parser::parse_file(file_id, &source_db, &interner, &sink);
+        sv_files.push(ast);
+    }
+
+    let parsed = ParsedDesign {
+        verilog_files: vec![],
+        sv_files,
+        vhdl_files: vec![],
+    };
+
+    finish_pipeline(parsed, config, &source_db, &interner, &sink)
+}
+
 fn run_pipeline_sv(source: &str, config: &ProjectConfig) -> PipelineResult {
     let mut source_db = SourceDb::new();
     let interner = Interner::new();
@@ -236,6 +275,17 @@ mod tests {
         let result = full_pipeline_sv("module top; endmodule", "top");
         assert!(!result.has_errors);
         assert_eq!(result.design.module_count(), 1);
+    }
+
+    #[test]
+    fn pipeline_sv_multifile_two_modules() {
+        let files = &[
+            ("a.sv", "module a; endmodule"),
+            ("b.sv", "module b; a u_a(); endmodule"),
+        ];
+        let result = full_pipeline_sv_multifile(files, "b");
+        assert!(!result.has_errors, "errors: {:?}", result.diagnostics);
+        assert_eq!(result.design.module_count(), 2);
     }
 
     #[test]

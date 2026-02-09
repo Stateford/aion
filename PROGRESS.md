@@ -21,12 +21,12 @@
 | `aion_vhdl_parser` | 🟢 Complete | 85 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_verilog_parser` | 🟢 Complete | 127 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_sv_parser` | 🟢 Complete | 166 | Lexer, Pratt parser, full AST, error recovery, serde |
-| `aion_elaborate` | 🟢 Complete | 117 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, delay/forever preservation, all 3 languages |
+| `aion_elaborate` | 🟢 Complete | 134 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, delay/forever preservation, bit/range-select targets, all 3 languages |
 | `aion_lint` | 🟢 Complete | 91 | LintEngine, 15 rules (W101-W108, E102/E104/E105, C201-C204), IR traversal helpers |
 | `aion_cache` | 🟢 Complete | 47 | Content-hash caching: manifest, artifact store, source hasher, cache orchestrator |
 | `aion_cli` | 🟢 Complete | 93 | CLI: `init`, `lint`, `sim`, `test`, `view` commands with shared pipeline, `--interactive` mode |
 | `aion_sim` | 🟢 Complete | 250 | Event-driven HDL simulator: kernel, evaluator, VCD/FST waveform, delta cycles, delay scheduling, interactive REPL, VCD loader |
-| `aion_conformance` | 🟢 Complete | 141 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 49 real-world designs, 5 unit |
+| `aion_conformance` | 🟢 Complete | 155 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 49 real-world designs, 13 project integration, 6 unit |
 | `aion_tui` | 🟢 Complete | 117 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping, bus expansion, cursor-time values, viewer mode |
 
 ### Phase 0 Checklist
@@ -60,6 +60,92 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-08 — Fix bit-select assignments and slice update merging (two simulator bugs)
+
+**Crates:** `aion_elaborate`, `aion_sim`
+
+**Bug 1 — Bit-select assignment targets silently discarded:**
+The elaborator's `lower_sv_to_signal_ref()` and `lower_to_signal_ref()` only handled `Identifier` and `Concat` expressions as assignment targets. Index expressions like `leds[0]` fell through to the `_ => SignalRef::Const(...)` catch-all, meaning the assignment wrote to nothing. Signals driven by bit-select assignments (e.g., `led_ctrl`'s `always_comb` with `leds[0] = count[0]; ... leds[7] = count[7];`) stayed permanently X.
+
+**Fix:** Added `Expr::Index` → `SignalRef::Slice { signal, high: idx, low: idx }` and `Expr::RangeSelect` → `SignalRef::Slice { signal, high, low }` handling to both Verilog and SV `lower_*_to_signal_ref()` functions. Added `source_db` parameter for const-evaluating index literals. Helper functions: `extract_base_signal_verilog/sv()`, `try_const_index_verilog/sv()`.
+
+**Bug 2 — Multiple slice updates to same signal clobbered each other:**
+When 8 separate `leds[0..7]` assignments produced 8 `PendingUpdate` entries, each merged its bit onto the **current** (unchanged) signal value independently, then scheduled 8 separate full-width events. Only the last event's bit survived. Result: `leds` showed `xxxx0xxx` instead of `00000000`.
+
+**Fix:** Added `SimKernel::merge_and_schedule()` that groups pending updates by target signal, accumulating all bit-writes into a single merged value before scheduling one event per signal. Replaced all three scheduling locations (step_delta, process_wakeups, initialize) with this method.
+
+**Example update:** Reduced `clk_divider` from 24-bit to 3-bit counter so tick/count/leds change within observable simulation time. Extended testbench to 500ns.
+
+**Tests added (5 in aion_elaborate):**
+- `signal_ref_verilog_index` — bit-select produces `SignalRef::Slice`
+- `signal_ref_verilog_range_select` — range-select produces `SignalRef::Slice`
+- `signal_ref_sv_index` — SV bit-select produces `SignalRef::Slice`
+- `signal_ref_sv_range_select` — SV range-select produces `SignalRef::Slice`
+- `signal_ref_index_unknown_base` — unknown base falls back to `SignalRef::Const`
+
+**Test results:** 1455 tests, all passing (was 1450, +5 new)
+**Clippy:** Clean (zero warnings)
+
+**Verification:** `blinky_soc` simulation now shows correct behavior — `cnt` counts 0→7, `tick` pulses every 8 clocks, `count` increments on each tick, `leds` mirrors `count` exactly.
+
+#### 2026-02-08 — Fix sized literal width loss in elaborator (critical sim bug)
+
+**Crate:** `aion_elaborate`
+
+**What:** Fixed a critical bug where sized Verilog/SystemVerilog literals like `24'h000000`, `8'h00`, `24'h000001` lost their explicit width during elaboration. The `parse_verilog_literal()` function discarded the width prefix entirely, and `lower_verilog_literal()` inferred width from the value (0 → 1 bit). This caused multi-module simulation to produce all-X signals after reset, because assignments like `cnt <= 24'h000000` became 1-bit assignments to 24-bit signals.
+
+**Root cause:** `parse_verilog_literal()` only returned the numeric value, discarding the size prefix. `lower_verilog_literal()` then computed `width = if val == 0 { 1 } else { 64 - leading_zeros }`, which produced width=1 for any zero-valued sized literal.
+
+**Fix:**
+- Added `parse_verilog_literal_with_width()` that returns `(Option<u32>, i64)` — the explicit width prefix (if any) plus the value
+- Updated `lower_verilog_literal()` to use the explicit width when present, falling back to value-based inference for unsized literals
+- This also fixes the W103 lint false positive (sized literals now report correct widths)
+
+**Tests added:** 12 new tests (8 for `parse_verilog_literal_with_width`, 4 for `lower_verilog_literal` width preservation)
+
+**Verification:** The `examples/blinky_soc/` simulation now correctly shows `cnt` incrementing 0,1,2,3... on each posedge clk after reset, instead of staying X.
+
+**Tests:** 1450 passed, 0 failed
+**Clippy:** Clean
+**Fmt:** Clean
+
+---
+
+#### 2026-02-08 — Example project + multi-file integration tests
+
+**Crate:** `aion_conformance`
+
+**What:** Added an example blinky SoC project and integration tests that exercise the full multi-file pipeline (file discovery → config loading → multi-file parsing → elaboration → lint), both in-memory and from on-disk project layouts.
+
+**New directory:** `examples/blinky_soc/` — A small SystemVerilog SoC with 4 modules:
+- `src/top.sv` — `blinky_top`: wires 3 submodules (clk_divider, counter, led_ctrl)
+- `src/clk_divider.sv` — 24-bit counter producing a slow tick pulse
+- `src/counter.sv` — 8-bit counter with synchronous enable
+- `src/led_ctrl.sv` — Combinational mapping of counter bits to LED outputs
+- `tests/blinky_tb.sv` — Simple testbench with clock and reset
+
+**New file:** `crates/aion_conformance/tests/project_integration.rs`
+
+**New public API:**
+- `full_pipeline_sv_multifile(files, top)` — Parses multiple named SV source strings into a single `ParsedDesign` and runs the full pipeline
+- `full_pipeline_sv_multifile_with_config(files, config)` — Same with custom `ProjectConfig`
+
+**Test categories (13 integration + 1 unit = 14 new tests):**
+- **Category A — Multi-file pipeline (in-memory, 6 tests):** hierarchy resolution (4 modules, 3 cells), clean lint, missing submodule error, duplicate module detection (E202), single file via multifile API, custom lint config with allow
+- **Category B — On-disk project (tempfile, 6 tests):** full discovery+pipeline (3 files, config load, 3 modules), subdirectory discovery, lint issue detection (W101), lint config allow suppression, empty src graceful handling, top module not found (E206)
+- **Category C — Committed example (1 test):** `example_blinky_soc_lints_clean` verifies the actual `examples/blinky_soc/` project has no errors, 4 modules, and 3 instantiations
+
+**Modified files:**
+- `crates/aion_conformance/src/lib.rs` — Added `full_pipeline_sv_multifile()`, `full_pipeline_sv_multifile_with_config()`, 1 unit test
+- `crates/aion_conformance/Cargo.toml` — Added `tempfile = "3"` dev-dependency
+
+**Tests added:** 14 new tests (141 → 155 conformance, 1424 → 1438 workspace total)
+**Test results:** 1438 passed, 0 failed
+**Clippy:** Clean (zero warnings with -D warnings)
+**Fmt:** Clean
+
+---
 
 #### 2026-02-08 — Real-world HDL conformance tests (Phase 1 complete)
 

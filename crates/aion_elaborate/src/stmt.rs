@@ -38,7 +38,7 @@ pub fn lower_verilog_stmt(
             value,
             span,
         } => {
-            let tgt = lower_to_signal_ref(target, sig_env, interner, sink);
+            let tgt = lower_to_signal_ref(target, sig_env, source_db, interner, sink);
             let val = lower_verilog_expr(value, sig_env, source_db, interner, sink);
             IrStmt::Assign {
                 target: tgt,
@@ -51,7 +51,7 @@ pub fn lower_verilog_stmt(
             value,
             span,
         } => {
-            let tgt = lower_to_signal_ref(target, sig_env, interner, sink);
+            let tgt = lower_to_signal_ref(target, sig_env, source_db, interner, sink);
             let val = lower_verilog_expr(value, sig_env, source_db, interner, sink);
             IrStmt::Assign {
                 target: tgt,
@@ -204,7 +204,7 @@ pub fn lower_sv_stmt(
             value,
             span,
         } => {
-            let tgt = lower_sv_to_signal_ref(target, sig_env, interner, sink);
+            let tgt = lower_sv_to_signal_ref(target, sig_env, source_db, interner, sink);
             let val = lower_sv_expr(value, sig_env, source_db, interner, sink);
             IrStmt::Assign {
                 target: tgt,
@@ -217,7 +217,7 @@ pub fn lower_sv_stmt(
             value,
             span,
         } => {
-            let tgt = lower_sv_to_signal_ref(target, sig_env, interner, sink);
+            let tgt = lower_sv_to_signal_ref(target, sig_env, source_db, interner, sink);
             let val = lower_sv_expr(value, sig_env, source_db, interner, sink);
             IrStmt::Assign {
                 target: tgt,
@@ -232,7 +232,7 @@ pub fn lower_sv_stmt(
             span,
         } => {
             // Expand `target op= value` into `target = target op value`
-            let tgt = lower_sv_to_signal_ref(target, sig_env, interner, sink);
+            let tgt = lower_sv_to_signal_ref(target, sig_env, source_db, interner, sink);
             let tgt_expr = lower_sv_expr(target, sig_env, source_db, interner, sink);
             let val = lower_sv_expr(value, sig_env, source_db, interner, sink);
             let ir_op = expr::map_sv_compound_op(*op);
@@ -256,7 +256,7 @@ pub fn lower_sv_stmt(
             ..
         } => {
             // Expand `i++` / `i--` into `i = i + 1` / `i = i - 1`
-            let tgt = lower_sv_to_signal_ref(operand, sig_env, interner, sink);
+            let tgt = lower_sv_to_signal_ref(operand, sig_env, source_db, interner, sink);
             let tgt_expr = lower_sv_expr(operand, sig_env, source_db, interner, sink);
             let one = IrExpr::Literal(crate::expr::logic_vec_from_u64(32, 1));
             let op = if *increment {

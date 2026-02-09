@@ -320,30 +320,9 @@ impl SimKernel {
             }
         }
 
-        // Schedule pending updates
+        // Schedule pending updates (merging slice updates to same signal)
         let next_delta = self.current_time.next_delta();
-        for update in all_pending {
-            let value = if let Some((high, low)) = update.range {
-                // Partial update: merge with current value
-                let sig = self.signals.get(update.target);
-                let mut merged = sig.value.clone();
-                for i in 0..(high - low + 1) {
-                    if i < update.value.width() {
-                        merged.set(low + i, update.value.get(i));
-                    }
-                }
-                merged
-            } else {
-                update.value
-            };
-
-            self.event_queue.push(Reverse(SimEvent {
-                time: next_delta,
-                signal: update.target,
-                value,
-                _strength: DriveStrength::Strong,
-            }));
-        }
+        self.merge_and_schedule(all_pending, next_delta);
 
         self.total_deltas += 1;
 
@@ -757,26 +736,7 @@ impl SimKernel {
             // because that would make step_delta see no difference and skip the
             // sensitivity check.
             let next_delta = self.current_time.next_delta();
-            for update in pending {
-                let value = if let Some((high, low)) = update.range {
-                    let sig = self.signals.get(update.target);
-                    let mut merged = sig.value.clone();
-                    for i in 0..(high - low + 1) {
-                        if i < update.value.width() {
-                            merged.set(low + i, update.value.get(i));
-                        }
-                    }
-                    merged
-                } else {
-                    update.value
-                };
-                self.event_queue.push(Reverse(SimEvent {
-                    time: next_delta,
-                    signal: update.target,
-                    value,
-                    _strength: DriveStrength::Strong,
-                }));
-            }
+            self.merge_and_schedule(pending, next_delta);
 
             match result {
                 ExecResult::Finish => {
@@ -888,28 +848,8 @@ impl SimKernel {
 
             self.display_output.extend(display.iter().cloned());
 
-            // Schedule updates at time 0, delta 1
-            for update in pending {
-                let value = if let Some((high, low)) = update.range {
-                    let sig = self.signals.get(update.target);
-                    let mut merged = sig.value.clone();
-                    for i in 0..(high - low + 1) {
-                        if i < update.value.width() {
-                            merged.set(low + i, update.value.get(i));
-                        }
-                    }
-                    merged
-                } else {
-                    update.value
-                };
-
-                self.event_queue.push(Reverse(SimEvent {
-                    time: SimTime { fs: 0, delta: 1 },
-                    signal: update.target,
-                    value,
-                    _strength: DriveStrength::Strong,
-                }));
-            }
+            // Schedule updates at time 0, delta 1 (merging slice updates)
+            self.merge_and_schedule(pending, SimTime { fs: 0, delta: 1 });
 
             if matches!(result, ExecResult::Finish) {
                 self.finished = true;
@@ -917,6 +857,59 @@ impl SimKernel {
             }
         }
         Ok(())
+    }
+
+    /// Merges pending updates by target signal and schedules one event per signal.
+    ///
+    /// Multiple bit-select assignments to the same signal (e.g., `leds[0] = ...; leds[1] = ...;`)
+    /// produce separate [`PendingUpdate`] entries. Without merging, each update reads the
+    /// current signal value independently, so only the last update's bit survives. This
+    /// method accumulates all partial writes into a single merged value per signal.
+    fn merge_and_schedule(&mut self, updates: Vec<PendingUpdate>, time: SimTime) {
+        // Use a Vec of (SimSignalId, LogicVec) to preserve insertion order
+        let mut merged: Vec<(SimSignalId, LogicVec)> = Vec::new();
+        let mut index_map: HashMap<SimSignalId, usize> = HashMap::new();
+
+        for update in updates {
+            if let Some(&idx) = index_map.get(&update.target) {
+                // Merge into existing entry
+                let (_, ref mut val) = merged[idx];
+                if let Some((high, low)) = update.range {
+                    for i in 0..(high - low + 1) {
+                        if i < update.value.width() {
+                            val.set(low + i, update.value.get(i));
+                        }
+                    }
+                } else {
+                    *val = update.value;
+                }
+            } else {
+                // New signal — start from current value and apply update
+                let base = if let Some((high, low)) = update.range {
+                    let sig = self.signals.get(update.target);
+                    let mut merged_val = sig.value.clone();
+                    for i in 0..(high - low + 1) {
+                        if i < update.value.width() {
+                            merged_val.set(low + i, update.value.get(i));
+                        }
+                    }
+                    merged_val
+                } else {
+                    update.value
+                };
+                index_map.insert(update.target, merged.len());
+                merged.push((update.target, base));
+            }
+        }
+
+        for (signal, value) in merged {
+            self.event_queue.push(Reverse(SimEvent {
+                time,
+                signal,
+                value,
+                _strength: DriveStrength::Strong,
+            }));
+        }
     }
 
     /// Applies an update immediately (for initial blocks).

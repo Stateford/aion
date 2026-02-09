@@ -291,7 +291,8 @@ fn elaborate_verilog_item(
             // Non-ANSI port declarations — handled by elaborate_verilog_ports
         }
         v_ast::ModuleItem::ContinuousAssign(ca) => {
-            let target = lower_to_signal_ref(&ca.target, sig_env, ctx.interner, ctx.sink);
+            let target =
+                lower_to_signal_ref(&ca.target, sig_env, ctx.source_db, ctx.interner, ctx.sink);
             let value =
                 lower_verilog_expr(&ca.value, sig_env, ctx.source_db, ctx.interner, ctx.sink);
             assignments.push(Assignment {
@@ -541,7 +542,7 @@ fn build_verilog_connections(
         .filter_map(|conn| {
             let formal = conn.formal?;
             let signal = if let Some(ref actual) = conn.actual {
-                lower_to_signal_ref(actual, sig_env, ctx.interner, ctx.sink)
+                lower_to_signal_ref(actual, sig_env, ctx.source_db, ctx.interner, ctx.sink)
             } else {
                 return None;
             };

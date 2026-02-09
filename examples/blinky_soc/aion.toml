@@ -1,0 +1,4 @@
+[project]
+name = "blinky_soc"
+version = "0.1.0"
+top = "blinky_top"

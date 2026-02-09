@@ -51,9 +51,25 @@ pub fn const_to_i64(val: &ConstValue) -> Option<i64> {
 /// sized octal (`8'o17`), sized decimal (`32'd100`), unsized based literals
 /// (`'b1`, `'hFF`), and underscore separators (`1_000`).
 pub(crate) fn parse_verilog_literal(text: &str) -> Option<i64> {
+    parse_verilog_literal_with_width(text).map(|(_, val)| val)
+}
+
+/// Parses a Verilog/SystemVerilog numeric literal, returning `(explicit_width, value)`.
+///
+/// For sized literals like `24'h000000`, returns `(Some(24), 0)`.
+/// For unsized literals like `42` or `'hFF`, returns `(None, value)`.
+pub(crate) fn parse_verilog_literal_with_width(text: &str) -> Option<(Option<u32>, i64)> {
     let text = text.replace('_', "");
 
     if let Some(tick_pos) = text.find('\'') {
+        // Extract the explicit width prefix (e.g., "24" from "24'h000000")
+        let width_str = &text[..tick_pos];
+        let explicit_width = if width_str.is_empty() {
+            None
+        } else {
+            width_str.parse::<u32>().ok()
+        };
+
         let after_tick = &text[tick_pos + 1..];
         if after_tick.is_empty() {
             return None;
@@ -91,10 +107,12 @@ pub(crate) fn parse_verilog_literal(text: &str) -> Option<i64> {
             })
             .collect();
 
-        return i64::from_str_radix(&clean, radix).ok();
+        return i64::from_str_radix(&clean, radix)
+            .ok()
+            .map(|val| (explicit_width, val));
     }
 
-    text.parse::<i64>().ok()
+    text.parse::<i64>().ok().map(|val| (None, val))
 }
 
 /// Computes the ceiling of log-base-2 for a non-negative integer.
@@ -611,6 +629,65 @@ mod tests {
     fn parse_literal_underscore_separator() {
         assert_eq!(parse_verilog_literal("1_000"), Some(1000));
         assert_eq!(parse_verilog_literal("8'hF_F"), Some(255));
+    }
+
+    // ---- parse_verilog_literal_with_width ----
+
+    #[test]
+    fn parse_literal_with_width_sized_hex() {
+        assert_eq!(
+            parse_verilog_literal_with_width("8'hFF"),
+            Some((Some(8), 255))
+        );
+    }
+
+    #[test]
+    fn parse_literal_with_width_sized_zero() {
+        // This is the key bug fix: 24'h000000 must preserve width=24
+        assert_eq!(
+            parse_verilog_literal_with_width("24'h000000"),
+            Some((Some(24), 0))
+        );
+    }
+
+    #[test]
+    fn parse_literal_with_width_sized_one() {
+        assert_eq!(
+            parse_verilog_literal_with_width("24'h000001"),
+            Some((Some(24), 1))
+        );
+    }
+
+    #[test]
+    fn parse_literal_with_width_sized_binary() {
+        assert_eq!(
+            parse_verilog_literal_with_width("4'b1010"),
+            Some((Some(4), 10))
+        );
+    }
+
+    #[test]
+    fn parse_literal_with_width_unsized_based() {
+        assert_eq!(parse_verilog_literal_with_width("'hFF"), Some((None, 255)));
+    }
+
+    #[test]
+    fn parse_literal_with_width_plain_decimal() {
+        assert_eq!(parse_verilog_literal_with_width("42"), Some((None, 42)));
+    }
+
+    #[test]
+    fn parse_literal_with_width_one_bit() {
+        assert_eq!(parse_verilog_literal_with_width("1'b0"), Some((Some(1), 0)));
+        assert_eq!(parse_verilog_literal_with_width("1'b1"), Some((Some(1), 1)));
+    }
+
+    #[test]
+    fn parse_literal_with_width_eight_bit_zero() {
+        assert_eq!(
+            parse_verilog_literal_with_width("8'h00"),
+            Some((Some(8), 0))
+        );
     }
 
     // ---- clog2 ----
