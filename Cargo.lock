@@ -186,6 +186,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aion_synth"
+version = "0.1.0"
+dependencies = [
+ "aion_arch",
+ "aion_common",
+ "aion_config",
+ "aion_diagnostics",
+ "aion_ir",
+ "aion_source",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "aion_tui"
 version = "0.1.0"
 dependencies = [

@@ -29,6 +29,7 @@
 | `aion_conformance` | 🟢 Complete | 155 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 49 real-world designs, 13 project integration, 6 unit |
 | `aion_tui` | 🟢 Complete | 117 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping, bus expansion, cursor-time values, viewer mode |
 | `aion_arch` | 🟢 Complete | 124 | Architecture trait, TechMapper trait, Intel Cyclone IV E (5 devices), Cyclone V (3 devices), Xilinx Artix-7 (3 devices), load_architecture() factory |
+| `aion_synth` | 🟢 Complete | 113 | Synthesis engine: behavioral lowering, expression lowering, optimization (const prop + DCE + CSE), technology mapping, resource counting |
 
 ### Phase 0 Checklist
 
@@ -93,6 +94,48 @@
 - lib: 16 tests (factory, aliases, defaults, error cases)
 
 **Test results:** 1579 tests, all passing (was 1455, +124 new)
+**Clippy:** Clean (zero warnings)
+**Fmt:** Clean
+
+---
+
+#### 2026-02-08 — Implement `aion_synth` crate (synthesis engine)
+
+**Crate:** `aion_synth` (new, 113 tests)
+
+**What:** Complete synthesis engine that transforms elaborated AionIR (behavioral processes, concurrent assignments) into a technology-mapped netlist of LUTs, FFs, BRAMs, and DSPs ready for place-and-route.
+
+**Architecture (10 source files):**
+- `lib.rs` — Public API: `synthesize()`, `MappedDesign`, `MappedModule`
+- `netlist.rs` — Internal mutable netlist with signals/cells arenas, connectivity helpers
+- `lower_expr.rs` — Expression lowering: `Expr` → cell networks (gates, arithmetic, mux, comparators)
+- `lower.rs` — Behavioral lowering: sequential → DFF, combinational → MUX chains, latched → Latch cells, assignments → cell wiring
+- `optimize.rs` — Optimization pass runner with `OptPass` trait
+- `const_prop.rs` — Constant propagation: evaluates cells with all-constant inputs
+- `dce.rs` — Dead code elimination: removes cells with no live fanout
+- `cse.rs` — Common subexpression elimination: merges identical cells (commutative-aware)
+- `tech_map.rs` — Technology mapping: generic cells → device-specific LUTs/FFs/BRAMs/DSPs via `TechMapper`
+- `resource.rs` — Resource usage counting: tallies LUTs, FFs, BRAMs, DSPs, IOs
+
+**Tests (113 total):**
+- netlist: 13 (creation, signals, cells, ports, connectivity maps, dead cells)
+- lower_expr: 20 (all Expr variants: literal, signal, unary, binary ops, ternary, concat, repeat, slice, index, nested)
+- lower: 16 (sequential→DFF, combinational→MUX, if/else, case, incomplete assignment, concurrent assign, latch inference, initial skip)
+- optimize: 2 (empty netlist pass, all-passes execution)
+- const_prop: 7 (fold AND/NOT/ADD/EQ/MUX, non-const preserved, chain propagation)
+- dce: 7 (dead removed, live preserved, transitive liveness, mixed, no-ports, empty, pre-dead)
+- cse: 5 (identical merged, different preserved, commutative reorder, non-commutative, downstream redirect)
+- tech_map: 13 (gate→LUT, DFF passthrough, memory→BRAM, mul→DSP, instance/const preserved, empty, large memory stays, LUT init)
+- resource: 9 (LUTs, FFs, BRAM, DSP, IO from ports, dead excluded, generic gates, empty, const no-resources)
+- lib (integration): 12 (simple register, combinational, empty module, ports, resources, multi-module, serde, opt levels, IO count, top ID, aggregation)
+
+**Key design decisions:**
+- `Netlist<'a>` borrows `&'a Interner` — avoids creating separate Interner (lasso `Ident` keys are rodeo-specific; separate instance causes "Key out of bounds" panics)
+- `wire_signal_ref()` redirects cell outputs by finding and rewriting the driving cell's output connection, or creates a buffer Slice cell for signal-to-signal passthrough
+- Optimization passes run in fixed order: const_prop → DCE → CSE → DCE (cleanup)
+- Technology mapping uses `Architecture::tech_mapper()` from `aion_arch` (tested with mock mapper)
+
+**Test results:** 1693 tests, all passing (was 1579, +114 new)
 **Clippy:** Clean (zero warnings)
 **Fmt:** Clean
 
@@ -1078,7 +1121,14 @@ Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construct
 
 ## Phase 2 — Synthesis (Months 8–14)
 
-_Not yet started._
+**Goal:** Logic synthesis from AionIR to technology-mapped netlists for FPGA targets.
+
+### Phase 2 Checklist
+
+- [x] `aion_arch` — Architecture models, TechMapper trait, device databases (124 tests)
+- [x] `aion_synth` — Synthesis engine: behavioral lowering, optimization, tech mapping (113 tests)
+- [ ] `aion_pnr` — Place & route: simulated annealing + PathFinder router
+- [ ] `aion_timing` — Static timing analysis, SDC/XDC parsing
 
 ## Phase 3 — Place & Route (Months 14–22)
 

@@ -33,8 +33,7 @@ pub mod types;
 pub mod xilinx;
 
 use ids::SiteId;
-use tech_map::TechMapper;
-use types::{Delay, ResourceUsage, RoutingGraph, Site, Tile};
+use types::{Delay, RoutingGraph, Site, Tile};
 
 pub use ids::{BelId, PipId, WireId};
 pub use intel::cyclone_iv::{CycloneIv, CycloneIvMapper};
@@ -42,8 +41,9 @@ pub use intel::cyclone_v::{CycloneV, CycloneVMapper};
 pub use intel::IntelFamily;
 pub use tech_map::{
     ArithmeticPattern, ArithmeticPatternKind, LogicCone, LutMapping, MapResult, MemoryCell,
+    TechMapper,
 };
-pub use types::{Bel, BelType, Pip, SiteType, TileType, Wire};
+pub use types::{Bel, BelType, Pip, ResourceUsage, SiteType, TileType, Wire};
 pub use xilinx::artix7::{Artix7, Artix7Mapper};
 pub use xilinx::XilinxFamily;
 

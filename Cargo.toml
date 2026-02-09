@@ -17,6 +17,7 @@ members = [
     "crates/aion_conformance",
     "crates/aion_tui",
     "crates/aion_arch",
+    "crates/aion_synth",
 ]
 
 [workspace.package]
@@ -55,3 +56,4 @@ aion_cache = { path = "crates/aion_cache" }
 aion_sim = { path = "crates/aion_sim" }
 aion_tui = { path = "crates/aion_tui" }
 aion_arch = { path = "crates/aion_arch" }
+aion_synth = { path = "crates/aion_synth" }
