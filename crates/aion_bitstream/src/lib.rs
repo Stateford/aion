@@ -46,6 +46,20 @@ impl BitstreamFormat {
             BitstreamFormat::Bit => "bit",
         }
     }
+
+    /// Parses a format name string (case-insensitive) into a `BitstreamFormat`.
+    ///
+    /// Accepts: `"sof"`, `"pof"`, `"rbf"`, `"bit"` (any case).
+    /// Returns `None` for unrecognized format strings.
+    pub fn parse(s: &str) -> Option<BitstreamFormat> {
+        match s.to_lowercase().as_str() {
+            "sof" => Some(BitstreamFormat::Sof),
+            "pof" => Some(BitstreamFormat::Pof),
+            "rbf" => Some(BitstreamFormat::Rbf),
+            "bit" => Some(BitstreamFormat::Bit),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for BitstreamFormat {
@@ -157,6 +171,29 @@ pub fn compute_checksum(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_parse_valid() {
+        assert_eq!(BitstreamFormat::parse("sof"), Some(BitstreamFormat::Sof));
+        assert_eq!(BitstreamFormat::parse("pof"), Some(BitstreamFormat::Pof));
+        assert_eq!(BitstreamFormat::parse("rbf"), Some(BitstreamFormat::Rbf));
+        assert_eq!(BitstreamFormat::parse("bit"), Some(BitstreamFormat::Bit));
+    }
+
+    #[test]
+    fn format_parse_case_insensitive() {
+        assert_eq!(BitstreamFormat::parse("SOF"), Some(BitstreamFormat::Sof));
+        assert_eq!(BitstreamFormat::parse("Pof"), Some(BitstreamFormat::Pof));
+        assert_eq!(BitstreamFormat::parse("RBF"), Some(BitstreamFormat::Rbf));
+        assert_eq!(BitstreamFormat::parse("BIT"), Some(BitstreamFormat::Bit));
+    }
+
+    #[test]
+    fn format_parse_unknown() {
+        assert_eq!(BitstreamFormat::parse("bin"), None);
+        assert_eq!(BitstreamFormat::parse("jic"), None);
+        assert_eq!(BitstreamFormat::parse(""), None);
+    }
 
     #[test]
     fn format_extension() {

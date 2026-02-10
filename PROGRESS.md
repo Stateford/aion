@@ -16,7 +16,7 @@
 | `aion_common` | 🟢 Complete | 45 | Ident, Interner, ContentHash, Frequency, Logic, LogicVec, AionResult |
 | `aion_source` | 🟢 Complete | 22 | FileId, Span, SourceFile, SourceDb, ResolvedSpan |
 | `aion_diagnostics` | 🟢 Complete | 22 | Severity, DiagnosticCode, Label, Diagnostic, DiagnosticSink, TerminalRenderer |
-| `aion_config` | 🟢 Complete | 22 | ProjectConfig, all config types, loader, validator, target resolver |
+| `aion_config` | 🟢 Complete | 26 | ProjectConfig, all config types, loader, validator, target resolver, output_formats |
 | `aion_ir` | 🟢 Complete | 79 | Arena, IDs, TypeDb, Design, Module, Signal, Cell, Process, Expr, Statement (incl Delay/Forever), SourceMap |
 | `aion_vhdl_parser` | 🟢 Complete | 85 | Lexer, Pratt parser, full AST, error recovery, serde |
 | `aion_verilog_parser` | 🟢 Complete | 127 | Lexer, Pratt parser, full AST, error recovery, serde |
@@ -24,7 +24,7 @@
 | `aion_elaborate` | 🟢 Complete | 134 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, delay/forever preservation, bit/range-select targets, all 3 languages |
 | `aion_lint` | 🟢 Complete | 91 | LintEngine, 15 rules (W101-W108, E102/E104/E105, C201-C204), IR traversal helpers |
 | `aion_cache` | 🟢 Complete | 47 | Content-hash caching: manifest, artifact store, source hasher, cache orchestrator |
-| `aion_cli` | 🟢 Complete | 93 | CLI: `init`, `lint`, `sim`, `test`, `view` commands with shared pipeline, `--interactive` mode |
+| `aion_cli` | 🟢 Complete | 115 | CLI: `init`, `lint`, `sim`, `test`, `view`, `build` commands with shared pipeline, `--interactive` mode, full synth→PnR→bitstream pipeline |
 | `aion_sim` | 🟢 Complete | 250 | Event-driven HDL simulator: kernel, evaluator, VCD/FST waveform, delta cycles, delay scheduling, interactive REPL, VCD loader |
 | `aion_conformance` | 🟢 Complete | 155 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 49 real-world designs, 13 project integration, 6 unit |
 | `aion_tui` | 🟢 Complete | 117 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping, bus expansion, cursor-time values, viewer mode |
@@ -32,7 +32,7 @@
 | `aion_synth` | 🟢 Complete | 113 | Synthesis engine: behavioral lowering, expression lowering, optimization (const prop + DCE + CSE), technology mapping, resource counting |
 | `aion_timing` | 🟢 Complete | 84 | Static timing analysis: TimingGraph, SDC parser, forward/backward propagation, slack computation, critical path extraction, timing reports |
 | `aion_pnr` | 🟢 Complete | 90 | Place & route: MappedDesign→PnrNetlist conversion, random + simulated annealing placement, PathFinder routing + A* search, timing bridge |
-| `aion_bitstream` | 🟢 Complete | 110 | Bitstream generation: Intel SOF/POF/RBF + Xilinx BIT formats, ConfigBitDatabase trait, CRC-16/CRC-32, simplified config databases |
+| `aion_bitstream` | 🟢 Complete | 113 | Bitstream generation: Intel SOF/POF/RBF + Xilinx BIT formats, ConfigBitDatabase trait, CRC-16/CRC-32, simplified config databases, BitstreamFormat::parse() |
 
 ### Phase 0 Checklist
 
@@ -48,7 +48,7 @@
 - [x] `aion_ir` — core IR type definitions
 - [x] `aion_elaborate` — AST→IR elaboration engine
 - [x] `aion_lint` — lint rules and engine (15 rules)
-- [x] `aion_cli` — `init`, `lint`, `sim`, and `test` commands
+- [x] `aion_cli` — `init`, `lint`, `sim`, `test`, `view`, and `build` commands
 - [x] `aion_cache` — basic content-hash caching
 - [x] Human-readable error output with source spans
 - [x] Parse + lint completes in <1s on test projects
@@ -65,6 +65,32 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-09 — Add `aion build` command (full pipeline)
+
+**Tests added:** 25 new (4 config, 3 bitstream, 6 CLI parsing, 12 build logic)
+**What:** Added the `aion build` CLI command that chains the entire pipeline from source files to bitstream output: parse → elaborate → synthesize → place & route → timing analysis → bitstream generation.
+
+**Changes across crates:**
+- `aion_config/types.rs` — Added `output_formats: Vec<String>` to `BuildConfig` with custom serde deserializer accepting string or list (e.g., `"sof"`, `["sof", "pof"]`, `"all"`)
+- `aion_config/resolve.rs` — Propagated `output_formats` to `ResolvedTarget`, updated `Clone` impl
+- `aion_bitstream/lib.rs` — Added `BitstreamFormat::parse()` for case-insensitive string-to-enum conversion
+- `aion_cli/Cargo.toml` — Added dependencies: `aion_synth`, `aion_arch`, `aion_timing`, `aion_pnr`, `aion_bitstream`
+- `aion_cli/main.rs` — Added `Build(BuildArgs)` command variant, `BuildArgs` struct (--target, --format, -O, --output-dir, --report-format), `CliOptLevel` enum
+- `aion_cli/pipeline.rs` — Added `apply_pin_assignments()` helper for matching IO cells to config pin assignments
+- `aion_cli/build.rs` — **New file**: full pipeline orchestration with helpers: `resolve_build_target()`, `resolve_output_formats()`, `determine_build_dir()`, `load_timing_constraints()`, `cli_opt_to_config()`
+
+**Key features:**
+- Auto-selects single target from config, requires `--target` when multiple defined
+- `--format all` expands to all vendor-supported formats
+- CLI `--format` overrides config `output_formats`, which overrides vendor default
+- Pin assignments from config applied to IO buffer cells post-PnR
+- SDC constraint files loaded and merged for timing analysis
+- Build artifacts written to `build/<target>/` (or `--output-dir`)
+
+**Status:** 2002 total workspace tests, all passing. Clippy clean.
+
+---
 
 #### 2026-02-09 — Implement `aion_bitstream` crate (Phase 3 start)
 

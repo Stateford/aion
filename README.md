@@ -1,15 +1,19 @@
 # Aion
 
-A fast, open-source FPGA toolchain written in Rust. Aion replaces proprietary vendor tools (Quartus, Vivado) with a unified, Cargo-inspired workflow — from HDL parsing and linting through synthesis, place-and-route, and device programming.
+A fast, open-source FPGA toolchain written in Rust. Aion replaces proprietary vendor tools (Quartus, Vivado) with a unified, Cargo-inspired workflow — from HDL parsing and linting through synthesis, place-and-route, and bitstream generation.
 
 ## Features
 
 - **Multi-language HDL support** — VHDL-2008, Verilog-2005, SystemVerilog-2017
 - **Unified intermediate representation** — All languages elaborate into a single AionIR, enabling cross-language instantiation and shared analysis
 - **15 built-in lint rules** — Warnings (unused signals, width mismatches, missing resets), errors (multiple drivers, port mismatches), and conventions (naming, magic numbers)
-- **Event-driven simulator** — Delta-cycle-accurate execution with 4-state logic (0/1/X/Z), multi-driver resolution, and VCD waveform output
+- **Event-driven simulator** — Delta-cycle-accurate with 4-state logic (0/1/X/Z), delay scheduling, VCD/FST waveform output, and an interactive REPL debugger
+- **Synthesis pipeline** — Behavioral lowering, constant propagation, dead code elimination, CSE, and technology mapping to vendor primitives
+- **Place & route** — Simulated annealing placement and PathFinder routing with static timing analysis
+- **Bitstream generation** — Intel SOF/POF/RBF and Xilinx BIT output formats
+- **TUI waveform viewer** — Terminal-based viewer with zoom/scroll, bus expansion, and cursor-time signal values
 - **Incremental compilation** — Content-hash caching skips unchanged work across rebuilds
-- **Cargo-like UX** — `aion init`, `aion lint`, project scaffolding, `aion.toml` configuration
+- **Cargo-like UX** — `aion init`, `aion lint`, `aion build`, project scaffolding, `aion.toml` configuration
 - **Precise diagnostics** — Source-span-accurate error messages with codes and suggestions, inspired by `rustc`
 
 ## Quick Start
@@ -24,8 +28,10 @@ cargo build --release
 aion init my_design --lang systemverilog
 cd my_design
 
-# Run static analysis
+# Lint, simulate, and build
 aion lint
+aion sim tests/my_tb.sv --time 1us
+aion build --target de0_nano
 ```
 
 ## CLI Usage
@@ -51,6 +57,46 @@ aion lint --allow unused-signal              # Suppress a rule
 aion lint --format json                      # Machine-readable output
 ```
 
+### `aion sim <TESTBENCH>`
+
+Runs a single testbench simulation.
+
+```bash
+aion sim tests/my_tb.sv                      # Run to completion
+aion sim tests/my_tb.sv --time 100ns         # Run for a duration
+aion sim tests/my_tb.sv --waveform vcd       # VCD output (default: FST)
+aion sim tests/my_tb.sv --interactive        # Launch REPL debugger
+```
+
+### `aion test`
+
+Discovers and runs all testbenches in the `tests/` directory.
+
+```bash
+aion test                                    # Run all testbenches
+aion test --filter uart                      # Filter by name
+aion test --no-waveform                      # Skip waveform recording
+```
+
+### `aion view <FILE>`
+
+Opens a waveform file in the terminal-based viewer.
+
+```bash
+aion view out/my_tb.vcd                      # View VCD waveform
+aion view out/my_tb.fst                      # View FST waveform
+```
+
+### `aion build`
+
+Runs the full synthesis pipeline: parse, elaborate, synthesize, place & route, timing analysis, and bitstream generation.
+
+```bash
+aion build --target de0_nano                 # Build for a target
+aion build --target de0_nano -O speed        # Optimize for speed
+aion build --target de0_nano --format sof    # Specific output format
+```
+
 ### Global Flags
 
 | Flag | Description |
@@ -66,15 +112,33 @@ Projects are configured via `aion.toml`:
 
 ```toml
 [project]
-name = "my_design"
+name = "blinky_soc"
 version = "0.1.0"
-top_module = "top"
-languages = ["systemverilog"]
+top = "blinky_top"
 
-[targets.default]
-device = "xc7a35t"
-package = "cpg236"
-speed_grade = "-1"
+[targets.de0_nano]
+device = "EP4CE22F17C6"
+family = "cyclone4"
+
+[targets.de0_nano.pins]
+clk   = { pin = "PIN_R8",  io_standard = "3.3-V LVTTL" }
+rst_n = { pin = "PIN_J15", io_standard = "3.3-V LVTTL" }
+
+[targets.de0_nano.pins."leds[0]"]
+pin = "PIN_A15"
+io_standard = "3.3-V LVTTL"
+
+[targets.de0_nano.pins."leds[1]"]
+pin = "PIN_A13"
+io_standard = "3.3-V LVTTL"
+
+[clocks.clk]
+frequency = "50MHz"
+port = "clk"
+
+[build]
+optimization = "balanced"
+output_formats = ["sof", "pof"]
 
 [lint]
 deny = ["multiple-drivers", "port-mismatch"]
@@ -93,9 +157,16 @@ Source Files (.v, .sv, .vhd)
    [ Elaboration ]      aion_elaborate
         |
    [ AionIR ]           aion_ir  (unified intermediate representation)
-       / \
-      /   \
-[ Lint ]  [ Simulate ]  aion_lint, aion_sim
+       /|\
+      / | \
+     /  |  \
+[ Lint] | [ Simulate ]  aion_lint, aion_sim
+        |
+   [ Synthesis ]        aion_synth, aion_arch
+        |
+   [ Place & Route ]    aion_pnr, aion_timing
+        |
+   [ Bitstream ]        aion_bitstream
 ```
 
 ### Crate Map
@@ -112,10 +183,16 @@ Source Files (.v, .sv, .vhd)
 | `aion_sv_parser` | Hand-rolled recursive descent SystemVerilog-2017 parser |
 | `aion_elaborate` | AST-to-IR elaboration with cross-language support |
 | `aion_lint` | Lint engine with 15 configurable rules |
+| `aion_sim` | Event-driven HDL simulator with VCD/FST output and interactive REPL |
+| `aion_tui` | Terminal-based waveform viewer with zoom/scroll and bus expansion |
+| `aion_synth` | Synthesis: behavioral lowering, optimization, technology mapping |
+| `aion_arch` | Device architecture models (Intel Cyclone IV/V, Xilinx Artix-7) |
+| `aion_timing` | Static timing analysis: SDC parsing, propagation, critical path |
+| `aion_pnr` | Place & route: simulated annealing placement, PathFinder routing |
+| `aion_bitstream` | Bitstream generation: Intel SOF/POF/RBF, Xilinx BIT |
 | `aion_cache` | Content-hash-based incremental compilation cache |
-| `aion_cli` | CLI entry point (`init`, `lint` commands) |
-| `aion_sim` | Event-driven HDL simulator with VCD output |
-| `aion_conformance` | Integration/conformance tests: full pipeline (parse→elaborate→lint) for all 3 languages |
+| `aion_conformance` | Integration tests: full pipeline across all 3 languages |
+| `aion_cli` | CLI entry point: `init`, `lint`, `sim`, `test`, `view`, `build` |
 
 ### Design Principles
 
@@ -147,64 +224,35 @@ Source Files (.v, .sv, .vhd)
 | C203 | `magic-number` | Convention | Literal values used directly in expressions |
 | C204 | `inconsistent-style` | Convention | Process kind style inconsistencies |
 
-## Performance
+## Target Devices
 
-The full parse → elaborate → lint pipeline runs entirely single-threaded and completes well under 1 second even on very large projects:
-
-| Project Size | Files | Lines | Time | Throughput |
-|---|---|---|---|---|
-| Typical FPGA project | 156 | 4K | **13ms** | 1.2M lines/s |
-| Large design | 1,156 | 43K | **36ms** | 1.2M lines/s |
-| Stress test | 10,156 | 376K | **479ms** | 785K lines/s |
-
-Performance comes from hand-rolled parsers (zero backtracking), arena allocation, string interning, and compact IR structures. No parallelism is used yet — `Interner`, `DiagnosticSink`, and `LintRule` are all thread-safe, leaving rayon parallelism as headroom for future scaling.
+| Vendor | Family | Devices |
+|--------|--------|---------|
+| Intel/Altera | Cyclone IV E | EP4CE6, EP4CE10, EP4CE22, EP4CE40, EP4CE115 |
+| Intel/Altera | Cyclone V | 5CSEMA4, 5CSEMA5, 5CSEBA6 |
+| Xilinx/AMD | Artix-7 | XC7A35T, XC7A100T, XC7A200T |
 
 ## Building & Testing
 
 ```bash
 cargo build                                  # Build all crates
-cargo test                                   # Run all 1083 tests
+cargo test                                   # Run all ~2000 tests
 cargo test -p aion_sim                       # Run tests for a specific crate
 cargo clippy --all-targets -- -D warnings    # Lint (zero warnings enforced)
 cargo fmt --check                            # Check formatting
 cargo doc --no-deps                          # Build documentation
 ```
 
-### Conformance Tests
-
-The `aion_conformance` crate runs 92 integration tests that exercise the full parse → elaborate → lint pipeline on realistic HDL designs across all three languages.
-
-```bash
-cargo test -p aion_conformance                              # Run all 92 conformance tests
-cargo test -p aion_conformance --test verilog_conformance   # Verilog-2005 designs (15 tests)
-cargo test -p aion_conformance --test sv_conformance        # SystemVerilog-2017 designs (15 tests)
-cargo test -p aion_conformance --test vhdl_conformance      # VHDL-2008 designs (12 tests)
-cargo test -p aion_conformance --test error_recovery        # Error recovery & graceful degradation (10 tests)
-cargo test -p aion_conformance --test lint_detection        # Lint rule detection through full pipeline (35 tests)
-```
-
-Test categories:
-- **Language conformance** — Counters, FSMs, ALUs, RAMs, shift registers, module hierarchies, generate blocks, gate primitives, functions, packages, structs
-- **Error recovery** — Malformed input handling, multi-error reporting, bad-then-good module recovery, empty source safety
-- **Lint detection** — All 15 lint rules tested through the full pipeline, including positive triggers and negative (no false positive) cases, deny/allow configuration
-
 ## Roadmap
 
 | Phase | Focus | Status |
 |-------|-------|--------|
 | **Phase 0** | Foundation — Parsing, elaboration, linting, caching, CLI | Complete |
-| **Phase 1** | Simulation — Event-driven simulator, VCD/FST, CLI integration | In Progress |
-| **Phase 2** | Synthesis — Behavioral lowering, optimization, technology mapping | Planned |
-| **Phase 3** | Place & Route — Simulated annealing, PathFinder routing, timing | Planned |
-| **Phase 4** | Polish — LSP, device programming, dependency management | Planned |
+| **Phase 1** | Simulation — Event-driven simulator, VCD/FST, TUI, CLI integration | Complete |
+| **Phase 2** | Backend — Synthesis, architecture models, PnR, timing, bitstream | Complete |
+| **Phase 3** | Polish — LSP, device programming, dependency management, reporting | In Progress |
 
 See [PROGRESS.md](PROGRESS.md) for detailed implementation status.
-
-## Target Devices
-
-**Intel/Altera:** Cyclone V, Cyclone 10 LP, MAX 10, Stratix V
-
-**Xilinx/AMD:** Artix-7, Kintex-7, Spartan-7, Zynq-7000
 
 ## Documentation
 

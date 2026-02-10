@@ -2,11 +2,13 @@
 //!
 //! Provides `aion init` for project scaffolding, `aion lint` for static analysis,
 //! `aion sim` for running individual testbench simulations, `aion test` for
-//! discovering and running all testbenches, and `aion view` for viewing
-//! previously saved waveform files in the TUI.
+//! discovering and running all testbenches, `aion view` for viewing
+//! previously saved waveform files in the TUI, and `aion build` for running
+//! the full synthesis pipeline to generate bitstream files.
 
 #![warn(missing_docs)]
 
+mod build;
 mod init;
 mod lint;
 mod pipeline;
@@ -68,6 +70,8 @@ pub enum Command {
     Test(TestArgs),
     /// View a previously saved waveform file in the TUI.
     View(ViewArgs),
+    /// Run the full build pipeline (parse → elaborate → synth → PnR → bitstream).
+    Build(BuildArgs),
 }
 
 /// Arguments for the `aion lint` subcommand.
@@ -147,6 +151,41 @@ pub struct ViewArgs {
     pub file: String,
 }
 
+/// Arguments for the `aion build` subcommand.
+#[derive(Parser, Debug)]
+pub struct BuildArgs {
+    /// Target name to select from `aion.toml` (required when multiple targets defined).
+    #[arg(short, long)]
+    pub target: Option<String>,
+
+    /// Output bitstream format(s). Repeatable. Use `"all"` for all vendor formats.
+    #[arg(short, long)]
+    pub format: Vec<String>,
+
+    /// Override the optimization level from `aion.toml`.
+    #[arg(short = 'O', long, value_enum)]
+    pub optimization: Option<CliOptLevel>,
+
+    /// Override the output directory (default: `build/<target>/`).
+    #[arg(long)]
+    pub output_dir: Option<String>,
+
+    /// Output format for diagnostics.
+    #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+    pub report_format: ReportFormat,
+}
+
+/// CLI optimization level override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliOptLevel {
+    /// Optimize for minimum area usage.
+    Area,
+    /// Optimize for maximum clock speed.
+    Speed,
+    /// Balance between area and speed.
+    Balanced,
+}
+
 /// Waveform output format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum WaveformFormat {
@@ -224,6 +263,7 @@ fn main() {
         Command::Sim(ref args) => sim::run(args, &global),
         Command::Test(ref args) => test::run(args, &global),
         Command::View(ref args) => view::run(args, &global),
+        Command::Build(ref args) => build::run(args, &global),
     };
 
     match result {
@@ -581,5 +621,77 @@ mod tests {
         assert_eq!(format!("{:?}", WaveformFormat::Vcd), "Vcd");
         assert_eq!(format!("{:?}", WaveformFormat::Fst), "Fst");
         assert_eq!(format!("{:?}", WaveformFormat::Ghw), "Ghw");
+    }
+
+    // -- Build command parsing tests --
+
+    #[test]
+    fn parse_build_default() {
+        let cli = Cli::parse_from(["aion", "build"]);
+        match cli.command {
+            Command::Build(ref args) => {
+                assert!(args.target.is_none());
+                assert!(args.format.is_empty());
+                assert!(args.optimization.is_none());
+                assert!(args.output_dir.is_none());
+                assert_eq!(args.report_format, ReportFormat::Text);
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_target() {
+        let cli = Cli::parse_from(["aion", "build", "--target", "de10_nano"]);
+        match cli.command {
+            Command::Build(ref args) => {
+                assert_eq!(args.target.as_deref(), Some("de10_nano"));
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_format() {
+        let cli = Cli::parse_from(["aion", "build", "-f", "sof", "-f", "pof"]);
+        match cli.command {
+            Command::Build(ref args) => {
+                assert_eq!(args.format, vec!["sof", "pof"]);
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_all_formats() {
+        let cli = Cli::parse_from(["aion", "build", "--format", "all"]);
+        match cli.command {
+            Command::Build(ref args) => {
+                assert_eq!(args.format, vec!["all"]);
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_optimization() {
+        let cli = Cli::parse_from(["aion", "build", "-O", "speed"]);
+        match cli.command {
+            Command::Build(ref args) => {
+                assert_eq!(args.optimization, Some(CliOptLevel::Speed));
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_output_dir() {
+        let cli = Cli::parse_from(["aion", "build", "--output-dir", "/tmp/build"]);
+        match cli.command {
+            Command::Build(ref args) => {
+                assert_eq!(args.output_dir.as_deref(), Some("/tmp/build"));
+            }
+            _ => panic!("expected Build command"),
+        }
     }
 }

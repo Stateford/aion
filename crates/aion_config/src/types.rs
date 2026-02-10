@@ -1,6 +1,7 @@
 //! Configuration types deserialized from `aion.toml`.
 
-use serde::Deserialize;
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 
 /// The top-level project configuration parsed from `aion.toml`.
@@ -135,6 +136,45 @@ pub struct BuildConfig {
     pub optimization: OptLevel,
     /// Target clock frequency for timing-driven optimization.
     pub target_frequency: Option<String>,
+    /// Output bitstream formats (e.g., `"sof"`, `["sof", "pof"]`, or `"all"`).
+    ///
+    /// Accepts either a single string or a list of strings. Defaults to an
+    /// empty vec, meaning the vendor's primary format will be used.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub output_formats: Vec<String>,
+}
+
+/// Deserializes a field that can be either a single string or a list of strings.
+///
+/// Allows TOML config to accept both `output_formats = "sof"` (string) and
+/// `output_formats = ["sof", "pof"]` (array of strings).
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringOrVec;
+
+    impl<'de> Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string or a list of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![v.to_string()])
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(val) = seq.next_element::<String>()? {
+                vec.push(val);
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
 }
 
 /// Optimization level for synthesis passes.
@@ -286,6 +326,66 @@ waveform_format = "{input}"
             let config = load_config_from_str(&toml).unwrap();
             assert_eq!(config.test.waveform_format, expected);
         }
+    }
+
+    #[test]
+    fn output_formats_single_string() {
+        let toml = r#"
+[project]
+name = "test"
+version = "0.1.0"
+top = "src/top.vhd"
+
+[build]
+output_formats = "sof"
+"#;
+        let config = load_config_from_str(toml).unwrap();
+        assert_eq!(config.build.output_formats, vec!["sof"]);
+    }
+
+    #[test]
+    fn output_formats_list() {
+        let toml = r#"
+[project]
+name = "test"
+version = "0.1.0"
+top = "src/top.vhd"
+
+[build]
+output_formats = ["sof", "pof"]
+"#;
+        let config = load_config_from_str(toml).unwrap();
+        assert_eq!(config.build.output_formats, vec!["sof", "pof"]);
+    }
+
+    #[test]
+    fn output_formats_all_string() {
+        let toml = r#"
+[project]
+name = "test"
+version = "0.1.0"
+top = "src/top.vhd"
+
+[build]
+output_formats = "all"
+"#;
+        let config = load_config_from_str(toml).unwrap();
+        assert_eq!(config.build.output_formats, vec!["all"]);
+    }
+
+    #[test]
+    fn output_formats_default_empty() {
+        let toml = r#"
+[project]
+name = "test"
+version = "0.1.0"
+top = "src/top.vhd"
+
+[build]
+optimization = "balanced"
+"#;
+        let config = load_config_from_str(toml).unwrap();
+        assert!(config.build.output_formats.is_empty());
     }
 
     #[test]

@@ -4,11 +4,14 @@
 //! source file discovery, language detection, project root resolution,
 //! duration parsing, and the parse-all-files step.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aion_common::Interner;
+use aion_config::PinAssignment;
 use aion_diagnostics::{DiagnosticRenderer, DiagnosticSink, TerminalRenderer};
 use aion_elaborate::ParsedDesign;
+use aion_pnr::{PnrCellType, PnrNetlist};
 use aion_sim::time::{FS_PER_MS, FS_PER_NS, FS_PER_PS, FS_PER_US};
 use aion_source::SourceDb;
 
@@ -203,6 +206,30 @@ pub fn render_diagnostics(sink: &DiagnosticSink, source_db: &SourceDb, color: bo
         eprintln!("{}", renderer.render(diag, source_db));
     }
     diagnostics.len()
+}
+
+/// Applies pin assignments from the project config to I/O buffer cells in the PnR netlist.
+///
+/// Matches IO cells whose name ends with `_<signal>` (e.g., `io_clk`) against the
+/// pin assignments map. When a match is found, updates the cell's `standard` field
+/// with the configured `io_standard`.
+pub fn apply_pin_assignments(netlist: &mut PnrNetlist, pins: &BTreeMap<String, PinAssignment>) {
+    for cell in &mut netlist.cells {
+        if let PnrCellType::Iobuf {
+            ref mut standard, ..
+        } = cell.cell_type
+        {
+            // IO cells are named "io_<signal>" — extract signal name
+            let signal_name = cell
+                .name
+                .strip_prefix("io_")
+                .unwrap_or(&cell.name)
+                .to_string();
+            if let Some(assignment) = pins.get(&signal_name) {
+                *standard = assignment.io_standard.clone();
+            }
+        }
+    }
 }
 
 #[cfg(test)]

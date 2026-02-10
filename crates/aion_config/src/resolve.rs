@@ -22,6 +22,8 @@ pub struct ResolvedTarget {
     pub constraints: ConstraintConfig,
     /// Build configuration.
     pub build: BuildConfig,
+    /// Output bitstream formats from config (e.g., `["sof"]` or `["sof", "pof"]`).
+    pub output_formats: Vec<String>,
 }
 
 /// Resolves a named target by merging global settings with target-specific overrides.
@@ -50,6 +52,8 @@ pub fn resolve_target(
         .clone()
         .unwrap_or_else(|| config.constraints.clone());
 
+    let output_formats = config.build.output_formats.clone();
+
     Ok(ResolvedTarget {
         name: target_name.to_string(),
         device: target.device.clone(),
@@ -59,7 +63,9 @@ pub fn resolve_target(
         build: BuildConfig {
             optimization: config.build.optimization.clone(),
             target_frequency: config.build.target_frequency.clone(),
+            output_formats: output_formats.clone(),
         },
+        output_formats,
     })
 }
 
@@ -87,6 +93,7 @@ impl Clone for BuildConfig {
         Self {
             optimization: self.optimization.clone(),
             target_frequency: self.target_frequency.clone(),
+            output_formats: self.output_formats.clone(),
         }
     }
 }

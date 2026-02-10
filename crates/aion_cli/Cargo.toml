@@ -21,6 +21,11 @@ aion_elaborate = { workspace = true }
 aion_lint = { workspace = true }
 aion_sim = { workspace = true }
 aion_tui = { workspace = true }
+aion_synth = { workspace = true }
+aion_arch = { workspace = true }
+aion_timing = { workspace = true }
+aion_pnr = { workspace = true }
+aion_bitstream = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 

@@ -62,15 +62,20 @@ dependencies = [
 name = "aion_cli"
 version = "0.1.0"
 dependencies = [
+ "aion_arch",
+ "aion_bitstream",
  "aion_common",
  "aion_config",
  "aion_diagnostics",
  "aion_elaborate",
  "aion_ir",
  "aion_lint",
+ "aion_pnr",
  "aion_sim",
  "aion_source",
  "aion_sv_parser",
+ "aion_synth",
+ "aion_timing",
  "aion_tui",
  "aion_verilog_parser",
  "aion_vhdl_parser",
