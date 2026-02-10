@@ -33,6 +33,7 @@
 | `aion_timing` | 🟢 Complete | 84 | Static timing analysis: TimingGraph, SDC parser, forward/backward propagation, slack computation, critical path extraction, timing reports |
 | `aion_pnr` | 🟢 Complete | 90 | Place & route: MappedDesign→PnrNetlist conversion, random + simulated annealing placement, PathFinder routing + A* search, timing bridge |
 | `aion_bitstream` | 🟢 Complete | 113 | Bitstream generation: Intel SOF/POF/RBF + Xilinx BIT formats, ConfigBitDatabase trait, CRC-16/CRC-32, simplified config databases, BitstreamFormat::parse() |
+| `aion_xray` | 🟢 Complete (M1-M3) | 105 | Project X-Ray integration: tilegrid/segbits/tile_type parsers, XRayDatabase loader, Artix7XRay Architecture impl, XRayConfigBitDb, FASM emitter |
 
 ### Phase 0 Checklist
 
@@ -118,7 +119,38 @@
 - Unsupported format requests produce S503 errors
 - All format writers are deterministic (BTreeMap-sorted frames)
 
-**Status:** Phase 3 started. 1977 total workspace tests, all passing.
+**Status:** Phase 3 in progress. 2082 total workspace tests, all passing.
+
+---
+
+#### 2026-02-10 — Implement `aion_xray` crate (Milestones 1-3: Project X-Ray integration)
+
+**Tests added:** 105
+**What:** Implemented Project X-Ray database integration for Xilinx 7-series FPGAs. This enables real device data for Artix-7 tile grids, configuration bit mappings, and site/BEL placement using the open-source prjxray-db.
+
+**Implementation details:**
+- `tilegrid.rs` — Parses `tilegrid.json`: hex baseaddr, grid position, tile types, site assignments
+- `segbits.rs` — Parses `segbits_*.db`: feature→config-bit mappings with frame offsets, bit positions, and inversion flags
+- `tile_type.rs` — Parses `tile_type_*.json`: PIP definitions, wires, site pin-to-wire mappings
+- `db.rs` — `XRayDatabase::load()` combining all file types, best-effort loading for segbits/tile_types, env var and config path resolution
+- `arch_impl.rs` — `Artix7XRay` struct implementing `Architecture` trait with real tile grid, sites, BELs, site-type indexing; delegates resource counts to base `Artix7`
+- `config_db_impl.rs` — `XRayConfigBitDb` implementing `ConfigBitDatabase` using real segbits data; frame address computation from tilegrid baseaddr + frame offset
+- `fasm.rs` — FASM text output for debugging/validation, sorted rendering, cross-validation with X-Ray Python tools
+
+**Changes to existing crates:**
+- `aion_arch/types.rs` — Added `name: String` to `Tile` and `Site` structs; added `TileType::Interconnect` variant for routing-only INT tiles
+- All 124 existing `aion_arch` tests updated and passing
+
+**Key decisions:**
+- Separate crate (`aion_xray`) keeps JSON parsing deps out of `aion_arch` trait definitions
+- Tile type classification maps CLBLL/CLBLM→Logic, INT→Interconnect, LIOB/RIOB→Io, BRAM→Bram, DSP→Dsp, CMT→Clock
+- Site type classification maps SLICEL/SLICEM→LutFf, IOB33→IoPad, RAMB→BramSite, DSP48E1→DspSite, MMCM/PLL→Pll
+- Slice BELs: 4 LUTs (A6LUT..D6LUT) + 8 FFs (AFF, AFF2..DFF, DFF2) per SLICEL/SLICEM
+- Config bit computation: `frame = baseaddr + frame_offset`, `bit_offset = tile_word_offset * 32 + bit_position`
+- Inverted segbits (! prefix) produce `value: false` in ConfigBit
+- Integration tests gated by X-Ray database presence (AION_XRAY_DB env var)
+
+**Status:** 2082 total workspace tests, all passing. Clippy clean. Milestone 4 (routing graph) deferred.
 
 ---
 
@@ -1233,12 +1265,13 @@ Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construct
 ### Phase 3 Checklist
 
 - [x] `aion_bitstream` — Bitstream generation: Intel SOF/POF/RBF + Xilinx BIT (110 tests)
+- [x] `aion_xray` — Project X-Ray integration: database parsing, Architecture impl, ConfigBitDatabase, FASM (105 tests)
 - [ ] `aion_lsp` — Language Server Protocol implementation
 - [ ] `aion_flash` — JTAG programming and device detection
 - [ ] `aion_deps` — Dependency resolution, fetching, lock file
 - [ ] `aion_report` — Report generation (text, JSON, SARIF, SVG)
-- [ ] Real routing graphs in `aion_arch` (replace Phase 2 stubs)
-- [ ] Real config bit databases (Mistral/Project X-Ray)
+- [ ] Real routing graphs via X-Ray tile PIPs (Milestone 4)
+- [ ] Real placement using X-Ray sites (update `aion_pnr`)
 
 ## Phase 4 — Polish & Ecosystem (Months 22–28)
 

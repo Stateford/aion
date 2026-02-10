@@ -24,6 +24,8 @@ pub enum TileType {
     Io,
     /// A tile containing clock management resources (PLLs, MMCMs).
     Clock,
+    /// A tile providing routing-only interconnect (no placement sites).
+    Interconnect,
     /// An empty tile with no programmable resources.
     Empty,
 }
@@ -34,6 +36,8 @@ pub enum TileType {
 /// regular grid. Each tile has a type that determines what resources it contains.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tile {
+    /// The instance name of this tile (e.g., "CLBLL_L_X16Y149").
+    pub name: String,
     /// Column index in the device grid (0-based, left to right).
     pub col: u32,
     /// Row index in the device grid (0-based, bottom to top).
@@ -113,6 +117,8 @@ pub struct Bel {
 pub struct Site {
     /// The unique ID of this site.
     pub id: SiteId,
+    /// The instance name of this site (e.g., "SLICE_X24Y149").
+    pub name: String,
     /// The functional type of this site.
     pub site_type: SiteType,
     /// The BELs contained in this site.
@@ -238,6 +244,7 @@ mod tests {
             TileType::Dsp,
             TileType::Io,
             TileType::Clock,
+            TileType::Interconnect,
             TileType::Empty,
         ];
         for (i, t) in types.iter().enumerate() {
@@ -254,6 +261,7 @@ mod tests {
     #[test]
     fn tile_construction() {
         let tile = Tile {
+            name: "CLBLL_L_X5Y10".to_string(),
             col: 5,
             row: 10,
             tile_type: TileType::Logic,
@@ -312,6 +320,7 @@ mod tests {
     fn site_construction() {
         let site = Site {
             id: SiteId::from_raw(0),
+            name: "SLICE_X0Y0".to_string(),
             site_type: SiteType::LutFf,
             bels: vec![
                 Bel {

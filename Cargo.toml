@@ -21,6 +21,7 @@ members = [
     "crates/aion_timing",
     "crates/aion_pnr",
     "crates/aion_bitstream",
+    "crates/aion_xray",
 ]
 
 [workspace.package]
@@ -63,4 +64,5 @@ aion_synth = { path = "crates/aion_synth" }
 aion_timing = { path = "crates/aion_timing" }
 aion_pnr = { path = "crates/aion_pnr" }
 aion_bitstream = { path = "crates/aion_bitstream" }
+aion_xray = { path = "crates/aion_xray" }
 rand = "0.8"

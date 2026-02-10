@@ -288,6 +288,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aion_xray"
+version = "0.1.0"
+dependencies = [
+ "aion_arch",
+ "aion_bitstream",
+ "aion_common",
+ "aion_diagnostics",
+ "aion_ir",
+ "aion_source",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
