@@ -15,7 +15,7 @@
 |-------|--------|-------|-------|
 | `aion_common` | 🟢 Complete | 45 | Ident, Interner, ContentHash, Frequency, Logic, LogicVec, AionResult |
 | `aion_source` | 🟢 Complete | 22 | FileId, Span, SourceFile, SourceDb, ResolvedSpan |
-| `aion_diagnostics` | 🟢 Complete | 22 | Severity, DiagnosticCode, Label, Diagnostic, DiagnosticSink, TerminalRenderer |
+| `aion_diagnostics` | 🟢 Complete | 25 | Severity, DiagnosticCode, Label, Diagnostic, DiagnosticSink, TerminalRenderer (with ANSI color) |
 | `aion_config` | 🟢 Complete | 26 | ProjectConfig, all config types, loader, validator, target resolver, output_formats |
 | `aion_ir` | 🟢 Complete | 79 | Arena, IDs, TypeDb, Design, Module, Signal, Cell, Process, Expr, Statement (incl Delay/Forever), SourceMap |
 | `aion_vhdl_parser` | 🟢 Complete | 85 | Lexer, Pratt parser, full AST, error recovery, serde |
@@ -66,6 +66,25 @@
 ## Implementation Log
 
 <!-- Entries are prepended here, newest first -->
+
+#### 2026-02-15 — Add colored diagnostic output
+
+**Tests added:** 3 new (25 total in aion_diagnostics)
+**What:** Implemented ANSI color support in `TerminalRenderer`. The `color: bool` field was already plumbed through from the CLI's `--color` flag but was completely ignored — all output was plain text. Now when `color: true`, diagnostics render with rustc-style coloring.
+
+**Changes:**
+- `aion_diagnostics/renderer.rs` — Added ANSI constants, `severity_style()` and `blue()` helper methods, wrapped severity headers in bold red/yellow/cyan/bold, line numbers and pipes in bold blue, carets and labels in severity color
+
+**Color scheme (matching rustc):**
+- `error[E101]` → bold red, `warning[W201]` → bold yellow, `note` → bold, `help` → bold cyan
+- Line numbers, `-->`, pipes `|`, `=` → bold blue
+- Carets `^^^^` and primary label → same color as severity
+
+**No new dependencies** — uses raw ANSI escape codes.
+
+**Status:** 25 aion_diagnostics tests passing. Clippy clean.
+
+---
 
 #### 2026-02-09 — Add `aion build` command (full pipeline)
 
