@@ -108,13 +108,13 @@ impl fmt::Display for SimTime {
         let fs = self.fs;
         if fs == 0 {
             write!(f, "0 fs")?;
-        } else if fs >= FS_PER_MS && fs % FS_PER_MS == 0 {
+        } else if fs >= FS_PER_MS && fs.is_multiple_of(FS_PER_MS) {
             write!(f, "{} ms", fs / FS_PER_MS)?;
-        } else if fs >= FS_PER_US && fs % FS_PER_US == 0 {
+        } else if fs >= FS_PER_US && fs.is_multiple_of(FS_PER_US) {
             write!(f, "{} us", fs / FS_PER_US)?;
-        } else if fs >= FS_PER_NS && fs % FS_PER_NS == 0 {
+        } else if fs >= FS_PER_NS && fs.is_multiple_of(FS_PER_NS) {
             write!(f, "{} ns", fs / FS_PER_NS)?;
-        } else if fs >= FS_PER_PS && fs % FS_PER_PS == 0 {
+        } else if fs >= FS_PER_PS && fs.is_multiple_of(FS_PER_PS) {
             write!(f, "{} ps", fs / FS_PER_PS)?;
         } else {
             write!(f, "{fs} fs")?;

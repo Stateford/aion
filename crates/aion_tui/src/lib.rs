@@ -57,24 +57,15 @@ use waveform_data::WaveformData;
 pub fn run_tui(design: &Design, interner: &Interner) -> Result<(), SimError> {
     install_panic_hook();
 
-    let mut terminal = init_terminal().map_err(|e| {
-        SimError::WaveformIo(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    let mut terminal =
+        init_terminal().map_err(|e| SimError::WaveformIo(std::io::Error::other(e.to_string())))?;
 
     let mut app = TuiApp::new(design, interner)?;
     app.initialize()?;
 
     run_tui_loop(&mut app, &mut terminal)?;
 
-    restore_terminal().map_err(|e| {
-        SimError::WaveformIo(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    restore_terminal().map_err(|e| SimError::WaveformIo(std::io::Error::other(e.to_string())))?;
 
     Ok(())
 }
@@ -94,23 +85,14 @@ pub fn run_tui_viewer(
 ) -> Result<(), SimError> {
     install_panic_hook();
 
-    let mut terminal = init_terminal().map_err(|e| {
-        SimError::WaveformIo(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    let mut terminal =
+        init_terminal().map_err(|e| SimError::WaveformIo(std::io::Error::other(e.to_string())))?;
 
     let mut app = TuiApp::from_waveform(waveform, signal_info);
 
     run_tui_loop(&mut app, &mut terminal)?;
 
-    restore_terminal().map_err(|e| {
-        SimError::WaveformIo(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    restore_terminal().map_err(|e| SimError::WaveformIo(std::io::Error::other(e.to_string())))?;
 
     Ok(())
 }
@@ -126,12 +108,7 @@ fn run_tui_loop(
         // Render
         terminal
             .draw(|frame| render::render(app, frame))
-            .map_err(|e| {
-                SimError::WaveformIo(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            .map_err(|e| SimError::WaveformIo(std::io::Error::other(e.to_string())))?;
 
         // Handle events
         match poll_event(tick_rate) {
