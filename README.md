@@ -16,6 +16,10 @@ A fast, open-source FPGA toolchain written in Rust. Aion replaces proprietary ve
 - **Cargo-like UX** — `aion init`, `aion lint`, `aion build`, project scaffolding, `aion.toml` configuration
 - **Precise diagnostics** — Source-span-accurate error messages with codes and suggestions, inspired by `rustc`
 
+<p align="center">
+  <img src="docs/assets/simulator.png" alt="Aion simulator running a testbench with waveform output" width="800">
+</p>
+
 ## Quick Start
 
 ```bash
