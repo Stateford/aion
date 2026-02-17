@@ -163,11 +163,7 @@ fn elaborate_verilog_ports(
             ctx.interner,
             ctx.sink,
         );
-        let kind = match dir {
-            PortDirection::Input => SignalKind::Port,
-            PortDirection::Output => SignalKind::Reg,
-            PortDirection::InOut => SignalKind::Wire,
-        };
+        let kind = SignalKind::Port;
         for &name in &port_decl.names {
             let sid = signals.alloc(Signal {
                 id: SignalId::from_raw(0),

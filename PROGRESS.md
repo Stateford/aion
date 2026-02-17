@@ -13,7 +13,8 @@
 - **Example output:** `magic number '0x2A' (8-bit) in expression` with label `literal '0x2A' used directly` and help `replace with a named constant or parameter for clarity`.
 - **Fixed false positives:** Bit-index (`count[2]`) and slice-bound (`data[7:0]`) literals are now excluded — these are structural positions, not magic numbers.
 - **Tests added:** `bit_index_no_warning`, `slice_bounds_no_warning`; existing tests strengthened to verify message content.
-- All 93 lint tests pass, clippy clean.
+- **Fixed W101 false positive on output ports:** Elaboration (`sv.rs`, `verilog.rs`, `vhdl.rs`) was only marking `Input` ports as `SignalKind::Port` — `Output` got `Reg` and `InOut` got `Wire`. All port directions now correctly use `SignalKind::Port`, so W101/W102 skip them properly.
+- All workspace tests pass, clippy clean.
 
 ---
 

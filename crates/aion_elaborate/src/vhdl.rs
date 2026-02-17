@@ -173,11 +173,7 @@ fn elaborate_vhdl_ports(
                 ctx.interner,
                 ctx.sink,
             );
-            let kind = match dir {
-                PortDirection::Input => SignalKind::Port,
-                PortDirection::Output => SignalKind::Reg,
-                PortDirection::InOut => SignalKind::Wire,
-            };
+            let kind = SignalKind::Port;
 
             for &name in &iface.names {
                 let sid = signals.alloc(Signal {
