@@ -12,7 +12,7 @@ use aion_ir::cell::{Cell, CellKind, Connection};
 use aion_ir::ids::{CellId, ModuleId, ProcessId, SignalId, TypeId};
 use aion_ir::module::{Assignment, Module, Parameter};
 use aion_ir::port::{Port, PortDirection};
-use aion_ir::process::{Process, ProcessKind, Sensitivity};
+use aion_ir::process::{Edge, EdgeSensitivity, Process, ProcessKind, Sensitivity};
 use aion_ir::signal::{Signal, SignalKind};
 use aion_ir::ConstValue;
 use aion_vhdl_parser::ast::{self as vhdl_ast, PortMode};
@@ -295,13 +295,9 @@ fn elaborate_vhdl_concurrent(
 ) {
     match stmt {
         vhdl_ast::ConcurrentStatement::Process(ps) => {
-            let sensitivity = map_vhdl_sensitivity(&ps.sensitivity, sig_env);
-            let kind = match &ps.sensitivity {
-                vhdl_ast::SensitivityList::All | vhdl_ast::SensitivityList::None => {
-                    ProcessKind::Combinational
-                }
-                vhdl_ast::SensitivityList::List(_) => ProcessKind::Combinational,
-            };
+            // Detect sequential processes by scanning for rising_edge/falling_edge
+            let (kind, sensitivity) =
+                detect_vhdl_process_kind(&ps.sensitivity, &ps.stmts, sig_env, ctx.interner);
             let ir_stmts: Vec<_> = ps
                 .stmts
                 .iter()
@@ -371,6 +367,132 @@ fn map_vhdl_sensitivity(sens: &vhdl_ast::SensitivityList, sig_env: &SignalEnv) -
     }
 }
 
+/// Determines the process kind and sensitivity for a VHDL process.
+///
+/// Scans the process body statements for `rising_edge` / `falling_edge` calls.
+/// When found, returns `ProcessKind::Sequential` with an `EdgeList` sensitivity,
+/// matching the approach used for SystemVerilog `always_ff` blocks.
+fn detect_vhdl_process_kind(
+    sens_list: &vhdl_ast::SensitivityList,
+    stmts: &[vhdl_ast::SequentialStatement],
+    sig_env: &SignalEnv,
+    interner: &aion_common::Interner,
+) -> (ProcessKind, Sensitivity) {
+    // Scan statements for rising_edge/falling_edge calls
+    let mut edges = Vec::new();
+    for stmt in stmts {
+        collect_edge_calls(stmt, sig_env, interner, &mut edges);
+    }
+
+    if !edges.is_empty() {
+        // Sequential process — build EdgeList from detected edges
+        // Also add any other sensitivity list signals as async reset candidates
+        if let vhdl_ast::SensitivityList::List(names) = sens_list {
+            for sn in names {
+                if let Some(&sig_name) = sn.parts.last() {
+                    if let Some(&sid) = sig_env.get(&sig_name) {
+                        // Add signals not already in the edge list as async resets (negedge)
+                        let already_listed = edges.iter().any(|e| e.signal == sid);
+                        if !already_listed {
+                            edges.push(EdgeSensitivity {
+                                signal: sid,
+                                edge: Edge::Both,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        (ProcessKind::Sequential, Sensitivity::EdgeList(edges))
+    } else {
+        // No edge calls found — use original sensitivity mapping
+        let sensitivity = map_vhdl_sensitivity(sens_list, sig_env);
+        (ProcessKind::Combinational, sensitivity)
+    }
+}
+
+/// Recursively scans VHDL sequential statements for `rising_edge` / `falling_edge` calls.
+fn collect_edge_calls(
+    stmt: &vhdl_ast::SequentialStatement,
+    sig_env: &SignalEnv,
+    interner: &aion_common::Interner,
+    edges: &mut Vec<EdgeSensitivity>,
+) {
+    match stmt {
+        vhdl_ast::SequentialStatement::If(if_stmt) => {
+            collect_edge_calls_expr(&if_stmt.condition, sig_env, interner, edges);
+            for s in &if_stmt.then_stmts {
+                collect_edge_calls(s, sig_env, interner, edges);
+            }
+            for elsif in &if_stmt.elsif_branches {
+                collect_edge_calls_expr(&elsif.condition, sig_env, interner, edges);
+                for s in &elsif.stmts {
+                    collect_edge_calls(s, sig_env, interner, edges);
+                }
+            }
+            for s in &if_stmt.else_stmts {
+                collect_edge_calls(s, sig_env, interner, edges);
+            }
+        }
+        vhdl_ast::SequentialStatement::Case(case_stmt) => {
+            for alt in &case_stmt.alternatives {
+                for s in &alt.stmts {
+                    collect_edge_calls(s, sig_env, interner, edges);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Checks a VHDL expression for `rising_edge(sig)` or `falling_edge(sig)` calls.
+fn collect_edge_calls_expr(
+    expr: &vhdl_ast::Expr,
+    sig_env: &SignalEnv,
+    interner: &aion_common::Interner,
+    edges: &mut Vec<EdgeSensitivity>,
+) {
+    match expr {
+        vhdl_ast::Expr::Name(name) => {
+            let primary_text = interner.resolve(name.primary).to_lowercase();
+            if (primary_text == "rising_edge" || primary_text == "falling_edge")
+                && !name.parts.is_empty()
+            {
+                if let vhdl_ast::NameSuffix::Index(args, _) = &name.parts[0] {
+                    if let Some(vhdl_ast::Expr::Name(arg_name)) = args.first() {
+                        if let Some(&sid) = sig_env.get(&arg_name.primary) {
+                            let edge = if primary_text == "rising_edge" {
+                                Edge::Posedge
+                            } else {
+                                Edge::Negedge
+                            };
+                            let already = edges.iter().any(|e| e.signal == sid);
+                            if !already {
+                                edges.push(EdgeSensitivity { signal: sid, edge });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        vhdl_ast::Expr::FunctionCall { name, .. } => {
+            // Also handle the case where the parser uses FunctionCall variant
+            collect_edge_calls_expr(name, sig_env, interner, edges);
+        }
+        vhdl_ast::Expr::Binary { left, right, .. } => {
+            collect_edge_calls_expr(left, sig_env, interner, edges);
+            collect_edge_calls_expr(right, sig_env, interner, edges);
+        }
+        vhdl_ast::Expr::Unary { operand, .. } => {
+            collect_edge_calls_expr(operand, sig_env, interner, edges);
+        }
+        vhdl_ast::Expr::Paren { inner, .. } => {
+            collect_edge_calls_expr(inner, sig_env, interner, edges);
+        }
+        _ => {}
+    }
+}
+
 /// Elaborates a VHDL component instantiation.
 fn elaborate_vhdl_component(
     ci: &vhdl_ast::ComponentInstantiation,
@@ -418,7 +540,7 @@ fn elaborate_vhdl_component(
         .unwrap_or_default();
 
     if let Some(mid) = ctx.check_cache(module_name, &generic_overrides) {
-        let connections = build_vhdl_port_connections(ci, sig_env, ctx);
+        let connections = build_vhdl_port_connections(ci, sig_env, mid, ctx);
         cells.alloc(Cell {
             id: CellId::from_raw(0),
             name: ci.label,
@@ -480,7 +602,7 @@ fn elaborate_vhdl_component(
     };
     ctx.pop_elab_stack();
 
-    let connections = build_vhdl_port_connections(ci, sig_env, ctx);
+    let connections = build_vhdl_port_connections(ci, sig_env, mid, ctx);
     cells.alloc(Cell {
         id: CellId::from_raw(0),
         name: ci.label,
@@ -501,10 +623,12 @@ fn extract_vhdl_formal(formal: &Option<vhdl_ast::Expr>) -> Option<Ident> {
     }
 }
 
-/// Builds IR connections from VHDL port map.
+/// Builds IR connections from VHDL port map, looking up actual port directions
+/// from the target module.
 fn build_vhdl_port_connections(
     ci: &vhdl_ast::ComponentInstantiation,
     sig_env: &SignalEnv,
+    target_module: ModuleId,
     ctx: &ElaborationContext<'_>,
 ) -> Vec<Connection> {
     ci.port_map
@@ -516,15 +640,33 @@ fn build_vhdl_port_connections(
                     let formal_name = extract_vhdl_formal(&elem.formal)?;
                     let signal =
                         lower_vhdl_to_signal_ref(&elem.actual, sig_env, ctx.interner, ctx.sink);
+                    let direction = lookup_port_direction(target_module, formal_name, ctx);
                     Some(Connection {
                         port_name: formal_name,
-                        direction: PortDirection::Input,
+                        direction,
                         signal,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Looks up the direction of a port in the target module by name.
+///
+/// Returns `PortDirection::Input` as fallback if the port is not found.
+fn lookup_port_direction(
+    target: ModuleId,
+    port_name: Ident,
+    ctx: &ElaborationContext<'_>,
+) -> PortDirection {
+    let module = ctx.design.modules.get(target);
+    module
+        .ports
+        .iter()
+        .find(|p| p.name == port_name)
+        .map(|p| p.direction)
+        .unwrap_or(PortDirection::Input)
 }
 
 #[cfg(test)]
@@ -700,5 +842,79 @@ mod tests {
         let mut ctx = ElaborationContext::new(&reg, &interner, &source_db, &sink);
         let mid = elaborate_vhdl_entity(&entity, &arch, &[], &mut ctx);
         assert_eq!(ctx.design.modules[mid].signals.len(), 1);
+    }
+
+    #[test]
+    fn detect_sequential_process_with_rising_edge() {
+        let (interner, _source_db, _sink) = setup();
+        let clk = interner.get_or_intern("clk");
+        let rising_edge = interner.get_or_intern("rising_edge");
+
+        let mut sig_env = SignalEnv::new();
+        let clk_sid = SignalId::from_raw(0);
+        sig_env.insert(clk, clk_sid);
+
+        let sensitivity = vhdl_ast::SensitivityList::List(vec![vhdl_ast::SelectedName {
+            parts: vec![clk],
+            span: Span::DUMMY,
+        }]);
+
+        // Build a process body with: if rising_edge(clk) then ... end if;
+        let stmts = vec![vhdl_ast::SequentialStatement::If(vhdl_ast::IfStatement {
+            label: None,
+            condition: vhdl_ast::Expr::Name(vhdl_ast::Name {
+                primary: rising_edge,
+                parts: vec![vhdl_ast::NameSuffix::Index(
+                    vec![vhdl_ast::Expr::Name(vhdl_ast::Name {
+                        primary: clk,
+                        parts: vec![],
+                        span: Span::DUMMY,
+                    })],
+                    Span::DUMMY,
+                )],
+                span: Span::DUMMY,
+            }),
+            then_stmts: vec![],
+            elsif_branches: vec![],
+            else_stmts: vec![],
+            span: Span::DUMMY,
+        })];
+
+        let (kind, sens) = detect_vhdl_process_kind(&sensitivity, &stmts, &sig_env, &interner);
+        assert!(
+            matches!(kind, ProcessKind::Sequential),
+            "process with rising_edge should be Sequential"
+        );
+        assert!(
+            matches!(sens, Sensitivity::EdgeList(ref edges) if !edges.is_empty()),
+            "should have EdgeList sensitivity"
+        );
+        if let Sensitivity::EdgeList(edges) = sens {
+            assert_eq!(edges[0].signal, clk_sid);
+            assert!(matches!(edges[0].edge, Edge::Posedge));
+        }
+    }
+
+    #[test]
+    fn detect_combinational_process_without_edges() {
+        let (interner, _source_db, _sink) = setup();
+        let a = interner.get_or_intern("a");
+
+        let mut sig_env = SignalEnv::new();
+        sig_env.insert(a, SignalId::from_raw(0));
+
+        let sensitivity = vhdl_ast::SensitivityList::List(vec![vhdl_ast::SelectedName {
+            parts: vec![a],
+            span: Span::DUMMY,
+        }]);
+
+        // Empty body — no rising_edge/falling_edge calls
+        let stmts = vec![vhdl_ast::SequentialStatement::Null { span: Span::DUMMY }];
+
+        let (kind, _sens) = detect_vhdl_process_kind(&sensitivity, &stmts, &sig_env, &interner);
+        assert!(
+            matches!(kind, ProcessKind::Combinational),
+            "process without edge calls should be Combinational"
+        );
     }
 }

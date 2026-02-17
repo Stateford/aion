@@ -437,7 +437,7 @@ fn elaborate_verilog_instantiation(
     if let Some(mid) = ctx.check_cache(module_name, &param_overrides) {
         // Create instance cells for each instance
         for instance in &inst.instances {
-            let connections = build_verilog_connections(&instance.connections, sig_env, ctx);
+            let connections = build_verilog_connections(&instance.connections, sig_env, mid, ctx);
             cells.alloc(Cell {
                 id: CellId::from_raw(0),
                 name: instance.name,
@@ -513,7 +513,7 @@ fn elaborate_verilog_instantiation(
     ctx.pop_elab_stack();
 
     for instance in &inst.instances {
-        let connections = build_verilog_connections(&instance.connections, sig_env, ctx);
+        let connections = build_verilog_connections(&instance.connections, sig_env, mid, ctx);
         cells.alloc(Cell {
             id: CellId::from_raw(0),
             name: instance.name,
@@ -527,10 +527,12 @@ fn elaborate_verilog_instantiation(
     }
 }
 
-/// Builds IR connections from Verilog port connections.
+/// Builds IR connections from Verilog port connections, looking up actual port
+/// directions from the target module.
 fn build_verilog_connections(
     connections: &[v_ast::Connection],
     sig_env: &SignalEnv,
+    target_module: ModuleId,
     ctx: &ElaborationContext<'_>,
 ) -> Vec<Connection> {
     connections
@@ -542,13 +544,31 @@ fn build_verilog_connections(
             } else {
                 return None;
             };
+            let direction = lookup_port_direction(target_module, formal, ctx);
             Some(Connection {
                 port_name: formal,
-                direction: PortDirection::Input, // resolved later
+                direction,
                 signal,
             })
         })
         .collect()
+}
+
+/// Looks up the direction of a port in the target module by name.
+///
+/// Returns `PortDirection::Input` as fallback if the port is not found.
+fn lookup_port_direction(
+    target: ModuleId,
+    port_name: Ident,
+    ctx: &ElaborationContext<'_>,
+) -> PortDirection {
+    let module = ctx.design.modules.get(target);
+    module
+        .ports
+        .iter()
+        .find(|p| p.name == port_name)
+        .map(|p| p.direction)
+        .unwrap_or(PortDirection::Input)
 }
 
 #[cfg(test)]

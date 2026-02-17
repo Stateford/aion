@@ -769,6 +769,38 @@ fn parse_vhdl_bit_string(text: &str) -> LogicVec {
     }
 }
 
+/// Known VHDL built-in functions and type conversion names.
+///
+/// When the VHDL parser encounters `rising_edge(clk)` or `std_logic_vector(x)`,
+/// it emits them as `Name { primary, parts: [Index(...)] }`. Without this list,
+/// `lower_vhdl_name` would try to resolve these as signals and emit E204.
+const VHDL_BUILTINS: &[&str] = &[
+    "rising_edge",
+    "falling_edge",
+    "to_unsigned",
+    "to_signed",
+    "to_integer",
+    "unsigned",
+    "signed",
+    "std_logic_vector",
+    "std_ulogic_vector",
+    "resize",
+    "shift_left",
+    "shift_right",
+    "to_stdulogicvector",
+    "to_stdlogicvector",
+    "to_bitvector",
+    "integer",
+    "natural",
+    "positive",
+];
+
+/// Returns `true` if `name` is a known VHDL built-in function or type name.
+fn is_vhdl_builtin(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    VHDL_BUILTINS.iter().any(|b| *b == lower)
+}
+
 /// Lowers a VHDL `Name` to an IR expression.
 fn lower_vhdl_name(
     name: &aion_vhdl_parser::ast::Name,
@@ -778,6 +810,27 @@ fn lower_vhdl_name(
     sink: &DiagnosticSink,
 ) -> IrExpr {
     use aion_vhdl_parser::ast::NameSuffix;
+
+    let primary_text = interner.resolve(name.primary);
+
+    // Check if the primary is a VHDL built-in function or type conversion
+    if is_vhdl_builtin(primary_text) {
+        // If there are Index suffix parts, treat as a function call with arguments
+        if let Some(NameSuffix::Index(args, span)) = name.parts.first() {
+            let ir_args: Vec<_> = args
+                .iter()
+                .map(|a| lower_vhdl_expr(a, sig_env, source_db, interner, sink))
+                .collect();
+            return IrExpr::FuncCall {
+                name: name.primary,
+                args: ir_args,
+                ty: TypeId::from_raw(0),
+                span: *span,
+            };
+        }
+        // No arguments — return a passthrough zero literal (type name used as value)
+        return IrExpr::Literal(LogicVec::all_zero(1));
+    }
 
     let base = resolve_signal(name.primary, name.span, sig_env, interner, sink);
 
@@ -1455,5 +1508,80 @@ mod tests {
         for op in ops {
             let _ = map_verilog_unary_op(op);
         }
+    }
+
+    #[test]
+    fn vhdl_builtin_rising_edge_no_error() {
+        let (sdb, interner, sink, mut env) = setup();
+        let clk = interner.get_or_intern("clk");
+        env.insert(clk, SignalId::from_raw(0));
+        let rising = interner.get_or_intern("rising_edge");
+
+        let ast_expr = aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
+            primary: rising,
+            parts: vec![aion_vhdl_parser::ast::NameSuffix::Index(
+                vec![aion_vhdl_parser::ast::Expr::Name(
+                    aion_vhdl_parser::ast::Name {
+                        primary: clk,
+                        parts: vec![],
+                        span: Span::DUMMY,
+                    },
+                )],
+                Span::DUMMY,
+            )],
+            span: Span::DUMMY,
+        });
+        let ir = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
+        // Should produce a FuncCall, not an error
+        assert!(matches!(ir, IrExpr::FuncCall { .. }));
+        assert!(!sink.has_errors(), "rising_edge should not emit E204");
+    }
+
+    #[test]
+    fn vhdl_builtin_std_logic_vector_no_error() {
+        let (sdb, interner, sink, mut env) = setup();
+        let sig = interner.get_or_intern("count_reg");
+        env.insert(sig, SignalId::from_raw(0));
+        let slv = interner.get_or_intern("std_logic_vector");
+
+        let ast_expr = aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
+            primary: slv,
+            parts: vec![aion_vhdl_parser::ast::NameSuffix::Index(
+                vec![aion_vhdl_parser::ast::Expr::Name(
+                    aion_vhdl_parser::ast::Name {
+                        primary: sig,
+                        parts: vec![],
+                        span: Span::DUMMY,
+                    },
+                )],
+                Span::DUMMY,
+            )],
+            span: Span::DUMMY,
+        });
+        let ir = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
+        assert!(matches!(ir, IrExpr::FuncCall { .. }));
+        assert!(!sink.has_errors(), "std_logic_vector should not emit E204");
+    }
+
+    #[test]
+    fn vhdl_non_builtin_emits_error() {
+        let (sdb, interner, sink, env) = setup();
+        let unknown = interner.get_or_intern("not_a_builtin");
+
+        let ast_expr = aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
+            primary: unknown,
+            parts: vec![],
+            span: Span::DUMMY,
+        });
+        let _ = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
+        assert!(sink.has_errors(), "unknown name should still emit E204");
+    }
+
+    #[test]
+    fn is_vhdl_builtin_case_insensitive() {
+        assert!(is_vhdl_builtin("RISING_EDGE"));
+        assert!(is_vhdl_builtin("Rising_Edge"));
+        assert!(is_vhdl_builtin("to_unsigned"));
+        assert!(!is_vhdl_builtin("my_signal"));
     }
 }

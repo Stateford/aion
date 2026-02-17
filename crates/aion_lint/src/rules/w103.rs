@@ -1,6 +1,7 @@
 //! W103: Width mismatch — LHS and RHS of assignment have different bit widths.
 
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
+use aion_ir::ids::TypeId;
 use aion_ir::{Design, Expr, Module, SignalRef, Statement};
 
 use crate::LintRule;
@@ -74,6 +75,10 @@ fn signal_ref_width(sref: &SignalRef, module: &Module, design: &Design) -> Optio
 }
 
 /// Returns the bit width of an expression, if known from its type annotation.
+///
+/// Returns `None` for context-dependent widths such as VHDL `(others => '0')`
+/// aggregates (which lower to 1-bit all-zero/all-one literals) and small integer
+/// literals used in arithmetic expressions.
 fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
     match expr {
         Expr::Signal(sref) => match sref {
@@ -81,11 +86,28 @@ fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
             SignalRef::Const(lv) => Some(lv.width()),
             _ => None, // Would need module context to resolve signal types
         },
-        Expr::Literal(lv) => Some(lv.width()),
+        Expr::Literal(lv) => {
+            // 1-bit all-zero or all-one literals are context-dependent in VHDL:
+            // they represent `(others => '0')` or `(others => '1')` aggregates
+            // whose actual width matches the assignment target.
+            if lv.width() == 1 && (lv.is_all_zero() || lv.is_all_one()) {
+                return None;
+            }
+            Some(lv.width())
+        }
         Expr::Unary { ty, .. }
         | Expr::Binary { ty, .. }
         | Expr::Ternary { ty, .. }
-        | Expr::FuncCall { ty, .. } => design.types.bit_width(*ty),
+        | Expr::FuncCall { ty, .. } => {
+            // TypeId::from_raw(0) is used as a placeholder for unresolved types
+            // throughout elaboration. Since this ID may coincidentally alias with a
+            // real type (e.g., std_logic → Bit → 1 bit), treat it as unknown to
+            // avoid false width-mismatch warnings.
+            if *ty == TypeId::from_raw(0) {
+                return None;
+            }
+            design.types.bit_width(*ty)
+        }
         Expr::Concat(exprs) => {
             let mut total = 0u32;
             for e in exprs {
@@ -291,5 +313,102 @@ mod tests {
         WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn others_zero_no_width_mismatch() {
+        // (others => '0') lowers to LogicVec::all_zero(1). When assigned to an
+        // 8-bit signal, W103 should NOT fire because the width is context-dependent.
+        let (mut module, mut types) = mk_module_with_types();
+        let ty8 = types.intern(Type::BitVec {
+            width: 8,
+            signed: false,
+        });
+        let sig_id = module.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: Ident::from_raw(10),
+            ty: ty8,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        // RHS is 1-bit all-zero (represents (others => '0'))
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(sig_id),
+            value: Expr::Literal(LogicVec::all_zero(1)),
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module, types);
+        let sink = DiagnosticSink::new();
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        assert!(
+            sink.take_all().is_empty(),
+            "1-bit all-zero should not trigger W103 (context-dependent width)"
+        );
+    }
+
+    #[test]
+    fn others_one_no_width_mismatch() {
+        // (others => '1') lowers to LogicVec::all_one(1).
+        let (mut module, mut types) = mk_module_with_types();
+        let ty8 = types.intern(Type::BitVec {
+            width: 8,
+            signed: false,
+        });
+        let sig_id = module.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: Ident::from_raw(10),
+            ty: ty8,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(sig_id),
+            value: Expr::Literal(LogicVec::all_one(1)),
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module, types);
+        let sink = DiagnosticSink::new();
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        assert!(
+            sink.take_all().is_empty(),
+            "1-bit all-one should not trigger W103 (context-dependent width)"
+        );
+    }
+
+    #[test]
+    fn explicit_multibit_literal_still_fires() {
+        // A 4-bit literal (not 1-bit context-dependent) should still trigger W103
+        let (mut module, mut types) = mk_module_with_types();
+        let ty8 = types.intern(Type::BitVec {
+            width: 8,
+            signed: false,
+        });
+        let sig_id = module.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: Ident::from_raw(10),
+            ty: ty8,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(sig_id),
+            value: Expr::Literal(LogicVec::from_u64(0xF, 4)),
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module, types);
+        let sink = DiagnosticSink::new();
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        let diags = sink.take_all();
+        assert_eq!(
+            diags.len(),
+            1,
+            "4-bit literal assigned to 8-bit should still fire W103"
+        );
     }
 }

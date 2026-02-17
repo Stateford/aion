@@ -1,0 +1,48 @@
+[project]
+name = "blinky_vhdl"
+version = "0.1.0"
+top = "blinky_top"
+
+[targets.de0_nano]
+device = "EP4CE22F17C6"
+family = "cyclone4"
+
+[targets.de0_nano.pins]
+clk   = { pin = "PIN_R8",  io_standard = "3.3-V LVTTL" }
+rst_n = { pin = "PIN_J15", io_standard = "3.3-V LVTTL" }
+
+[targets.de0_nano.pins."leds(0)"]
+pin = "PIN_A15"
+io_standard = "3.3-V LVTTL"
+
+[targets.de0_nano.pins."leds(1)"]
+pin = "PIN_A13"
+io_standard = "3.3-V LVTTL"
+
+[targets.de0_nano.pins."leds(2)"]
+pin = "PIN_B13"
+io_standard = "3.3-V LVTTL"
+
+[targets.de0_nano.pins."leds(3)"]
+pin = "PIN_A11"
+io_standard = "3.3-V LVTTL"
+
+[targets.de0_nano.pins."leds(4)"]
+pin = "PIN_D1"
+io_standard = "3.3-V LVTTL"
+
+[targets.de0_nano.pins."leds(5)"]
+pin = "PIN_F3"
+io_standard = "3.3-V LVTTL"
+
+[targets.de0_nano.pins."leds(6)"]
+pin = "PIN_B1"
+io_standard = "3.3-V LVTTL"
+
+[targets.de0_nano.pins."leds(7)"]
+pin = "PIN_L3"
+io_standard = "3.3-V LVTTL"
+
+[clocks.clk]
+frequency = "50MHz"
+port = "clk"

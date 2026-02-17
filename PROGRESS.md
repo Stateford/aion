@@ -5,6 +5,18 @@
 
 ---
 
+## 2026-02-17 — Fix VHDL Elaboration False Positives
+
+- **Fixed 5 root causes** producing 3 errors + 13 warnings (all false positives) when linting valid VHDL-2008 code in `examples/blinky_vhdl`.
+- **Fix 1+2 (E204):** `lower_vhdl_name` in `expr.rs` now recognizes VHDL built-in functions (`rising_edge`, `falling_edge`, `std_logic_vector`, `to_unsigned`, etc.) and type conversion names. These are lowered as `IrExpr::FuncCall` instead of triggering unknown-signal errors.
+- **Fix 3 (W103):** `expr_width` in `w103.rs` returns `None` for 1-bit all-zero/all-one literals (representing VHDL `(others => '0'/'1')` aggregates with context-dependent width). Also skips width checks on expressions with unresolved placeholder types (`TypeId::from_raw(0)`).
+- **Fix 4 (W105/W106):** Added `detect_vhdl_process_kind` in `vhdl.rs` that scans process body for `rising_edge`/`falling_edge` calls. When detected, sets `ProcessKind::Sequential` with `Sensitivity::EdgeList`, matching the SV `always_ff` approach.
+- **Fix 5 (W102):** `build_vhdl_port_connections`, `build_sv_connections`, and `build_verilog_connections` now look up the target module's actual port directions instead of hardcoding `PortDirection::Input`.
+- **Tests added:** 9 new unit tests across `expr.rs`, `vhdl.rs`, and `w103.rs`.
+- **Result:** `aion lint` on `examples/blinky_vhdl` → 0 errors, 0 warnings. All workspace tests pass, clippy clean.
+
+---
+
 ## 2026-02-17 — C203 Magic Number Diagnostic Improvement
 
 - **Fixed:** C203 lint rule now provides meaningful diagnostic data instead of empty `Span::DUMMY` locations and generic messages.
