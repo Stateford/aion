@@ -5,6 +5,18 @@
 
 ---
 
+## 2026-02-17 — C203 Magic Number Diagnostic Improvement
+
+- **Fixed:** C203 lint rule now provides meaningful diagnostic data instead of empty `Span::DUMMY` locations and generic messages.
+- **Changes:** `check_expr_magic_numbers` now threads the enclosing statement/assignment span as context, and includes the literal value (hex) and bit width in the message.
+- **Diagnostics now include:** primary span from enclosing context, label with the literal value, and help text suggesting named constants.
+- **Example output:** `magic number '0x2A' (8-bit) in expression` with label `literal '0x2A' used directly` and help `replace with a named constant or parameter for clarity`.
+- **Fixed false positives:** Bit-index (`count[2]`) and slice-bound (`data[7:0]`) literals are now excluded — these are structural positions, not magic numbers.
+- **Tests added:** `bit_index_no_warning`, `slice_bounds_no_warning`; existing tests strengthened to verify message content.
+- All 93 lint tests pass, clippy clean.
+
+---
+
 ## Phase 0 — Foundation (Months 1–4)
 
 **Goal:** Parse all three HDL languages and produce useful lint output.
