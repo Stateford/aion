@@ -65,4 +65,4 @@ aion_timing = { path = "crates/aion_timing" }
 aion_pnr = { path = "crates/aion_pnr" }
 aion_bitstream = { path = "crates/aion_bitstream" }
 aion_xray = { path = "crates/aion_xray" }
-rand = "0.8"
+rand = "0.9"
