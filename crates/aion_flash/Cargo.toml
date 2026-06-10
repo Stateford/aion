@@ -1,0 +1,13 @@
+[package]
+name = "aion_flash"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JTAG programming and device detection for FPGA development boards"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
