@@ -5,6 +5,19 @@
 
 ---
 
+## 2026-06-10 — Implement `aion_flash` MVP + `aion flash` command (Phase 3)
+
+- **New crate `aion_flash`** (30 tests): JTAG programming and device detection, first backend delegating to [openFPGALoader](https://github.com/trabucayre/openFPGALoader) as a subprocess (native `rusb` USB-Blaster driver deferred; see `docs/de0-nano-plan.md` Phase 3).
+  - `lib.rs` — `JtagProgrammer` trait (`detect_devices`/`program`/`close`), `JtagDevice`
+  - `error.rs` — `FlashError` via `thiserror`: `LoaderNotFound`, `LoaderFailed`, `BitstreamNotFound` (with `aion build --format rbf` hint), `DeviceMismatch`, `Io`
+  - `idcode.rs` — known-IDCODE table for Cyclone IV E parts (EP4CE6/10/15/22), longest-prefix part-number lookup (`EP4CE22F17C6` → `0x020F30DD`)
+  - `openfpgaloader.rs` — builder-style `OpenFpgaLoader` (`with_board`/`with_cable`/`with_executable`), pure arg construction, lenient `--detect` output parser, subprocess error mapping
+- **New `aion flash` CLI command** (14 new tests in `aion_cli`, 129 total): `--target`, `--file`, `--board`, `--cable`, `--loader-path`, `--detect`. Defaults to `build/<target>/<project>.rbf` and the `usb-blaster` cable (DE0-Nano on-board programmer) when no board/cable given. Cross-checks the detected JTAG IDCODE against the configured target part before programming; mismatch is a hard error.
+- **Decisions:** `JtagProgrammer::program` takes a file path instead of the spec sketch's `&[u8]` because the subprocess backend needs format detection from the file extension (documented in the trait docs). `verify()` from the spec deferred until the native driver can do readback. Explicit `--file` skips the device check (file may target any board).
+- **Testing:** fake-executable shell scripts (tempfile, unix-gated) exercise the real subprocess path: detect parse, stderr surfacing on failure, programming success; hardware validation on a real DE0-Nano remains manual.
+
+---
+
 ## 2026-02-17 — Fix VHDL Elaboration False Positives
 
 - **Fixed 5 root causes** producing 3 errors + 13 warnings (all false positives) when linting valid VHDL-2008 code in `examples/blinky_vhdl`.
@@ -49,7 +62,7 @@
 | `aion_elaborate` | 🟢 Complete | 134 | AST→IR elaboration: registry, const eval, type resolution, expr/stmt lowering, delay/forever preservation, bit/range-select targets, all 3 languages |
 | `aion_lint` | 🟢 Complete | 91 | LintEngine, 15 rules (W101-W108, E102/E104/E105, C201-C204), IR traversal helpers |
 | `aion_cache` | 🟢 Complete | 47 | Content-hash caching: manifest, artifact store, source hasher, cache orchestrator |
-| `aion_cli` | 🟢 Complete | 115 | CLI: `init`, `lint`, `sim`, `test`, `view`, `build` commands with shared pipeline, `--interactive` mode, full synth→PnR→bitstream pipeline |
+| `aion_cli` | 🟢 Complete | 129 | CLI: `init`, `lint`, `sim`, `test`, `view`, `build`, `flash` commands with shared pipeline, `--interactive` mode, full synth→PnR→bitstream pipeline |
 | `aion_sim` | 🟢 Complete | 250 | Event-driven HDL simulator: kernel, evaluator, VCD/FST waveform, delta cycles, delay scheduling, interactive REPL, VCD loader |
 | `aion_conformance` | 🟢 Complete | 155 | Conformance tests: 15 Verilog, 15 SV, 12 VHDL, 10 error recovery, 35 lint, 49 real-world designs, 13 project integration, 6 unit |
 | `aion_tui` | 🟢 Complete | 117 | Ratatui-based TUI: waveform viewer, signal list, status bar, command input, zoom/scroll, sim stepping, bus expansion, cursor-time values, viewer mode |
@@ -59,6 +72,7 @@
 | `aion_pnr` | 🟢 Complete | 90 | Place & route: MappedDesign→PnrNetlist conversion, random + simulated annealing placement, PathFinder routing + A* search, timing bridge |
 | `aion_bitstream` | 🟢 Complete | 113 | Bitstream generation: Intel SOF/POF/RBF + Xilinx BIT formats, ConfigBitDatabase trait, CRC-16/CRC-32, simplified config databases, BitstreamFormat::parse() |
 | `aion_xray` | 🟢 Complete (M1-M3) | 105 | Project X-Ray integration: tilegrid/segbits/tile_type parsers, XRayDatabase loader, Artix7XRay Architecture impl, XRayConfigBitDb, FASM emitter |
+| `aion_flash` | 🟡 MVP | 30 | JtagProgrammer trait, OpenFpgaLoader subprocess backend, IDCODE table, `aion flash` CLI command; native USB-Blaster driver pending |
 
 ### Phase 0 Checklist
 
@@ -1311,7 +1325,7 @@ Also added `Ident::from_raw()`/`as_raw()` to `aion_common` for IR test construct
 - [x] `aion_bitstream` — Bitstream generation: Intel SOF/POF/RBF + Xilinx BIT (110 tests)
 - [x] `aion_xray` — Project X-Ray integration: database parsing, Architecture impl, ConfigBitDatabase, FASM (105 tests)
 - [ ] `aion_lsp` — Language Server Protocol implementation
-- [ ] `aion_flash` — JTAG programming and device detection
+- [x] `aion_flash` — JTAG programming and device detection (MVP: openFPGALoader subprocess backend; native rusb USB-Blaster driver pending)
 - [ ] `aion_deps` — Dependency resolution, fetching, lock file
 - [ ] `aion_report` — Report generation (text, JSON, SARIF, SVG)
 - [ ] Real routing graphs via X-Ray tile PIPs (Milestone 4)
