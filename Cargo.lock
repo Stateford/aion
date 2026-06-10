@@ -68,6 +68,7 @@ dependencies = [
  "aion_config",
  "aion_diagnostics",
  "aion_elaborate",
+ "aion_flash",
  "aion_ir",
  "aion_lint",
  "aion_pnr",
@@ -147,6 +148,14 @@ dependencies = [
  "aion_vhdl_parser",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "aion_flash"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
