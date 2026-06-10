@@ -3,12 +3,14 @@
 //! Provides `aion init` for project scaffolding, `aion lint` for static analysis,
 //! `aion sim` for running individual testbench simulations, `aion test` for
 //! discovering and running all testbenches, `aion view` for viewing
-//! previously saved waveform files in the TUI, and `aion build` for running
-//! the full synthesis pipeline to generate bitstream files.
+//! previously saved waveform files in the TUI, `aion build` for running
+//! the full synthesis pipeline to generate bitstream files, and `aion flash`
+//! for programming a generated bitstream onto a connected FPGA.
 
 #![warn(missing_docs)]
 
 mod build;
+mod flash;
 mod init;
 mod lint;
 mod pipeline;
@@ -72,6 +74,8 @@ pub enum Command {
     View(ViewArgs),
     /// Run the full build pipeline (parse → elaborate → synth → PnR → bitstream).
     Build(BuildArgs),
+    /// Program a generated bitstream onto a connected FPGA device.
+    Flash(FlashArgs),
 }
 
 /// Arguments for the `aion lint` subcommand.
@@ -175,6 +179,34 @@ pub struct BuildArgs {
     pub report_format: ReportFormat,
 }
 
+/// Arguments for the `aion flash` subcommand.
+#[derive(Parser, Debug)]
+pub struct FlashArgs {
+    /// Target name to select from `aion.toml` (required when multiple targets defined).
+    #[arg(short, long)]
+    pub target: Option<String>,
+
+    /// Bitstream file to program (default: `build/<target>/<project>.rbf`).
+    #[arg(short, long)]
+    pub file: Option<String>,
+
+    /// Board profile passed to the programmer (e.g. `de0nano`).
+    #[arg(short, long)]
+    pub board: Option<String>,
+
+    /// JTAG cable passed to the programmer (default: `usb-blaster` unless `--board` is set).
+    #[arg(short, long)]
+    pub cable: Option<String>,
+
+    /// Path to the openFPGALoader executable (default: resolved from PATH).
+    #[arg(long)]
+    pub loader_path: Option<String>,
+
+    /// Only scan the JTAG chain and list detected devices.
+    #[arg(long)]
+    pub detect: bool,
+}
+
 /// CLI optimization level override.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CliOptLevel {
@@ -264,6 +296,7 @@ fn main() {
         Command::Test(ref args) => test::run(args, &global),
         Command::View(ref args) => view::run(args, &global),
         Command::Build(ref args) => build::run(args, &global),
+        Command::Flash(ref args) => flash::run(args, &global),
     };
 
     match result {
@@ -692,6 +725,63 @@ mod tests {
                 assert_eq!(args.output_dir.as_deref(), Some("/tmp/build"));
             }
             _ => panic!("expected Build command"),
+        }
+    }
+
+    // -- Flash command parsing tests --
+
+    #[test]
+    fn parse_flash_default() {
+        let cli = Cli::parse_from(["aion", "flash"]);
+        match cli.command {
+            Command::Flash(ref args) => {
+                assert!(args.target.is_none());
+                assert!(args.file.is_none());
+                assert!(args.board.is_none());
+                assert!(args.cable.is_none());
+                assert!(args.loader_path.is_none());
+                assert!(!args.detect);
+            }
+            _ => panic!("expected Flash command"),
+        }
+    }
+
+    #[test]
+    fn parse_flash_with_flags() {
+        let cli = Cli::parse_from([
+            "aion",
+            "flash",
+            "--target",
+            "de0_nano",
+            "--file",
+            "out/blinky.rbf",
+            "--board",
+            "de0nano",
+            "--cable",
+            "usb-blaster",
+            "--loader-path",
+            "/opt/ofl/openFPGALoader",
+        ]);
+        match cli.command {
+            Command::Flash(ref args) => {
+                assert_eq!(args.target.as_deref(), Some("de0_nano"));
+                assert_eq!(args.file.as_deref(), Some("out/blinky.rbf"));
+                assert_eq!(args.board.as_deref(), Some("de0nano"));
+                assert_eq!(args.cable.as_deref(), Some("usb-blaster"));
+                assert_eq!(args.loader_path.as_deref(), Some("/opt/ofl/openFPGALoader"));
+            }
+            _ => panic!("expected Flash command"),
+        }
+    }
+
+    #[test]
+    fn parse_flash_detect() {
+        let cli = Cli::parse_from(["aion", "flash", "--detect"]);
+        match cli.command {
+            Command::Flash(ref args) => {
+                assert!(args.detect);
+            }
+            _ => panic!("expected Flash command"),
         }
     }
 }
