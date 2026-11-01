@@ -77,6 +77,24 @@ pub enum SimError {
         max_deltas: u32,
     },
 
+    /// A `forever` loop completed an iteration without suspending.
+    ///
+    /// The loop never yields, so no other process can run and no signal it
+    /// reads can change: it would repeat the same iteration at the same
+    /// simulation time indefinitely. Real simulators hang on such a loop; Aion
+    /// reports it instead. The loop body needs a timing control such as `#5`.
+    ///
+    /// Event controls (`@(...)`), `wait`, and `break` inside procedural code
+    /// are not yet modelled by the simulator, so a loop that relies on them to
+    /// yield or exit also ends up here; the message says so.
+    #[error(
+        "forever loop completed an iteration without a delay and would repeat \
+         forever at the same simulation time; add a timing control such as `#5` \
+         to the loop body (note: `@(...)` event controls, `wait`, and `break` \
+         inside `forever` are not yet supported by the simulator)"
+    )]
+    ZeroTimeLoop,
+
     /// A general-purpose error for situations not covered by other variants.
     #[error("{message}")]
     Other {
@@ -115,6 +133,15 @@ mod tests {
             reason: "out of range".into(),
         };
         assert_eq!(e.to_string(), "invalid signal reference: out of range");
+    }
+
+    #[test]
+    fn zero_time_loop_display() {
+        let msg = SimError::ZeroTimeLoop.to_string();
+        assert!(msg.starts_with("forever loop completed an iteration without a delay"));
+        assert!(msg.contains("same simulation time"));
+        assert!(msg.contains("`#5`"));
+        assert!(msg.contains("not yet supported"));
     }
 
     #[test]

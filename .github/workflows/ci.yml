@@ -31,7 +31,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --all-targets
+      # Fail fast if a test hangs (e.g. a simulator scheduling loop, see #5)
+      # instead of holding the runner until GitHub's 6-hour job default.
       - run: cargo test
+        timeout-minutes: 15
       - run: cargo doc --no-deps
 
   audit:

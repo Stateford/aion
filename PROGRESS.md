@@ -5,6 +5,30 @@
 
 ---
 
+## 2026-11-01 — Sim: `forever` Without Timing Control No Longer Runs Once Silently
+
+- **Bug:** `forever` with no timing control (e.g. `forever clk = ~clk;`) ran its body once and then fell through to the next statement (`evaluator.rs`). That produced a wrong but plausible result with no diagnostic. Real simulators hang on this loop.
+- **Runtime fix (`aion_sim`):** When a `forever` body finishes an iteration without suspending, the evaluator now returns the new `SimError::ZeroTimeLoop`. Every further iteration would be identical, because signals only change when the process yields. A body containing a `wait` (not yet modelled) returns `SimError::Unsupported` instead. The error message also notes that `@(...)`, `wait` and `break` inside `forever` are not yet supported, since lowering drops them.
+- **Elaboration warning (`aion_elaborate`):** New **W202** "`forever` loop has no timing control" for Verilog/SV, with the loop's span, a note and a help. It is computed on the AST (`verilog_may_yield` / `sv_may_yield`) because lowering drops nested event controls. It is conservative: delays, `@`, `wait`, `disable`, `$finish`/`$stop`, user task calls, SV `break`/`return` and error nodes all count as "may yield", so there are no false positives on `forever @(posedge clk)`.
+- **CLI (`aion sim`):** Elaboration warnings are now rendered when not `--quiet`. Previously they were only shown if there were errors. Testbenches live outside `src/`, so `aion lint` never sees them.
+- **Tests added:** sim evaluator (empty body, assign, untaken delay branch, taken branch suspends, `$finish` finishes, `wait` → Unsupported, `contains_wait` ×2), a kernel test (the statement after the loop never runs), the error Display test, elaborate (6 source-based W202 tests covering Verilog/SV positive and negative cases, `may_yield` unit tests, the existing `*_forever_preserved` tests now assert W202), and a CLI end-to-end test (`aion sim` on a zero-time loop returns the error).
+- **Known gaps (not addressed):** Nested `@(...)`/`wait`/`break` in procedural code are still not simulated. `for`/`while`/`repeat` loops are lowered to a single execution of their body. The VHDL `aion init` testbench fails elaboration with `E204 unknown signal 'false'` (an existing bug).
+- Workspace `cargo test` passes and clippy is clean.
+
+---
+
+## 2026-11-01 — Sim: Zero-Delay Loop Guard (Fixes #5, SIM-4)
+
+- **Bug:** `SimKernel::run()` / `run_to_completion()` / `run_until()` hung forever on a zero-delay loop such as `initial forever #0;`. The per-time `deltas_at_current_time` counter was only incremented when `step_delta()` ran (i.e. when signal events were queued). A `#0` resume re-queues the process at the same fs without producing events, so the loop spun at one timestamp and never reached `max_delta_per_step`.
+- **Fix (`crates/aion_sim/src/kernel.rs`):** Added private `SimKernel::charge_delta()`, called once per scheduler iteration in both `run_simulation()` and `run_until()`. Each iteration counts, whether it resumed suspended processes, ran `step_delta()`, or both. The counter still resets when time advances. Zero-delay loops now return the existing `SimError::DeltaCycleLimit { fs, max_deltas }`. Normal designs are unaffected: their delta counts per timestamp stay the same.
+- **Tests added (kernel.rs unit tests):** `forever_zero_delay_run_hits_delta_limit`, `forever_zero_delay_run_until_hits_delta_limit` (regression for the issue's repro), `zero_delay_loop_after_delay_reports_its_time` (error reports 10 ns), `nonzero_delay_forever_runs_under_tight_delta_limit`, `nonzero_delay_forever_run_until_under_tight_delta_limit` (a `forever #5` clock runs normally with `max_delta = 2`, including resumed `run_until` calls).
+- **Note:** The untracked `crates/aion_sim/tests/tmp_verify_zero_delay_hang.rs` in the main checkout was left untouched. These unit tests replace it, and it can now be deleted.
+- `cargo test -p aion_sim` (255 passed), `aion_cli` / `aion_tui` tests pass, and clippy is clean.
+- **Review follow-up (CodeRabbit on #47):** Charging *every* pure-wakeup iteration made a tight limit (e.g. `set_max_delta(1)`) reject finite processes, such as a terminal `#0;` or a `forever #5;` that always moves time forward. The helper is now `charge_iteration(stepped, …)`: delta-cycle iterations are charged as before, and pure-wakeup iterations are charged only when they leave more work at the same timestamp (a zero-delay resume). Added tests `terminal_zero_delay_wakeup_not_charged`, `future_rescheduling_wakeup_not_charged` (both `run` and `run_until`, and both fail under the previous rule), and `zero_delay_loop_trips_limit_of_one`.
+- **CI:** Added `timeout-minutes: 15` to the `cargo test` step. CI was also failing because it installs the latest stable Rust (1.99), whose clippy flags existing code. Fixed the five sites (`collapsible_match` ×2 in `aion_timing`, `drain_collect` in `aion_synth`, `question_mark` ×2 in `aion_elaborate`, `manual_checked_div` in `aion_tui`) with behaviour-preserving rewrites, and added edge-case tests for each. Verified with the full CI sequence on 1.99.0 and on 1.93.
+
+---
+
 ## 2026-02-17 — Fix VHDL Elaboration False Positives
 
 - **Fixed 5 root causes** producing 3 errors + 13 warnings (all false positives) when linting valid VHDL-2008 code in `examples/blinky_vhdl`.

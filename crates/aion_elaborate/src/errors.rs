@@ -1,8 +1,9 @@
 //! Diagnostic codes and helper functions for elaboration errors and warnings.
 //!
 //! Error codes `E200`--`E211` cover elaboration failures (unknown modules,
-//! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W201`
-//! cover non-fatal issues (width mismatches, unconnected ports).
+//! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W202`
+//! cover non-fatal issues (width mismatches, unconnected ports, `forever`
+//! loops with no timing control).
 
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode};
 use aion_source::Span;
@@ -91,6 +92,12 @@ pub const W201: DiagnosticCode = DiagnosticCode {
     number: 201,
 };
 
+/// `forever` loop whose body contains no timing control and no way out.
+pub const W202: DiagnosticCode = DiagnosticCode {
+    category: Category::Warning,
+    number: 202,
+};
+
 /// Creates a diagnostic for an unknown module in an instantiation.
 pub fn error_unknown_module(name: &str, span: Span) -> Diagnostic {
     Diagnostic::error(E200, format!("unknown module `{name}`"), span)
@@ -167,6 +174,17 @@ pub fn error_unknown_port(port_name: &str, module_name: &str, span: Span) -> Dia
 /// Creates a warning for a width mismatch.
 pub fn warn_width_mismatch(msg: &str, span: Span) -> Diagnostic {
     Diagnostic::warning(W200, msg.to_string(), span)
+}
+
+/// Creates a warning for a `forever` loop with no timing control.
+///
+/// Such a loop never yields to the scheduler, so it repeats forever at the
+/// same simulation time: simulators hang on it, and Aion's simulator stops
+/// with an error.
+pub fn warn_forever_without_timing(span: Span) -> Diagnostic {
+    Diagnostic::warning(W202, "`forever` loop has no timing control", span)
+        .with_note("the loop never yields, so it repeats forever at the same simulation time")
+        .with_help("add a delay such as `#5` to the loop body, or `$finish` to end the simulation")
 }
 
 /// Creates a warning for an unconnected port.
@@ -256,6 +274,12 @@ mod tests {
         let d = warn_unconnected_port("clk", "u1", Span::DUMMY);
         assert_eq!(d.code, W201);
         assert!(d.message.contains("clk"));
+
+        let d = warn_forever_without_timing(Span::DUMMY);
+        assert_eq!(d.code, W202);
+        assert_eq!(format!("{W202}"), "W202");
+        assert!(d.message.contains("forever"));
+        assert!(!d.notes.is_empty());
     }
 
     #[test]
