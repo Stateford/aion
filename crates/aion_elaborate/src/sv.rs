@@ -23,7 +23,7 @@ use crate::context::ElaborationContext;
 use crate::errors;
 use crate::expr::{lower_sv_expr, lower_sv_to_signal_ref, SignalEnv};
 use crate::registry::ModuleEntry;
-use crate::stmt::lower_sv_stmt;
+use crate::stmt::{lower_sv_looping_always, lower_sv_stmt};
 use crate::types;
 
 /// Elaborates a SystemVerilog module declaration into an IR module.
@@ -304,8 +304,14 @@ fn elaborate_sv_item(
             });
         }
         sv_ast::ModuleItem::AlwaysBlock(ab) => {
-            let (kind, sensitivity, body_stmt) =
-                analyze_sv_always(&ab.body, sig_env, ctx.source_db, ctx.interner, ctx.sink);
+            let (kind, sensitivity, body_stmt) = analyze_sv_always(
+                &ab.body,
+                ab.span,
+                sig_env,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
             processes.alloc(Process {
                 id: ProcessId::from_raw(0),
                 name: None,
@@ -356,7 +362,9 @@ fn elaborate_sv_item(
                 name: None,
                 kind: ProcessKind::Initial,
                 body,
-                sensitivity: Sensitivity::All,
+                // An initial block runs once at time 0 and then resumes only
+                // from its own delays: it is sensitive to nothing.
+                sensitivity: Sensitivity::SignalList(Vec::new()),
                 span: ib.span,
             });
         }
@@ -378,8 +386,15 @@ fn elaborate_sv_item(
 }
 
 /// Analyzes an SV `always` block to determine ProcessKind and sensitivity.
+///
+/// `always @(...) body` maps its event control to the process sensitivity.
+/// A plain `always` block without a top-level event control (e.g.
+/// `always #5 clk = ~clk;`) is a looping process: its body is wrapped in a
+/// `forever` loop (see [`lower_sv_looping_always`]). `always_comb`,
+/// `always_ff` and `always_latch` are handled separately.
 fn analyze_sv_always(
     body: &sv_ast::Statement,
+    always_span: aion_source::Span,
     sig_env: &SignalEnv,
     source_db: &aion_source::SourceDb,
     interner: &aion_common::Interner,
@@ -393,7 +408,8 @@ fn analyze_sv_always(
         let ir_body = lower_sv_stmt(body, sig_env, source_db, interner, sink);
         (kind, sens, ir_body)
     } else {
-        let ir_body = lower_sv_stmt(body, sig_env, source_db, interner, sink);
+        let ir_body =
+            lower_sv_looping_always(body, always_span, sig_env, source_db, interner, sink);
         (ProcessKind::Combinational, Sensitivity::All, ir_body)
     }
 }

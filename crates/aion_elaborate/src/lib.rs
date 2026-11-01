@@ -175,6 +175,201 @@ mod tests {
     }
 
     /// Parses `src` as Verilog (`.v`) or SystemVerilog (`.sv`), elaborates it
+    /// with top `tb`, and returns the top module's processes plus the source
+    /// text of every diagnostic span with the given code.
+    fn elaborate_tb(
+        file_name: &str,
+        src: &str,
+        code: aion_diagnostics::DiagnosticCode,
+    ) -> (Vec<aion_ir::Process>, Vec<String>) {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source(file_name, src.to_string());
+        let mut parsed = ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![],
+        };
+        if file_name.ends_with(".sv") {
+            parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else {
+            parsed.verilog_files.push(aion_verilog_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        }
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        let design = elaborate(&parsed, &make_config("tb"), &source_db, &interner, &sink).unwrap();
+        let procs = design.modules[design.top]
+            .processes
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect();
+        let spans = sink
+            .diagnostics()
+            .into_iter()
+            .filter(|d| d.code == code)
+            .map(|d| source_db.snippet(d.primary_span).to_string())
+            .collect();
+        (procs, spans)
+    }
+
+    fn assert_empty_sensitivity(p: &aion_ir::Process) {
+        assert!(
+            matches!(&p.sensitivity, aion_ir::Sensitivity::SignalList(s) if s.is_empty()),
+            "expected no sensitivity, got {:?}",
+            p.sensitivity
+        );
+    }
+
+    #[test]
+    fn verilog_initial_block_has_empty_sensitivity() {
+        let (procs, _) = elaborate_tb(
+            "tb.v",
+            "module tb; reg a; reg b; initial begin a = b; #1 a = ~b; end endmodule",
+            errors::W203,
+        );
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].kind, ProcessKind::Initial);
+        assert_empty_sensitivity(&procs[0]);
+    }
+
+    #[test]
+    fn sv_initial_block_has_empty_sensitivity() {
+        let (procs, _) = elaborate_tb(
+            "tb.sv",
+            "module tb; logic a; logic b; initial a = b; endmodule",
+            errors::W203,
+        );
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].kind, ProcessKind::Initial);
+        assert_empty_sensitivity(&procs[0]);
+    }
+
+    /// Asserts `p` is a looping `always` block: a `forever` loop around the
+    /// original body, started once (combinational, no event control).
+    fn assert_looping_always(p: &aion_ir::Process) -> &aion_ir::Statement {
+        assert_eq!(p.kind, ProcessKind::Combinational);
+        match &p.body {
+            aion_ir::Statement::Forever { body, span } => {
+                assert_eq!(*span, p.span, "loop spans the always block");
+                body
+            }
+            other => panic!("expected Forever, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verilog_always_without_event_control_is_a_loop() {
+        let (procs, w203) = elaborate_tb(
+            "tb.v",
+            "module tb; reg clk; always #5 clk = ~clk; endmodule",
+            errors::W203,
+        );
+        assert_eq!(procs.len(), 1);
+        let body = assert_looping_always(&procs[0]);
+        assert!(matches!(body, aion_ir::Statement::Delay { .. }), "{body:?}");
+        assert!(w203.is_empty(), "{w203:?}");
+    }
+
+    #[test]
+    fn verilog_always_block_with_two_delays_is_a_loop() {
+        let (procs, w203) = elaborate_tb(
+            "tb.v",
+            "module tb; reg clk; always begin #5 clk = 0; #5 clk = 1; end endmodule",
+            errors::W203,
+        );
+        let body = assert_looping_always(&procs[0]);
+        assert!(
+            matches!(body, aion_ir::Statement::Block { stmts, .. } if stmts.len() == 2),
+            "{body:?}"
+        );
+        assert!(w203.is_empty(), "{w203:?}");
+    }
+
+    #[test]
+    fn sv_always_without_event_control_is_a_loop() {
+        let (procs, w203) = elaborate_tb(
+            "tb.sv",
+            "module tb; logic clk; always #5 clk = ~clk; endmodule",
+            errors::W203,
+        );
+        let body = assert_looping_always(&procs[0]);
+        assert!(matches!(body, aion_ir::Statement::Delay { .. }), "{body:?}");
+        assert!(w203.is_empty(), "{w203:?}");
+    }
+
+    #[test]
+    fn w203_verilog_always_without_any_timing_control() {
+        let (procs, w203) = elaborate_tb(
+            "tb.v",
+            "module tb; reg clk; always clk = ~clk; endmodule",
+            errors::W203,
+        );
+        assert_looping_always(&procs[0]);
+        assert_eq!(w203.len(), 1, "{w203:?}");
+        assert!(
+            w203[0].starts_with("always"),
+            "span covers the block: {w203:?}"
+        );
+    }
+
+    #[test]
+    fn w203_sv_always_without_any_timing_control() {
+        let (_, w203) = elaborate_tb(
+            "tb.sv",
+            "module tb; logic a; logic b; always begin a = b; end endmodule",
+            errors::W203,
+        );
+        assert_eq!(w203.len(), 1, "{w203:?}");
+    }
+
+    #[test]
+    fn always_with_event_control_is_not_a_loop() {
+        // Event-controlled and SV-specific always blocks keep their shape.
+        let (procs, w203) = elaborate_tb(
+            "tb.sv",
+            "module tb; logic clk; logic d; logic q; logic y; \
+             always @(posedge clk) begin q = d; #2 q = 0; end \
+             always @(*) y = d; \
+             always_comb y = d; \
+             always_ff @(posedge clk) q <= d; \
+             endmodule",
+            errors::W203,
+        );
+        assert_eq!(procs.len(), 4);
+        for p in &procs {
+            assert!(
+                !matches!(p.body, aion_ir::Statement::Forever { .. }),
+                "{:?}",
+                p.body
+            );
+        }
+        assert_eq!(procs[0].kind, ProcessKind::Sequential);
+        assert!(matches!(procs[1].sensitivity, aion_ir::Sensitivity::All));
+        assert!(matches!(procs[2].sensitivity, aion_ir::Sensitivity::All));
+        assert!(w203.is_empty(), "{w203:?}");
+    }
+
+    #[test]
+    fn verilog_always_with_event_control_keeps_sensitivity() {
+        let (procs, w203) = elaborate_tb(
+            "tb.v",
+            "module tb; reg clk; reg q; always @(posedge clk) q = ~q; endmodule",
+            errors::W203,
+        );
+        assert_eq!(procs[0].kind, ProcessKind::Sequential);
+        assert!(matches!(
+            procs[0].sensitivity,
+            aion_ir::Sensitivity::EdgeList(_)
+        ));
+        assert!(!matches!(procs[0].body, aion_ir::Statement::Forever { .. }));
+        assert!(w203.is_empty());
+    }
+
+    /// Parses `src` as Verilog (`.v`) or SystemVerilog (`.sv`), elaborates it
     /// with top `tb`, and returns the source text of every W202 span.
     fn forever_warnings(file_name: &str, src: &str) -> Vec<String> {
         let interner = Interner::new();
