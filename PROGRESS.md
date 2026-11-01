@@ -17,6 +17,31 @@
 
 ---
 
+## 2026-11-01 — Sim: Blocking vs Non-Blocking Assignments, NBA Region (Fixes #3)
+
+- **IR:** `Statement::Assign` has a new `kind: AssignKind { Blocking, NonBlocking }` field. The elaborator sets it for Verilog/SV (`=` vs `<=`) and VHDL (`:=` vs `<=`).
+- **Blocking writes:** the evaluator keeps a per-segment overlay of blocking writes, so later statements in the same process see them (SIM-3).
+- **NBA region:** the kernel's `nba_queue` is applied only once the active region and due wakeups at the current time have drained. `#0` resumes run after active events.
+- **Width fitting:** `apply_write` fits a write to the signal width or slice width. This fixes `reg [7:0] c; initial c = 0;` shrinking `c` to 1 bit, and `q[7:4] = 0` clearing only one bit.
+- **VHDL declarations:**
+  - Process-local variables and constants are registered, as the new `SignalKind::Variable`, with scoped names (`<label>.<name>` or `_process<N>.<name>`).
+  - Declared defaults become the signal's `init`. A default that can't be evaluated gets the new warning **W204**.
+  - Architecture-level constant and signal defaults now also work.
+  - Variables are left out of `process(all)` sensitivity, and W105 ignores reads of variables and constants.
+- **Tests:**
+  - 24 kernel region tests and 17 evaluator tests;
+  - elaborator tests for assignment kinds, VHDL scoping and defaults, and W204;
+  - `AssignKind` and `SignalKind::Variable` serde/bincode round-trips;
+  - `aion_conformance/tests/sim_assign_semantics.rs` (10 end-to-end tests).
+- **Known gaps:**
+  - Verilog/SV declaration initializers are dropped (#11).
+  - Same-time wakeups can overwrite each other's bit writes (#11).
+  - The VCD time-0 dump is taken before initial blocks run (#10).
+  - VHDL string literals in expressions lower to 1 bit.
+  - `$display` keeps the format string's quotes.
+
+---
+
 ## 2026-11-01 — Sim: `forever` Without Timing Control No Longer Runs Once Silently
 
 - **Bug:** `forever` with no timing control (e.g. `forever clk = ~clk;`) ran its body once and then fell through to the next statement (`evaluator.rs`). That produced a wrong but plausible result with no diagnostic. Real simulators hang on this loop.
