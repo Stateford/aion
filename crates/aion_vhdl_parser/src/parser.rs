@@ -204,7 +204,13 @@ impl<'src> VhdlParser<'src> {
     // ========================================================================
 
     /// Emits an error diagnostic at the current position.
+    ///
+    /// Once the no-progress backstop has aborted the parse, further errors are
+    /// suppressed so the abort produces exactly one diagnostic.
     pub(crate) fn error(&self, msg: &str) {
+        if self.aborted.get() {
+            return;
+        }
         self.sink.emit(Diagnostic::error(
             DiagnosticCode::new(Category::Error, 101),
             msg,
@@ -214,7 +220,12 @@ impl<'src> VhdlParser<'src> {
     }
 
     /// Emits an "expected X" error at the current position.
+    ///
+    /// Suppressed after the no-progress backstop has aborted the parse.
     pub(crate) fn expected(&self, what: &str) {
+        if self.aborted.get() {
+            return;
+        }
         let actual = format!("{:?}", self.current());
         self.sink.emit(Diagnostic::error(
             DiagnosticCode::new(Category::Error, 101),
@@ -1895,6 +1906,24 @@ mod tests {
             .filter(|e| e.message.contains("parser made no progress"))
             .count();
         assert_eq!(backstops, 1);
+    }
+
+    #[test]
+    fn backstop_suppresses_all_errors_after_abort() {
+        let (_, errors) = with_parser("a b c", |p| {
+            for _ in 0..MAX_ERRORS_WITHOUT_PROGRESS + 50 {
+                p.expected("something");
+                p.error("other");
+            }
+        });
+        // Exactly MAX errors at the stuck token, then the single abort note;
+        // nothing after it (no stale "found Eof" messages).
+        assert_eq!(errors.len(), MAX_ERRORS_WITHOUT_PROGRESS as usize + 1);
+        assert!(errors
+            .last()
+            .unwrap()
+            .message
+            .contains("parser made no progress"));
     }
 
     #[test]
