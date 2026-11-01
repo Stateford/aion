@@ -79,6 +79,9 @@ pub enum SimError {
 
     /// A `forever` loop completed an iteration without suspending.
     ///
+    /// An `always` block without an event control is lowered as such a loop,
+    /// so `always clk = ~clk;` ends up here too.
+    ///
     /// The loop never yields, so no other process can run and no signal it
     /// reads can change: it would repeat the same iteration at the same
     /// simulation time indefinitely. Real simulators hang on such a loop; Aion
@@ -90,8 +93,9 @@ pub enum SimError {
     #[error(
         "forever loop completed an iteration without a delay and would repeat \
          forever at the same simulation time; add a timing control such as `#5` \
-         to the loop body (note: `@(...)` event controls, `wait`, and `break` \
-         inside `forever` are not yet supported by the simulator)"
+         to the loop body (an `always` block without an event control is such \
+         a loop; note: `@(...)` event controls, `wait`, and `break` inside \
+         `forever` are not yet supported by the simulator)"
     )]
     ZeroTimeLoop,
 
@@ -142,6 +146,7 @@ mod tests {
         assert!(msg.contains("same simulation time"));
         assert!(msg.contains("`#5`"));
         assert!(msg.contains("not yet supported"));
+        assert!(msg.contains("`always` block without an event control"));
     }
 
     #[test]

@@ -69,6 +69,29 @@ struct SimProcess {
     sensitivity: Sensitivity,
     /// The set of signals this process reads (for `Sensitivity::All`).
     read_signals: HashSet<SimSignalId>,
+    /// Whether a change on a signal in the sensitivity list may start the
+    /// body again (see [`is_retriggerable`]).
+    retriggerable: bool,
+}
+
+/// Returns whether a process may be (re)started by its sensitivity list.
+///
+/// An `initial` block runs once at time 0 and afterwards only resumes from
+/// its own continuations. A process whose body is a top-level `forever` loop
+/// (how the elaborator lowers an `always` block without an event control,
+/// e.g. `always #5 clk = ~clk;`) never completes, so it is likewise started
+/// once and then driven only by its own delays. Neither belongs in the
+/// sensitivity map.
+fn is_retriggerable(kind: ProcessKind, body: &Statement) -> bool {
+    kind != ProcessKind::Initial && !matches!(body, Statement::Forever { .. })
+}
+
+/// Where [`SimKernel::run_process`] starts executing a process.
+enum ProcessEntry {
+    /// From the top of the process body (time-0 start or sensitivity trigger).
+    Body,
+    /// From the continuation saved when the process last suspended on a delay.
+    Resume(Statement),
 }
 
 /// The result of a completed simulation run.
@@ -136,7 +159,17 @@ pub struct SimKernel {
     /// Total delta cycles executed.
     total_deltas: u64,
     /// Processes suspended by delay statements, sorted by wake time.
+    ///
+    /// Holds at most one entry per process: a suspended process is not
+    /// re-triggered by its sensitivity list until it resumes and completes.
     suspended_processes: Vec<(SimTime, SuspendedProcess)>,
+    /// Whether the time-0 start (initial blocks plus the initial
+    /// combinational pass) has run; shared by `initialize()`, `run()`,
+    /// `run_to_completion()` and `run_until()` so it happens exactly once.
+    initialized: bool,
+    /// Whether the attached waveform recorder has received its signal
+    /// declarations and initial value dump.
+    waveform_started: bool,
 }
 
 impl SimKernel {
@@ -166,6 +199,8 @@ impl SimKernel {
             max_delta_per_step: 10_000,
             total_deltas: 0,
             suspended_processes: Vec::new(),
+            initialized: false,
+            waveform_started: false,
         };
 
         // Flatten the hierarchy starting at top
@@ -189,8 +224,13 @@ impl SimKernel {
     }
 
     /// Attaches a waveform recorder to the kernel.
+    ///
+    /// The recorder receives its signal declarations and a dump of the
+    /// current signal values when the simulation next starts or resumes, so
+    /// it may be attached before or after [`initialize`](Self::initialize).
     pub fn set_recorder(&mut self, recorder: Box<dyn WaveformRecorder>) {
         self.recorder = Some(recorder);
+        self.waveform_started = false;
     }
 
     /// Returns the current simulation time.
@@ -304,26 +344,7 @@ impl SimKernel {
         let processes_to_run = self.find_sensitive_processes(&changed_signals);
 
         for proc_idx in processes_to_run {
-            let proc = &self.processes[proc_idx];
-            let ctx = EvalContext {
-                signals: &self.signals,
-                signal_map: &proc.signal_map,
-                types: &self.types,
-            };
-            let mut pending = Vec::new();
-            let mut display = Vec::new();
-            let result = exec_statement(&ctx, &proc.body, &mut pending, &mut display)?;
-
-            self.display_output.extend(display.iter().cloned());
-            for msg in &display {
-                if msg.starts_with("ASSERTION FAILED:") {
-                    self.assertion_failures.push(msg.clone());
-                }
-            }
-            all_pending.extend(pending);
-
-            if matches!(result, ExecResult::Finish) {
-                self.finished = true;
+            if self.run_process(proc_idx, ProcessEntry::Body, &mut all_pending)? {
                 return Ok(StepResult::Done);
             }
         }
@@ -403,6 +424,7 @@ impl SimKernel {
                 body: proc_body,
                 sensitivity: Sensitivity::All,
                 read_signals: read_sigs,
+                retriggerable: true,
             };
             self.processes.push(proc);
         }
@@ -459,14 +481,22 @@ impl SimKernel {
             body: process.body.clone(),
             sensitivity: process.sensitivity.clone(),
             read_signals: read_sigs,
+            retriggerable: is_retriggerable(process.kind, &process.body),
         };
         self.processes.push(proc);
     }
 
     /// Builds the sensitivity map: signal → list of process indices.
+    ///
+    /// Initial blocks and looping processes are left out (see
+    /// [`is_retriggerable`]): they run once at time 0 and then resume only
+    /// from their own continuations, whatever their IR sensitivity says.
     fn build_sensitivity_map(&mut self) {
         self.sensitivity_map.clear();
         for (idx, proc) in self.processes.iter().enumerate() {
+            if !proc.retriggerable {
+                continue;
+            }
             match &proc.sensitivity {
                 Sensitivity::All => {
                     // Sensitive to all read signals
@@ -493,12 +523,24 @@ impl SimKernel {
     }
 
     /// Finds processes to execute based on which signals changed.
+    ///
+    /// A process that is suspended mid-body on a delay is skipped: it is not
+    /// waiting on its sensitivity list, so the event is simply missed (as in
+    /// IEEE 1800 event scheduling) instead of starting a second copy.
     fn find_sensitive_processes(&self, changed: &HashSet<SimSignalId>) -> Vec<usize> {
         let mut to_run = HashSet::new();
+        let suspended: HashSet<usize> = self
+            .suspended_processes
+            .iter()
+            .map(|(_, sp)| sp.process_idx)
+            .collect();
 
         for &sig_id in changed {
             if let Some(procs) = self.sensitivity_map.get(&sig_id) {
                 for &proc_idx in procs {
+                    if suspended.contains(&proc_idx) {
+                        continue;
+                    }
                     let proc = &self.processes[proc_idx];
 
                     // For edge-sensitive processes, check edge conditions
@@ -590,7 +632,7 @@ impl SimKernel {
         Ok(())
     }
 
-    /// Records the initial value of every signal at time 0.
+    /// Records the current value of every signal at the current time.
     ///
     /// Called after `register_waveform_signals` so that the waveform file
     /// contains a complete initial value dump (e.g. VCD `$dumpvars`).
@@ -600,22 +642,116 @@ impl SimKernel {
             None => return Ok(()),
         };
 
+        let time_fs = self.current_time.fs;
         for (id, state) in self.signals.iter() {
-            rec.record_change(0, id, &state.value)?;
+            rec.record_change(time_fs, id, &state.value)?;
         }
         Ok(())
     }
 
-    fn run_simulation(&mut self) -> Result<SimResult, SimError> {
-        // Phase 0: Register signals with waveform recorder and dump initial values
+    /// Writes the waveform header (scopes and signal declarations) and the
+    /// initial value dump, once per attached recorder.
+    fn start_waveform(&mut self) -> Result<(), SimError> {
+        if self.waveform_started || self.recorder.is_none() {
+            return Ok(());
+        }
+        self.waveform_started = true;
         self.register_waveform_signals()?;
-        self.record_initial_values()?;
+        self.record_initial_values()
+    }
 
-        // Phase 1: Execute all Initial processes
+    /// Performs the time-0 start exactly once: starts the waveform, runs all
+    /// Initial processes, then runs every combinational process once for
+    /// initial propagation (which also starts looping `always` blocks).
+    ///
+    /// Later calls only start a waveform recorder attached since the last
+    /// call, so `run()` twice, or `initialize()` followed by `run()` or
+    /// `run_until()`, never re-runs initial blocks or rewrites the header.
+    fn ensure_initialized(&mut self) -> Result<(), SimError> {
+        self.start_waveform()?;
+        if self.initialized {
+            return Ok(());
+        }
+        self.initialized = true;
         self.execute_initial_processes()?;
+        self.execute_combinational_processes()
+    }
 
-        // Phase 2: Execute all combinational processes once (initial propagation)
-        self.execute_combinational_processes()?;
+    /// Runs process `idx` from `entry` until it completes, suspends on a
+    /// delay, or calls `$finish`.
+    ///
+    /// This is the single place where process statements are executed, for
+    /// every path: initial blocks and the time-0 combinational pass, sensitivity
+    /// triggers in [`step_delta`](Self::step_delta), and delay wakeups. It:
+    ///
+    /// - evaluates against the current signal values and appends the
+    ///   resulting signal updates to `pending` (the caller decides when they
+    ///   take effect);
+    /// - collects `$display` output and assertion failures;
+    /// - on suspension, parks the continuation in `suspended_processes` to
+    ///   wake at the current time plus the delay (the process is then not
+    ///   re-triggered by its sensitivity list until it resumes and completes);
+    /// - on `$finish`, marks the simulation finished.
+    ///
+    /// Returns `true` if the process called `$finish`.
+    fn run_process(
+        &mut self,
+        idx: usize,
+        entry: ProcessEntry,
+        pending: &mut Vec<PendingUpdate>,
+    ) -> Result<bool, SimError> {
+        let mut display = Vec::new();
+        let result = {
+            let proc = &self.processes[idx];
+            let stmt = match &entry {
+                ProcessEntry::Body => &proc.body,
+                ProcessEntry::Resume(continuation) => continuation,
+            };
+            let ctx = EvalContext {
+                signals: &self.signals,
+                signal_map: &proc.signal_map,
+                types: &self.types,
+            };
+            exec_statement(&ctx, stmt, pending, &mut display)?
+        };
+
+        for msg in &display {
+            if msg.starts_with("ASSERTION FAILED:") {
+                self.assertion_failures.push(msg.clone());
+            }
+        }
+        self.display_output.extend(display);
+
+        match result {
+            ExecResult::Continue => Ok(false),
+            ExecResult::Finish => {
+                self.finished = true;
+                Ok(true)
+            }
+            ExecResult::Suspend {
+                delay_fs,
+                continuation,
+            } => {
+                let wake_time = SimTime {
+                    fs: self.current_time.fs + delay_fs,
+                    delta: 0,
+                };
+                self.suspended_processes.push((
+                    wake_time,
+                    SuspendedProcess {
+                        process_idx: idx,
+                        continuation: *continuation,
+                    },
+                ));
+                Ok(false)
+            }
+        }
+    }
+
+    fn run_simulation(&mut self) -> Result<SimResult, SimError> {
+        // Phases 0-2 (once): waveform header, Initial processes, and the
+        // initial combinational propagation pass.
+        self.ensure_initialized()?;
 
         // Phase 3: Event loop — process events and wakeups
         let mut deltas_at_current_time = 0u32;
@@ -759,22 +895,12 @@ impl SimKernel {
         };
 
         for sp in due {
-            let proc = &self.processes[sp.process_idx];
-            let ctx = EvalContext {
-                signals: &self.signals,
-                signal_map: &proc.signal_map,
-                types: &self.types,
-            };
             let mut pending = Vec::new();
-            let mut display = Vec::new();
-            let result = exec_statement(&ctx, &sp.continuation, &mut pending, &mut display)?;
-
-            self.display_output.extend(display.iter().cloned());
-            for msg in &display {
-                if msg.starts_with("ASSERTION FAILED:") {
-                    self.assertion_failures.push(msg.clone());
-                }
-            }
+            let finished = self.run_process(
+                sp.process_idx,
+                ProcessEntry::Resume(sp.continuation),
+                &mut pending,
+            )?;
 
             // Schedule updates as events for the next delta cycle so that
             // step_delta() can properly detect the change (comparing previous_value
@@ -785,28 +911,8 @@ impl SimKernel {
             let next_delta = self.current_time.next_delta();
             self.merge_and_schedule(pending, next_delta);
 
-            match result {
-                ExecResult::Finish => {
-                    self.finished = true;
-                    return Ok(());
-                }
-                ExecResult::Suspend {
-                    delay_fs,
-                    continuation,
-                } => {
-                    let wake_time = SimTime {
-                        fs: self.current_time.fs + delay_fs,
-                        delta: 0,
-                    };
-                    self.suspended_processes.push((
-                        wake_time,
-                        SuspendedProcess {
-                            process_idx: sp.process_idx,
-                            continuation: *continuation,
-                        },
-                    ));
-                }
-                ExecResult::Continue => {}
+            if finished {
+                return Ok(());
             }
         }
         Ok(())
@@ -823,56 +929,25 @@ impl SimKernel {
             .collect();
 
         for idx in initial_indices {
-            let proc = &self.processes[idx];
-            let ctx = EvalContext {
-                signals: &self.signals,
-                signal_map: &proc.signal_map,
-                types: &self.types,
-            };
             let mut pending = Vec::new();
-            let mut display = Vec::new();
-            let result = exec_statement(&ctx, &proc.body, &mut pending, &mut display)?;
-
-            self.display_output.extend(display.iter().cloned());
-            for msg in &display {
-                if msg.starts_with("ASSERTION FAILED:") {
-                    self.assertion_failures.push(msg.clone());
-                }
-            }
+            let finished = self.run_process(idx, ProcessEntry::Body, &mut pending)?;
 
             // Apply initial updates immediately
             for update in pending {
                 self.apply_update_immediate(&update);
             }
 
-            match result {
-                ExecResult::Finish => {
-                    self.finished = true;
-                    break;
-                }
-                ExecResult::Suspend {
-                    delay_fs,
-                    continuation,
-                } => {
-                    let wake_time = SimTime {
-                        fs: self.current_time.fs + delay_fs,
-                        delta: 0,
-                    };
-                    self.suspended_processes.push((
-                        wake_time,
-                        SuspendedProcess {
-                            process_idx: idx,
-                            continuation: *continuation,
-                        },
-                    ));
-                }
-                ExecResult::Continue => {}
+            if finished {
+                break;
             }
         }
         Ok(())
     }
 
     /// Executes all combinational processes once for initial propagation.
+    ///
+    /// This is also where a looping `always` block (no event control) starts:
+    /// it runs up to its first delay and suspends.
     fn execute_combinational_processes(&mut self) -> Result<(), SimError> {
         let comb_indices: Vec<usize> = self
             .processes
@@ -883,23 +958,13 @@ impl SimKernel {
             .collect();
 
         for idx in comb_indices {
-            let proc = &self.processes[idx];
-            let ctx = EvalContext {
-                signals: &self.signals,
-                signal_map: &proc.signal_map,
-                types: &self.types,
-            };
             let mut pending = Vec::new();
-            let mut display = Vec::new();
-            let result = exec_statement(&ctx, &proc.body, &mut pending, &mut display)?;
-
-            self.display_output.extend(display.iter().cloned());
+            let finished = self.run_process(idx, ProcessEntry::Body, &mut pending)?;
 
             // Schedule updates at time 0, delta 1 (merging slice updates)
             self.merge_and_schedule(pending, SimTime { fs: 0, delta: 1 });
 
-            if matches!(result, ExecResult::Finish) {
-                self.finished = true;
+            if finished {
                 break;
             }
         }
@@ -993,12 +1058,17 @@ impl SimKernel {
         self.finished
     }
 
-    /// Executes initial processes (exposed for interactive mode).
+    /// Performs the time-0 start: writes the waveform header (if a recorder
+    /// is attached), runs all `initial` blocks, and runs every combinational
+    /// process once for initial propagation.
     ///
-    /// Call this once after kernel construction to run all `initial` blocks.
+    /// Idempotent: the start happens at most once per kernel, and
+    /// [`run`](Self::run), [`run_to_completion`](Self::run_to_completion) and
+    /// [`run_until`](Self::run_until) perform it implicitly if it has not
+    /// happened yet. Interactive front ends call it explicitly to observe the
+    /// time-0 state before stepping.
     pub fn initialize(&mut self) -> Result<(), SimError> {
-        self.execute_initial_processes()?;
-        self.execute_combinational_processes()
+        self.ensure_initialized()
     }
 
     /// Returns collected `$display` output and clears the buffer.
@@ -1022,7 +1092,15 @@ impl SimKernel {
     /// maximum number of scheduler iterations (delta cycles or zero-delay
     /// wakeups) occur at a single timestamp, so a zero-delay loop such as
     /// `initial forever #0;` terminates instead of hanging.
+    ///
+    /// Performs the time-0 start first if [`initialize`](Self::initialize)
+    /// has not been called.
     pub fn run_until(&mut self, target_fs: u64) -> Result<StepResult, SimError> {
+        self.ensure_initialized()?;
+        // Like `run()`, the run's end time bounds `step_delta()`. Without this
+        // a stale limit from an earlier `run()` would make `step_delta()`
+        // refuse events this loop has already chosen to process.
+        self.time_limit = Some(target_fs);
         let mut deltas_at_current_time = 0u32;
 
         while !self.finished {
@@ -2567,5 +2645,546 @@ mod tests {
         kernel.execute_initial_processes().unwrap();
         assert_eq!(kernel.suspended_processes.len(), 1);
         assert_eq!(kernel.suspended_processes[0].0.fs, 50_000_000);
+    }
+
+    // ---- Unified process dispatch (#4: SIM-1, SIM-2, SIM-21) ----
+
+    const NS: u64 = crate::time::FS_PER_NS;
+
+    /// `SignalRef` to signal `i` of the test module.
+    fn sref(i: u32) -> SignalRef {
+        SignalRef::Signal(SignalId::from_raw(i))
+    }
+
+    /// Reads signal `i`.
+    fn rd(i: u32) -> Expr {
+        Expr::Signal(sref(i))
+    }
+
+    /// A `width`-bit literal.
+    fn lit(v: u64, width: u32) -> Expr {
+        Expr::Literal(LogicVec::from_u64(v, width))
+    }
+
+    /// `~sig[i]` on a 1-bit signal.
+    fn inv(i: u32) -> Expr {
+        Expr::Unary {
+            op: aion_ir::UnaryOp::Not,
+            operand: Box::new(rd(i)),
+            ty: aion_ir::TypeId::from_raw(0),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `sig[i] + 1` on an 8-bit signal.
+    fn inc(i: u32) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(rd(i)),
+            rhs: Box::new(lit(1, 8)),
+            ty: aion_ir::TypeId::from_raw(1),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `sig[i] = value;`
+    fn set(i: u32, value: Expr) -> Statement {
+        Statement::Assign {
+            target: sref(i),
+            value,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `#ns body`
+    fn after(ns: u64, body: Statement) -> Statement {
+        Statement::Delay {
+            duration_fs: ns * NS,
+            body: Box::new(body),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn seq(stmts: Vec<Statement>) -> Statement {
+        Statement::Block {
+            stmts,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn looping(body: Statement) -> Statement {
+        Statement::Forever {
+            body: Box::new(body),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn show(format: &str, args: Vec<Expr>) -> Statement {
+        Statement::Display {
+            format: format.into(),
+            args,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn posedge(i: u32) -> Sensitivity {
+        Sensitivity::EdgeList(vec![EdgeSensitivity {
+            signal: SignalId::from_raw(i),
+            edge: Edge::Posedge,
+        }])
+    }
+
+    /// Builds module `top` from `(interner name index, type id, init)` signals
+    /// (signal `n` is the `n`-th entry), processes, and continuous assignments.
+    fn build_design(
+        signals: &[(u32, u32, Option<i64>)],
+        processes: Vec<(ProcessKind, Sensitivity, Statement)>,
+        assigns: Vec<(u32, Expr)>,
+    ) -> Design {
+        let mut top = empty_module(0, Ident::from_raw(1));
+        for (n, &(name, ty, init)) in signals.iter().enumerate() {
+            top.signals.alloc(Signal {
+                id: SignalId::from_raw(n as u32),
+                name: Ident::from_raw(name),
+                ty: aion_ir::TypeId::from_raw(ty),
+                kind: SignalKind::Reg,
+                init: init.map(ConstValue::Int),
+                clock_domain: None,
+                span: Span::DUMMY,
+            });
+        }
+        for (n, (kind, sensitivity, body)) in processes.into_iter().enumerate() {
+            top.processes.alloc(aion_ir::Process {
+                id: aion_ir::ProcessId::from_raw(n as u32),
+                name: None,
+                kind,
+                body,
+                sensitivity,
+                span: Span::DUMMY,
+            });
+        }
+        for (target, value) in assigns {
+            top.assignments.push(Assignment {
+                target: sref(target),
+                value,
+                span: Span::DUMMY,
+            });
+        }
+        let mut modules = Arena::new();
+        modules.alloc(top);
+        Design {
+            modules,
+            top: ModuleId::from_raw(0),
+            types: make_type_db(),
+            source_map: aion_ir::SourceMap::new(),
+        }
+    }
+
+    fn kernel_for(design: &Design) -> SimKernel {
+        SimKernel::new(design, &make_test_interner()).unwrap()
+    }
+
+    fn value_of(kernel: &SimKernel, name: &str) -> Option<u64> {
+        kernel
+            .signal_value(kernel.find_signal(name).unwrap())
+            .to_u64()
+    }
+
+    /// Initial process driving a single rising edge on signal 0 at 5 ns.
+    fn one_posedge_at_5ns() -> (ProcessKind, Sensitivity, Statement) {
+        (
+            ProcessKind::Initial,
+            Sensitivity::All,
+            seq(vec![set(0, lit(0, 1)), after(5, set(0, lit(1, 1)))]),
+        )
+    }
+
+    // Repro A (SIM-1): an initial block that reads a signal driven by a
+    // continuous assignment used to be re-run from the top whenever that
+    // signal changed, repeating `b = 0` after `b = 1`.
+    #[test]
+    fn initial_block_not_retriggered_by_read_signal() {
+        // Signals: 0 = a, 1 = b.  assign a = ~b;
+        // initial begin b = 0; #10 begin b = 1; $display(a); end end
+        let design = build_design(
+            &[(8, 0, None), (9, 0, None)],
+            vec![(
+                ProcessKind::Initial,
+                Sensitivity::All,
+                seq(vec![
+                    set(1, lit(0, 1)),
+                    after(10, seq(vec![set(1, lit(1, 1)), show("a=%b", vec![rd(0)])])),
+                ]),
+            )],
+            vec![(0, inv(1))],
+        );
+        let mut kernel = kernel_for(&design);
+        let result = kernel.run(100 * NS).unwrap();
+        assert_eq!(value_of(&kernel, "top.b"), Some(1), "b must stay 1");
+        assert_eq!(value_of(&kernel, "top.a"), Some(0));
+        assert_eq!(result.display_output, vec!["a=1".to_string()]);
+    }
+
+    #[test]
+    fn initial_block_without_delay_runs_exactly_once() {
+        // Signals: 0 = a, 1 = b.  assign a = ~b;
+        // initial begin $display(a); b = 1; end  -- reads `a`, which changes.
+        let design = build_design(
+            &[(8, 0, None), (9, 0, Some(0))],
+            vec![(
+                ProcessKind::Initial,
+                Sensitivity::All,
+                seq(vec![show("a=%b", vec![rd(0)]), set(1, lit(1, 1))]),
+            )],
+            vec![(0, inv(1))],
+        );
+        let mut kernel = kernel_for(&design);
+        let result = kernel.run(50 * NS).unwrap();
+        assert_eq!(
+            result.display_output.len(),
+            1,
+            "{:?}",
+            result.display_output
+        );
+        assert_eq!(value_of(&kernel, "top.a"), Some(0));
+    }
+
+    #[test]
+    fn initial_and_looping_processes_not_in_sensitivity_map() {
+        // Signals: 0 = clk, 1 = q. Process 0 (initial) and process 1 (a
+        // looping always) both read clk; only process 2 (`q = clk`) may be
+        // woken by it.
+        let design = build_design(
+            &[(2, 0, Some(0)), (7, 0, Some(0))],
+            vec![
+                (
+                    ProcessKind::Initial,
+                    Sensitivity::All,
+                    show("clk=%b", vec![rd(0)]),
+                ),
+                (
+                    ProcessKind::Combinational,
+                    Sensitivity::All,
+                    looping(after(5, set(0, inv(0)))),
+                ),
+                (ProcessKind::Combinational, Sensitivity::All, set(1, rd(0))),
+            ],
+            vec![],
+        );
+        let kernel = kernel_for(&design);
+        let registered: HashSet<usize> =
+            kernel.sensitivity_map.values().flatten().copied().collect();
+        assert_eq!(registered, HashSet::from([2]));
+    }
+
+    // Repro B (SIM-2): a combinational process whose body is a delay (the
+    // old lowering of `always #5 clk = ~clk;`) never ran: its Suspend was
+    // dropped by the initial combinational pass.
+    #[test]
+    fn combinational_delay_suspend_is_honored() {
+        let design = build_design(
+            &[(2, 0, None)],
+            vec![
+                (ProcessKind::Initial, Sensitivity::All, set(0, lit(0, 1))),
+                (
+                    ProcessKind::Combinational,
+                    Sensitivity::All,
+                    after(5, set(0, inv(0))),
+                ),
+            ],
+            vec![],
+        );
+        let mut kernel = kernel_for(&design);
+        let result = kernel.run(47 * NS).unwrap();
+        assert_eq!(result.final_time.fs, 45 * NS);
+        // Toggles at 5, 10, ..., 45 ns: nine toggles from 0.
+        assert_eq!(value_of(&kernel, "top.clk"), Some(1));
+    }
+
+    /// `always #5 clk = ~clk;` as the elaborator now lowers it (a loop).
+    #[test]
+    fn looping_always_clock_generator() {
+        let design = build_design(
+            &[(2, 0, None)],
+            vec![
+                (ProcessKind::Initial, Sensitivity::All, set(0, lit(0, 1))),
+                (
+                    ProcessKind::Combinational,
+                    Sensitivity::All,
+                    looping(after(5, set(0, inv(0)))),
+                ),
+            ],
+            vec![],
+        );
+        let mut kernel = kernel_for(&design);
+        let result = kernel.run(47 * NS).unwrap();
+        assert_eq!(result.final_time.fs, 45 * NS);
+        assert_eq!(value_of(&kernel, "top.clk"), Some(1));
+        // Exactly one copy of the process is ever pending.
+        assert_eq!(kernel.suspended_processes.len(), 1);
+    }
+
+    /// `always begin #5 clk = 0; #5 clk = 1; end`, observed across several
+    /// `run()` calls (which must not restart the process).
+    #[test]
+    fn looping_always_with_two_delays() {
+        let design = build_design(
+            &[(2, 0, None)],
+            vec![(
+                ProcessKind::Combinational,
+                Sensitivity::All,
+                looping(seq(vec![
+                    after(5, set(0, lit(0, 1))),
+                    after(5, set(0, lit(1, 1))),
+                ])),
+            )],
+            vec![],
+        );
+        let mut kernel = kernel_for(&design);
+        kernel.run(3 * NS).unwrap();
+        assert_eq!(value_of(&kernel, "top.clk"), None, "still X before 5 ns");
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            kernel.run(5 * NS).unwrap(); // 8, 13, 18, 23 ns
+            seen.push(value_of(&kernel, "top.clk"));
+        }
+        assert_eq!(seen, vec![Some(0), Some(1), Some(0), Some(1)]);
+        assert_eq!(kernel.suspended_processes.len(), 1);
+    }
+
+    // Repro B2 (SIM-2): `always @(posedge clk) begin q = 1; #2 q = 0; end`
+    // lost everything after the delay.
+    #[test]
+    fn edge_triggered_process_resumes_after_delay() {
+        // Signals: 0 = clk, 1 = q.
+        let design = build_design(
+            &[(2, 0, None), (7, 0, Some(0))],
+            vec![
+                one_posedge_at_5ns(),
+                (
+                    ProcessKind::Sequential,
+                    posedge(0),
+                    seq(vec![set(1, lit(1, 1)), after(2, set(1, lit(0, 1)))]),
+                ),
+            ],
+            vec![],
+        );
+        let mut kernel = kernel_for(&design);
+        kernel.run(6 * NS).unwrap();
+        assert_eq!(value_of(&kernel, "top.q"), Some(1), "q = 1 at the edge");
+        kernel.run(44 * NS).unwrap();
+        assert_eq!(value_of(&kernel, "top.q"), Some(0), "q = 0 two ns later");
+    }
+
+    // A sensitivity-triggered process that is mid-delay misses further
+    // events (IEEE 1800 9.4): it must not be started a second time.
+    #[test]
+    fn suspended_process_not_retriggered() {
+        // Signals: 0 = clk (posedges at 5, 15, 25, 35, 45 ns), 1 = count,
+        // 2 = q.
+        // always @(posedge clk) begin count = count + 1; #12 q = q + 1; end
+        let design = build_design(
+            &[(2, 0, None), (6, 1, Some(0)), (7, 1, Some(0))],
+            vec![
+                (
+                    ProcessKind::Initial,
+                    Sensitivity::All,
+                    seq(vec![set(0, lit(0, 1)), looping(after(5, set(0, inv(0))))]),
+                ),
+                (
+                    ProcessKind::Sequential,
+                    posedge(0),
+                    seq(vec![set(1, inc(1)), after(12, set(2, inc(2)))]),
+                ),
+            ],
+            vec![],
+        );
+        let mut kernel = kernel_for(&design);
+        kernel.run(50 * NS).unwrap();
+        // Edges at 5, 25, 45 start the block; 15 and 35 arrive mid-delay.
+        assert_eq!(value_of(&kernel, "top.count"), Some(3));
+        // Delays complete at 17 and 37 ns (the third resumes at 57 ns).
+        assert_eq!(value_of(&kernel, "top.q"), Some(2));
+    }
+
+    #[test]
+    fn edge_triggered_process_without_delay_still_retriggers() {
+        // always @(posedge clk) count = count + 1;  with posedges every 10 ns.
+        let design = build_design(
+            &[(2, 0, None), (6, 1, Some(0))],
+            vec![
+                (
+                    ProcessKind::Initial,
+                    Sensitivity::All,
+                    seq(vec![set(0, lit(0, 1)), looping(after(5, set(0, inv(0))))]),
+                ),
+                (ProcessKind::Sequential, posedge(0), set(1, inc(1))),
+            ],
+            vec![],
+        );
+        let mut kernel = kernel_for(&design);
+        kernel.run(50 * NS).unwrap();
+        assert_eq!(value_of(&kernel, "top.count"), Some(5));
+    }
+
+    #[test]
+    fn finish_after_delay_in_triggered_process_stops_simulation() {
+        // always @(posedge clk) #1 $finish;
+        let design = build_design(
+            &[(2, 0, None)],
+            vec![
+                one_posedge_at_5ns(),
+                (
+                    ProcessKind::Sequential,
+                    posedge(0),
+                    after(1, Statement::Finish { span: Span::DUMMY }),
+                ),
+            ],
+            vec![],
+        );
+        let mut kernel = kernel_for(&design);
+        let result = kernel.run(100 * NS).unwrap();
+        assert!(result.finished_by_user);
+        assert_eq!(result.final_time.fs, 6 * NS);
+    }
+
+    #[test]
+    fn looping_process_without_timing_control_errors() {
+        // always clk = ~clk;  (lowered as a loop) must fail, not hang.
+        let design = build_design(
+            &[(2, 0, Some(0))],
+            vec![(
+                ProcessKind::Combinational,
+                Sensitivity::All,
+                looping(set(0, inv(0))),
+            )],
+            vec![],
+        );
+        let mut kernel = kernel_for(&design);
+        assert!(matches!(kernel.run(10 * NS), Err(SimError::ZeroTimeLoop)));
+    }
+
+    // SIM-21: run() twice / initialize() then run() must not re-run
+    // initial blocks or the initial combinational pass.
+    fn hello_design() -> Design {
+        build_design(
+            &[(2, 0, None)],
+            vec![
+                (
+                    ProcessKind::Initial,
+                    Sensitivity::All,
+                    show("hello", vec![]),
+                ),
+                (
+                    ProcessKind::Combinational,
+                    Sensitivity::All,
+                    looping(after(5, set(0, lit(1, 1)))),
+                ),
+            ],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn run_twice_does_not_rerun_initial_blocks() {
+        let mut kernel = kernel_for(&hello_design());
+        kernel.run(10 * NS).unwrap();
+        let result = kernel.run(10 * NS).unwrap();
+        assert_eq!(result.display_output, vec!["hello".to_string()]);
+        assert_eq!(kernel.suspended_processes.len(), 1);
+    }
+
+    #[test]
+    fn initialize_then_run_does_not_rerun_initial_blocks() {
+        let mut kernel = kernel_for(&hello_design());
+        kernel.initialize().unwrap();
+        kernel.initialize().unwrap();
+        let result = kernel.run(10 * NS).unwrap();
+        assert_eq!(result.display_output, vec!["hello".to_string()]);
+        assert_eq!(kernel.suspended_processes.len(), 1);
+    }
+
+    #[test]
+    fn run_until_initializes_once() {
+        let mut kernel = kernel_for(&hello_design());
+        kernel.run_until(7 * NS).unwrap();
+        assert_eq!(value_of(&kernel, "top.clk"), Some(1));
+        kernel.run_until(12 * NS).unwrap();
+        kernel.run(5 * NS).unwrap();
+        assert_eq!(kernel.take_display_output(), vec!["hello".to_string()]);
+        assert_eq!(kernel.suspended_processes.len(), 1);
+    }
+
+    #[test]
+    fn run_until_after_run_is_not_bounded_by_stale_limit() {
+        // run() leaves time_limit at 3 ns; run_until(7 ns) must still apply
+        // the 5 ns wakeup's update instead of spinning on it.
+        let mut kernel = kernel_for(&hello_design());
+        kernel.run(3 * NS).unwrap();
+        assert_eq!(kernel.run_until(7 * NS).unwrap(), StepResult::Continued);
+        assert_eq!(value_of(&kernel, "top.clk"), Some(1));
+        assert_eq!(kernel.current_time().fs, 7 * NS);
+    }
+
+    /// A waveform recorder that counts `(register_signal, begin_scope,
+    /// time-0 record_change)` calls.
+    #[derive(Default, Clone)]
+    struct CountingRecorder {
+        counts: std::sync::Arc<std::sync::Mutex<(usize, usize, usize)>>,
+    }
+
+    impl WaveformRecorder for CountingRecorder {
+        fn register_signal(&mut self, _: SimSignalId, _: &str, _: u32) -> Result<(), SimError> {
+            self.counts.lock().unwrap().0 += 1;
+            Ok(())
+        }
+        fn begin_scope(&mut self, _: &str) -> Result<(), SimError> {
+            self.counts.lock().unwrap().1 += 1;
+            Ok(())
+        }
+        fn end_scope(&mut self) -> Result<(), SimError> {
+            Ok(())
+        }
+        fn record_change(&mut self, t: u64, _: SimSignalId, _: &LogicVec) -> Result<(), SimError> {
+            if t == 0 {
+                self.counts.lock().unwrap().2 += 1;
+            }
+            Ok(())
+        }
+        fn finalize(&mut self) -> Result<(), SimError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn run_twice_writes_waveform_header_once() {
+        let rec = CountingRecorder::default();
+        let mut kernel = kernel_for(&hello_design());
+        kernel.set_recorder(Box::new(rec.clone()));
+        kernel.run(10 * NS).unwrap();
+        kernel.run(10 * NS).unwrap();
+        // One signal, one scope, one time-0 dump.
+        assert_eq!(*rec.counts.lock().unwrap(), (1, 1, 1));
+    }
+
+    #[test]
+    fn initialize_then_run_writes_waveform_header_once() {
+        let rec = CountingRecorder::default();
+        let mut kernel = kernel_for(&hello_design());
+        kernel.set_recorder(Box::new(rec.clone()));
+        kernel.initialize().unwrap();
+        kernel.run(10 * NS).unwrap();
+        kernel.run_until(30 * NS).unwrap();
+        assert_eq!(*rec.counts.lock().unwrap(), (1, 1, 1));
+    }
+
+    #[test]
+    fn recorder_attached_after_initialize_still_gets_header() {
+        let rec = CountingRecorder::default();
+        let mut kernel = kernel_for(&hello_design());
+        kernel.initialize().unwrap();
+        kernel.set_recorder(Box::new(rec.clone()));
+        kernel.run(10 * NS).unwrap();
+        assert_eq!(*rec.counts.lock().unwrap(), (1, 1, 1));
     }
 }

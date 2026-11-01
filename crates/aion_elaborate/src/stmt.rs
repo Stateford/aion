@@ -193,6 +193,50 @@ pub fn lower_verilog_stmt(
     }
 }
 
+/// Lowers the body of a Verilog `always` block that has no top-level event
+/// control (e.g. `always #5 clk = ~clk;`).
+///
+/// Such a block restarts as soon as its body ends, so it is lowered as a
+/// `forever` loop spanning the whole `always` block; the simulator starts it
+/// once at time 0 and it then advances only through its own delays. A body
+/// that can never yield gets W203 (the simulator rejects it at run time with
+/// a zero-time-loop error instead of hanging).
+pub fn lower_verilog_looping_always(
+    body: &aion_verilog_parser::ast::Statement,
+    always_span: aion_source::Span,
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrStmt {
+    if !verilog_may_yield(body, interner) {
+        sink.emit(errors::warn_always_without_timing(always_span));
+    }
+    IrStmt::Forever {
+        body: Box::new(lower_verilog_stmt(body, sig_env, source_db, interner, sink)),
+        span: always_span,
+    }
+}
+
+/// SystemVerilog counterpart of [`lower_verilog_looping_always`] for a plain
+/// `always` block without a top-level event control.
+pub fn lower_sv_looping_always(
+    body: &aion_sv_parser::ast::Statement,
+    always_span: aion_source::Span,
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrStmt {
+    if !sv_may_yield(body, interner) {
+        sink.emit(errors::warn_always_without_timing(always_span));
+    }
+    IrStmt::Forever {
+        body: Box::new(lower_sv_stmt(body, sig_env, source_db, interner, sink)),
+        span: always_span,
+    }
+}
+
 /// Returns `true` if a system task name ends the simulation (`$finish`/`$stop`).
 fn is_finish_task(name: aion_common::Ident, interner: &Interner) -> bool {
     matches!(
