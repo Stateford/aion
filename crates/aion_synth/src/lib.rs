@@ -166,6 +166,7 @@ mod tests {
     use super::*;
     use aion_arch::{ArithmeticPattern, LutMapping, MapResult, MemoryCell, TechMapper};
     use aion_common::Interner;
+    use aion_ir::AssignKind;
     use aion_ir::{
         Arena, Assignment, BinaryOp, CellKind, Design, Edge, EdgeSensitivity, Expr, Module, Port,
         PortDirection, Process, ProcessId, ProcessKind, Sensitivity, Signal, SignalId, SignalKind,
@@ -353,6 +354,7 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(out_id),
                 value: Expr::Signal(SignalRef::Signal(in_id)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             span: Span::DUMMY,

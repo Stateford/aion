@@ -130,6 +130,7 @@ mod tests {
     use super::*;
     use aion_common::{ContentHash, Ident, Interner, LogicVec};
     use aion_ir::arena::Arena;
+    use aion_ir::AssignKind;
     use aion_ir::{
         Assignment, CellKind, Connection, ConstValue, Design, Edge, EdgeSensitivity, Expr, Module,
         ModuleId, Port, PortDirection, Process, ProcessId, ProcessKind, Sensitivity, Signal,
@@ -334,6 +335,7 @@ mod tests {
                     ty: bit4_ty,
                     span: Span::DUMMY,
                 },
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::EdgeList(vec![EdgeSensitivity {
@@ -674,11 +676,13 @@ mod tests {
                 then_body: Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(1)),
                     value: Expr::Literal(LogicVec::from_bool(true)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 }),
                 else_body: Some(Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(1)),
                     value: Expr::Literal(LogicVec::from_bool(false)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 })),
                 span: Span::DUMMY,
@@ -765,6 +769,7 @@ mod tests {
                     body: Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(1)),
                         value: Expr::Literal(LogicVec::from_bool(true)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                     span: Span::DUMMY,
@@ -772,6 +777,7 @@ mod tests {
                 default: Some(Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(1)),
                     value: Expr::Literal(LogicVec::from_bool(false)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 })),
                 span: Span::DUMMY,

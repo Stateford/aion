@@ -285,8 +285,8 @@ fn elaborate_vhdl_decl(
 #[allow(clippy::too_many_arguments)]
 fn elaborate_vhdl_concurrent(
     stmt: &vhdl_ast::ConcurrentStatement,
-    _const_env: &ConstEnv,
-    _signals: &mut Arena<SignalId, Signal>,
+    const_env: &ConstEnv,
+    signals: &mut Arena<SignalId, Signal>,
     sig_env: &mut SignalEnv,
     cells: &mut Arena<CellId, Cell>,
     processes: &mut Arena<ProcessId, Process>,
@@ -295,6 +295,15 @@ fn elaborate_vhdl_concurrent(
 ) {
     match stmt {
         vhdl_ast::ConcurrentStatement::Process(ps) => {
+            // Process-local declarations (variables, constants) become
+            // module signals visible only while lowering this process. A
+            // variable keeps its value between activations, like a `reg`;
+            // `:=` lowers to a blocking assignment to it.
+            let outer_env = (!ps.decls.is_empty()).then(|| sig_env.clone());
+            for decl in &ps.decls {
+                elaborate_vhdl_decl(decl, const_env, signals, sig_env, ctx);
+            }
+
             // Detect sequential processes by scanning for rising_edge/falling_edge
             let (kind, sensitivity) =
                 detect_vhdl_process_kind(&ps.sensitivity, &ps.stmts, sig_env, ctx.interner);
@@ -319,6 +328,9 @@ fn elaborate_vhdl_concurrent(
                 sensitivity,
                 span: ps.span,
             });
+            if let Some(env) = outer_env {
+                *sig_env = env;
+            }
         }
         vhdl_ast::ConcurrentStatement::SignalAssignment(sa) => {
             let target = lower_vhdl_to_signal_ref(&sa.target, sig_env, ctx.interner, ctx.sink);
