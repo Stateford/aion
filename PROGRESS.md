@@ -12,6 +12,7 @@
 - **Tests added (kernel.rs unit tests):** `forever_zero_delay_run_hits_delta_limit`, `forever_zero_delay_run_until_hits_delta_limit` (regression for the issue's repro), `zero_delay_loop_after_delay_reports_its_time` (error reports 10 ns), `nonzero_delay_forever_runs_under_tight_delta_limit`, `nonzero_delay_forever_run_until_under_tight_delta_limit` (a `forever #5` clock runs normally with `max_delta = 2`, including resumed `run_until` calls).
 - **Note:** The untracked `crates/aion_sim/tests/tmp_verify_zero_delay_hang.rs` in the main checkout was left untouched. These unit tests replace it, and it can now be deleted.
 - `cargo test -p aion_sim` (255 passed), `aion_cli` / `aion_tui` tests pass, and clippy is clean.
+- **CI:** Added `timeout-minutes: 15` to the `cargo test` step. CI was also failing because it installs the latest stable Rust (1.99), whose clippy flags existing code. Fixed the five sites (`collapsible_match` ×2 in `aion_timing`, `drain_collect` in `aion_synth`, `question_mark` ×2 in `aion_elaborate`, `manual_checked_div` in `aion_tui`) with behaviour-preserving rewrites, and added edge-case tests for each. Verified with the full CI sequence on 1.99.0 and on 1.93.
 
 ---
 
