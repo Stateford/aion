@@ -3,22 +3,34 @@
 //! [`eval_expr`] recursively evaluates an IR [`Expr`] tree into a [`LogicVec`],
 //! reading signal values from the simulation state. [`exec_statement`] executes
 //! a [`Statement`] tree, collecting deferred [`PendingUpdate`]s for the kernel
-//! to apply after the process completes.
+//! to commit after the process segment completes.
+//!
+//! Blocking assignments ([`AssignKind::Blocking`]) are also recorded in a
+//! process-local overlay, so later statements of the same segment read the
+//! new value immediately. Non-blocking assignments
+//! ([`AssignKind::NonBlocking`]) evaluate their right-hand side right away but
+//! leave the overlay untouched; the kernel applies them in the NBA region.
 
 use std::collections::HashMap;
 
 use aion_common::{Logic, LogicVec};
 use aion_ir::arena::Arena;
-use aion_ir::{AssertionKind, BinaryOp, Expr, SignalId, SignalRef, Statement, TypeDb, UnaryOp};
+use aion_ir::{
+    AssertionKind, AssignKind, BinaryOp, Expr, SignalId, SignalRef, Statement, TypeDb, UnaryOp,
+};
 
 use crate::error::SimError;
 use crate::value::{SimSignalId, SimSignalState};
 
 /// A deferred signal update collected during statement execution.
 ///
-/// Updates are not applied immediately; they are batched and applied
-/// after the entire process body finishes executing, preserving
-/// delta-cycle semantics.
+/// Updates are not written to the shared signal state while the process
+/// runs; the kernel commits them after the process segment finishes. How
+/// they are committed depends on [`kind`](Self::kind): blocking updates
+/// become active-region events for the next delta (the writing process
+/// already saw them through its overlay), while non-blocking updates wait
+/// in the kernel's NBA queue until the active region at the current time
+/// has drained.
 #[derive(Debug, Clone)]
 pub struct PendingUpdate {
     /// The flat simulation signal to update.
@@ -27,6 +39,9 @@ pub struct PendingUpdate {
     pub value: LogicVec,
     /// Optional bit range for partial updates `(high, low)` inclusive.
     pub range: Option<(u32, u32)>,
+    /// Whether the update came from a blocking or a non-blocking assignment,
+    /// which decides the scheduling region it is applied in.
+    pub kind: AssignKind,
 }
 
 /// The result of executing a single statement.
@@ -68,25 +83,54 @@ pub fn logic_is_true(lv: &LogicVec) -> bool {
     lv.width() > 0 && lv.get(0) == Logic::One
 }
 
+/// Process-local values written by blocking assignments during one process
+/// execution segment, keyed by flat signal.
+///
+/// Reads inside the same segment consult this overlay before the committed
+/// signal state, so `tmp = a + b; y = tmp;` sees the new `tmp`. The overlay
+/// lives only for a single [`exec_statement`] call: the kernel commits the
+/// corresponding blocking [`PendingUpdate`]s before the process runs again
+/// (including after a `#delay`), so nothing needs to survive a suspension.
+type BlockingOverlay = HashMap<SimSignalId, LogicVec>;
+
 /// Evaluates an IR expression into a `LogicVec`.
 ///
 /// Recursively walks the expression tree, reading signal values from the
 /// evaluation context. Operations involving X or Z values propagate
 /// unknown results following IEEE 1364 semantics.
 pub fn eval_expr(ctx: &EvalContext<'_>, expr: &Expr) -> Result<LogicVec, SimError> {
+    eval_expr_ov(ctx, &BlockingOverlay::new(), expr)
+}
+
+/// Returns the value of `id` as seen by the executing process: its own
+/// pending blocking write if it made one, else the committed signal value.
+fn read_signal<'v>(
+    ctx: &'v EvalContext<'_>,
+    ov: &'v BlockingOverlay,
+    id: SimSignalId,
+) -> &'v LogicVec {
+    ov.get(&id).unwrap_or_else(|| &ctx.signals.get(id).value)
+}
+
+/// Evaluates an expression, reading signals through the blocking overlay `ov`.
+fn eval_expr_ov(
+    ctx: &EvalContext<'_>,
+    ov: &BlockingOverlay,
+    expr: &Expr,
+) -> Result<LogicVec, SimError> {
     match expr {
         Expr::Literal(lv) => Ok(lv.clone()),
 
-        Expr::Signal(signal_ref) => eval_signal_ref(ctx, signal_ref),
+        Expr::Signal(signal_ref) => eval_signal_ref_ov(ctx, ov, signal_ref),
 
         Expr::Unary { op, operand, .. } => {
-            let val = eval_expr(ctx, operand)?;
+            let val = eval_expr_ov(ctx, ov, operand)?;
             eval_unary(*op, &val)
         }
 
         Expr::Binary { op, lhs, rhs, .. } => {
-            let l = eval_expr(ctx, lhs)?;
-            let r = eval_expr(ctx, rhs)?;
+            let l = eval_expr_ov(ctx, ov, lhs)?;
+            let r = eval_expr_ov(ctx, ov, rhs)?;
             eval_binary(*op, &l, &r)
         }
 
@@ -96,26 +140,26 @@ pub fn eval_expr(ctx: &EvalContext<'_>, expr: &Expr) -> Result<LogicVec, SimErro
             false_val,
             ..
         } => {
-            let cond = eval_expr(ctx, condition)?;
+            let cond = eval_expr_ov(ctx, ov, condition)?;
             if has_xz(&cond) {
                 // Unknown condition → all X result
-                let tv = eval_expr(ctx, true_val)?;
+                let tv = eval_expr_ov(ctx, ov, true_val)?;
                 let mut result = LogicVec::new(tv.width());
                 for i in 0..tv.width() {
                     result.set(i, Logic::X);
                 }
                 Ok(result)
             } else if logic_is_true(&cond) {
-                eval_expr(ctx, true_val)
+                eval_expr_ov(ctx, ov, true_val)
             } else {
-                eval_expr(ctx, false_val)
+                eval_expr_ov(ctx, ov, false_val)
             }
         }
 
         Expr::Concat(parts) => {
             let mut evaluated: Vec<LogicVec> = Vec::with_capacity(parts.len());
             for p in parts {
-                evaluated.push(eval_expr(ctx, p)?);
+                evaluated.push(eval_expr_ov(ctx, ov, p)?);
             }
             let total_width: u32 = evaluated.iter().map(|v| v.width()).sum();
             let mut result = LogicVec::new(total_width);
@@ -131,7 +175,7 @@ pub fn eval_expr(ctx: &EvalContext<'_>, expr: &Expr) -> Result<LogicVec, SimErro
         }
 
         Expr::Repeat { expr, count, .. } => {
-            let val = eval_expr(ctx, expr)?;
+            let val = eval_expr_ov(ctx, ov, expr)?;
             let total_width = val.width() * count;
             let mut result = LogicVec::new(total_width);
             for rep in 0..*count {
@@ -143,8 +187,8 @@ pub fn eval_expr(ctx: &EvalContext<'_>, expr: &Expr) -> Result<LogicVec, SimErro
         }
 
         Expr::Index { expr, index, .. } => {
-            let val = eval_expr(ctx, expr)?;
-            let idx_val = eval_expr(ctx, index)?;
+            let val = eval_expr_ov(ctx, ov, expr)?;
+            let idx_val = eval_expr_ov(ctx, ov, index)?;
             match idx_val.to_u64() {
                 Some(idx) if (idx as u32) < val.width() => {
                     Ok(LogicVec::from_bool(val.get(idx as u32) == Logic::One))
@@ -167,9 +211,9 @@ pub fn eval_expr(ctx: &EvalContext<'_>, expr: &Expr) -> Result<LogicVec, SimErro
         Expr::Slice {
             expr, high, low, ..
         } => {
-            let val = eval_expr(ctx, expr)?;
-            let h_val = eval_expr(ctx, high)?;
-            let l_val = eval_expr(ctx, low)?;
+            let val = eval_expr_ov(ctx, ov, expr)?;
+            let h_val = eval_expr_ov(ctx, ov, high)?;
+            let l_val = eval_expr_ov(ctx, ov, low)?;
             match (h_val.to_u64(), l_val.to_u64()) {
                 (Some(h), Some(l)) if h >= l => {
                     let width = (h - l + 1) as u32;
@@ -196,8 +240,13 @@ pub fn eval_expr(ctx: &EvalContext<'_>, expr: &Expr) -> Result<LogicVec, SimErro
     }
 }
 
-/// Evaluates a `SignalRef` to its current `LogicVec` value.
-fn eval_signal_ref(ctx: &EvalContext<'_>, signal_ref: &SignalRef) -> Result<LogicVec, SimError> {
+/// Evaluates a `SignalRef` to its current `LogicVec` value, as seen through
+/// the executing process's blocking overlay `ov`.
+fn eval_signal_ref_ov(
+    ctx: &EvalContext<'_>,
+    ov: &BlockingOverlay,
+    signal_ref: &SignalRef,
+) -> Result<LogicVec, SimError> {
     match signal_ref {
         SignalRef::Signal(sig_id) => {
             let sim_id = ctx
@@ -206,7 +255,7 @@ fn eval_signal_ref(ctx: &EvalContext<'_>, signal_ref: &SignalRef) -> Result<Logi
                 .ok_or_else(|| SimError::InvalidSignalRef {
                     reason: format!("unmapped signal ID {}", sig_id.as_raw()),
                 })?;
-            Ok(ctx.signals.get(*sim_id).value.clone())
+            Ok(read_signal(ctx, ov, *sim_id).clone())
         }
         SignalRef::Slice { signal, high, low } => {
             let sim_id = ctx
@@ -215,7 +264,7 @@ fn eval_signal_ref(ctx: &EvalContext<'_>, signal_ref: &SignalRef) -> Result<Logi
                 .ok_or_else(|| SimError::InvalidSignalRef {
                     reason: format!("unmapped signal ID {}", signal.as_raw()),
                 })?;
-            let full = &ctx.signals.get(*sim_id).value;
+            let full = read_signal(ctx, ov, *sim_id);
             let width = high - low + 1;
             let mut result = LogicVec::new(width);
             for i in 0..width {
@@ -231,7 +280,7 @@ fn eval_signal_ref(ctx: &EvalContext<'_>, signal_ref: &SignalRef) -> Result<Logi
         SignalRef::Concat(refs) => {
             let mut parts = Vec::with_capacity(refs.len());
             for r in refs {
-                parts.push(eval_signal_ref(ctx, r)?);
+                parts.push(eval_signal_ref_ov(ctx, ov, r)?);
             }
             let total_width: u32 = parts.iter().map(|v| v.width()).sum();
             let mut result = LogicVec::new(total_width);
@@ -425,6 +474,13 @@ fn eval_binary(op: BinaryOp, lhs: &LogicVec, rhs: &LogicVec) -> Result<LogicVec,
 
 /// Executes a statement, collecting pending updates and display output.
 ///
+/// The call is one process execution segment: it runs until the statement
+/// completes, suspends on a delay, or hits `$finish`. Blocking writes made
+/// during the segment are visible to its later reads (through a
+/// process-local overlay) and are also returned in `pending` for the kernel
+/// to commit. Non-blocking writes are returned in `pending` with
+/// [`AssignKind::NonBlocking`] and are not visible to later reads.
+///
 /// Returns `ExecResult::Finish` if a `$finish` is encountered.
 pub fn exec_statement(
     ctx: &EvalContext<'_>,
@@ -432,10 +488,36 @@ pub fn exec_statement(
     pending: &mut Vec<PendingUpdate>,
     display_output: &mut Vec<String>,
 ) -> Result<ExecResult, SimError> {
+    let mut overlay = BlockingOverlay::new();
+    exec_stmt_ov(ctx, &mut overlay, stmt, pending, display_output)
+}
+
+/// Executes `stmt` within a process segment whose blocking writes so far are
+/// recorded in `overlay`.
+fn exec_stmt_ov(
+    ctx: &EvalContext<'_>,
+    overlay: &mut BlockingOverlay,
+    stmt: &Statement,
+    pending: &mut Vec<PendingUpdate>,
+    display_output: &mut Vec<String>,
+) -> Result<ExecResult, SimError> {
     match stmt {
-        Statement::Assign { target, value, .. } => {
-            let val = eval_expr(ctx, value)?;
-            collect_assign_updates(ctx, target, &val, pending)?;
+        Statement::Assign {
+            target,
+            value,
+            kind,
+            ..
+        } => {
+            // The right-hand side is evaluated now for both kinds, reading
+            // this segment's own earlier blocking writes.
+            let val = eval_expr_ov(ctx, overlay, value)?;
+            let first_new = pending.len();
+            collect_assign_updates(ctx, target, &val, *kind, pending)?;
+            if *kind == AssignKind::Blocking {
+                for update in &pending[first_new..] {
+                    apply_to_overlay(ctx, overlay, update);
+                }
+            }
             Ok(ExecResult::Continue)
         }
 
@@ -445,11 +527,11 @@ pub fn exec_statement(
             else_body,
             ..
         } => {
-            let cond = eval_expr(ctx, condition)?;
+            let cond = eval_expr_ov(ctx, overlay, condition)?;
             if logic_is_true(&cond) {
-                exec_statement(ctx, then_body, pending, display_output)
+                exec_stmt_ov(ctx, overlay, then_body, pending, display_output)
             } else if let Some(else_b) = else_body {
-                exec_statement(ctx, else_b, pending, display_output)
+                exec_stmt_ov(ctx, overlay, else_b, pending, display_output)
             } else {
                 Ok(ExecResult::Continue)
             }
@@ -461,17 +543,17 @@ pub fn exec_statement(
             default,
             ..
         } => {
-            let subj = eval_expr(ctx, subject)?;
+            let subj = eval_expr_ov(ctx, overlay, subject)?;
             for arm in arms {
                 for pat in &arm.patterns {
-                    let pat_val = eval_expr(ctx, pat)?;
+                    let pat_val = eval_expr_ov(ctx, overlay, pat)?;
                     if values_equal(&subj, &pat_val) {
-                        return exec_statement(ctx, &arm.body, pending, display_output);
+                        return exec_stmt_ov(ctx, overlay, &arm.body, pending, display_output);
                     }
                 }
             }
             if let Some(def) = default {
-                exec_statement(ctx, def, pending, display_output)
+                exec_stmt_ov(ctx, overlay, def, pending, display_output)
             } else {
                 Ok(ExecResult::Continue)
             }
@@ -479,7 +561,7 @@ pub fn exec_statement(
 
         Statement::Block { stmts, span } => {
             for (i, s) in stmts.iter().enumerate() {
-                let result = exec_statement(ctx, s, pending, display_output)?;
+                let result = exec_stmt_ov(ctx, overlay, s, pending, display_output)?;
                 match result {
                     ExecResult::Finish => return Ok(ExecResult::Finish),
                     ExecResult::Suspend {
@@ -523,7 +605,7 @@ pub fn exec_statement(
             message,
             ..
         } => {
-            let cond = eval_expr(ctx, condition)?;
+            let cond = eval_expr_ov(ctx, overlay, condition)?;
             match kind {
                 AssertionKind::Assert => {
                     if !logic_is_true(&cond) {
@@ -541,7 +623,7 @@ pub fn exec_statement(
         Statement::Display { format, args, .. } => {
             let mut evaluated_args: Vec<LogicVec> = Vec::new();
             for arg in args {
-                evaluated_args.push(eval_expr(ctx, arg)?);
+                evaluated_args.push(eval_expr_ov(ctx, overlay, arg)?);
             }
             let output = format_display(format, &evaluated_args);
             display_output.push(output);
@@ -558,7 +640,7 @@ pub fn exec_statement(
         Statement::Forever { body, span } => {
             // Execute the body once; if it suspends (has a delay), wrap the
             // continuation back into the forever loop for re-entry
-            let result = exec_statement(ctx, body, pending, display_output)?;
+            let result = exec_stmt_ov(ctx, overlay, body, pending, display_output)?;
             match result {
                 ExecResult::Suspend {
                     delay_fs,
@@ -632,11 +714,58 @@ fn contains_wait(stmt: &Statement) -> bool {
     }
 }
 
-/// Collects pending updates for a signal assignment target.
+/// Returns `current` with a write of `value` applied, keeping the width of
+/// `current` (the signal's declared width).
+///
+/// - A full write (`range == None`) is resized to the signal: a narrower
+///   value is zero-extended and a wider one truncated, as for a Verilog
+///   assignment of an unsigned value.
+/// - A partial write (`Some((high, low))`) replaces only bits `low..=high`;
+///   bits outside the signal are ignored instead of panicking.
+///
+/// The overlay, the kernel's update merging and the immediate commit of
+/// initial-block writes all use this, so a process reads exactly what is
+/// later committed.
+pub fn apply_write(current: &LogicVec, value: &LogicVec, range: Option<(u32, u32)>) -> LogicVec {
+    let mut new_val = current.clone();
+    match range {
+        None => {
+            for i in 0..new_val.width() {
+                let bit = if i < value.width() {
+                    value.get(i)
+                } else {
+                    Logic::Zero
+                };
+                new_val.set(i, bit);
+            }
+        }
+        Some((high, low)) => {
+            for i in 0..(high.saturating_sub(low) + 1) {
+                if i < value.width() && low + i < new_val.width() {
+                    new_val.set(low + i, value.get(i));
+                }
+            }
+        }
+    }
+    new_val
+}
+
+/// Applies a blocking update to the process-local overlay, so later reads in
+/// the same segment see it (with the same result the kernel later commits;
+/// see [`apply_write`]).
+fn apply_to_overlay(ctx: &EvalContext<'_>, overlay: &mut BlockingOverlay, update: &PendingUpdate) {
+    let current = read_signal(ctx, overlay, update.target);
+    let new_val = apply_write(current, &update.value, update.range);
+    overlay.insert(update.target, new_val);
+}
+
+/// Collects pending updates of the given `kind` for a signal assignment
+/// target.
 fn collect_assign_updates(
     ctx: &EvalContext<'_>,
     target: &SignalRef,
     value: &LogicVec,
+    kind: AssignKind,
     pending: &mut Vec<PendingUpdate>,
 ) -> Result<(), SimError> {
     match target {
@@ -651,6 +780,7 @@ fn collect_assign_updates(
                 target: *sim_id,
                 value: value.clone(),
                 range: None,
+                kind,
             });
             Ok(())
         }
@@ -665,6 +795,7 @@ fn collect_assign_updates(
                 target: *sim_id,
                 value: value.clone(),
                 range: Some((*high, *low)),
+                kind,
             });
             Ok(())
         }
@@ -679,7 +810,7 @@ fn collect_assign_updates(
                         part_val.set(i, value.get(offset + i));
                     }
                 }
-                collect_assign_updates(ctx, r, &part_val, pending)?;
+                collect_assign_updates(ctx, r, &part_val, kind, pending)?;
                 offset += part_width;
             }
             Ok(())
@@ -1267,6 +1398,7 @@ mod tests {
         let stmt = Statement::Assign {
             target: SignalRef::Signal(SignalId::from_raw(0)),
             value: Expr::Literal(LogicVec::from_u64(0b1010, 4)),
+            kind: AssignKind::Blocking,
             span: Span::DUMMY,
         };
         let mut pending = Vec::new();
@@ -1286,11 +1418,13 @@ mod tests {
             then_body: Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             }),
             else_body: Some(Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Literal(LogicVec::from_u64(2, 4)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             })),
             span: Span::DUMMY,
@@ -1311,11 +1445,13 @@ mod tests {
             then_body: Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             }),
             else_body: Some(Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Literal(LogicVec::from_u64(2, 4)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             })),
             span: Span::DUMMY,
@@ -1339,6 +1475,7 @@ mod tests {
                     body: Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(0)),
                         value: Expr::Literal(LogicVec::from_u64(10, 4)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                     span: Span::DUMMY,
@@ -1348,6 +1485,7 @@ mod tests {
                     body: Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(0)),
                         value: Expr::Literal(LogicVec::from_u64(20, 8)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                     span: Span::DUMMY,
@@ -1377,6 +1515,7 @@ mod tests {
             default: Some(Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Literal(LogicVec::from_u64(0, 4)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             })),
             span: Span::DUMMY,
@@ -1397,11 +1536,13 @@ mod tests {
                 Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 },
                 Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: Expr::Literal(LogicVec::from_u64(2, 4)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 },
             ],
@@ -1493,12 +1634,14 @@ mod tests {
                 Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 },
                 Statement::Finish { span: Span::DUMMY },
                 Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: Expr::Literal(LogicVec::from_u64(2, 4)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 },
             ],
@@ -1575,6 +1718,7 @@ mod tests {
                 low: 0,
             },
             value: Expr::Literal(LogicVec::from_u64(0b1111, 4)),
+            kind: AssignKind::Blocking,
             span: Span::DUMMY,
         };
         let mut pending = Vec::new();
@@ -1596,6 +1740,7 @@ mod tests {
             body: Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             }),
             span: Span::DUMMY,
@@ -1627,6 +1772,7 @@ mod tests {
                 body: Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 }),
                 span: Span::DUMMY,
@@ -1660,6 +1806,7 @@ mod tests {
         Statement::Assign {
             target: SignalRef::Signal(SignalId::from_raw(0)),
             value: Expr::Literal(LogicVec::from_u64(value, 4)),
+            kind: AssignKind::Blocking,
             span: Span::DUMMY,
         }
     }
@@ -1783,6 +1930,7 @@ mod tests {
                 Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: Expr::Literal(LogicVec::from_u64(0, 4)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 },
                 Statement::Delay {
@@ -1790,6 +1938,7 @@ mod tests {
                     body: Box::new(Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(0)),
                         value: Expr::Literal(LogicVec::from_u64(1, 4)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     }),
                     span: Span::DUMMY,
@@ -1881,5 +2030,393 @@ mod tests {
         let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
         // Should suspend, not finish
         assert!(matches!(result, ExecResult::Suspend { .. }));
+    }
+
+    // ---- blocking overlay / non-blocking assignment tests ----
+
+    /// Creates `n` 8-bit signals (IR ids 0..n) with the given initial values.
+    fn setup_byte_signals(
+        values: &[u64],
+    ) -> (
+        Arena<SimSignalId, SimSignalState>,
+        HashMap<SignalId, SimSignalId>,
+        TypeDb,
+    ) {
+        let mut signals = Arena::<SimSignalId, SimSignalState>::new();
+        let mut map = HashMap::new();
+        for (i, &v) in values.iter().enumerate() {
+            let id = signals.alloc(SimSignalState::new(
+                format!("s{i}"),
+                8,
+                LogicVec::from_u64(v, 8),
+            ));
+            map.insert(SignalId::from_raw(i as u32), id);
+        }
+        (signals, map, TypeDb::new())
+    }
+
+    fn sig(i: u32) -> SignalRef {
+        SignalRef::Signal(SignalId::from_raw(i))
+    }
+
+    fn read(i: u32) -> Expr {
+        Expr::Signal(sig(i))
+    }
+
+    fn assign(target: SignalRef, value: Expr, kind: AssignKind) -> Statement {
+        Statement::Assign {
+            target,
+            value,
+            kind,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn block(stmts: Vec<Statement>) -> Statement {
+        Statement::Block {
+            stmts,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// Runs `stmt` as one process segment, returning its updates and output.
+    fn run_segment(ctx: &EvalContext<'_>, stmt: &Statement) -> (Vec<PendingUpdate>, Vec<String>) {
+        let mut pending = Vec::new();
+        let mut display = Vec::new();
+        exec_statement(ctx, stmt, &mut pending, &mut display).unwrap();
+        (pending, display)
+    }
+
+    /// The last update to `target` in `pending`, as `(value, kind)`.
+    fn last_update(
+        pending: &[PendingUpdate],
+        map: &HashMap<SignalId, SimSignalId>,
+        target: u32,
+    ) -> (Option<u64>, AssignKind) {
+        let id = map[&SignalId::from_raw(target)];
+        let u = pending
+            .iter()
+            .rev()
+            .find(|u| u.target == id)
+            .expect("no update for target");
+        (u.value.to_u64(), u.kind)
+    }
+
+    #[test]
+    fn blocking_write_visible_to_next_statement() {
+        // SIM-3: `a = 1; b = a;` must give b = 1, not the stale value.
+        let (mut signals, map, types) = setup_byte_signals(&[0, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(
+                sig(0),
+                Expr::Literal(LogicVec::from_u64(1, 8)),
+                AssignKind::Blocking,
+            ),
+            assign(sig(1), read(0), AssignKind::Blocking),
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        assert_eq!(
+            last_update(&pending, &map, 1),
+            (Some(1), AssignKind::Blocking)
+        );
+        // The committed state itself is untouched; the kernel applies updates.
+        assert_eq!(
+            ctx.signals.get(map[&SignalId::from_raw(0)]).value.to_u64(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn blocking_temp_chain_computes_from_new_temp() {
+        // tmp = x + y; z = tmp;  (x = 3, y = 4)
+        let (mut signals, map, types) = setup_byte_signals(&[3, 4, 0, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let sum = Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(read(0)),
+            rhs: Box::new(read(1)),
+            ty: aion_ir::TypeId::from_raw(0),
+            span: Span::DUMMY,
+        };
+        let stmt = block(vec![
+            assign(sig(2), sum, AssignKind::Blocking),
+            assign(sig(3), read(2), AssignKind::Blocking),
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        assert_eq!(last_update(&pending, &map, 3).0, Some(7));
+    }
+
+    #[test]
+    fn nonblocking_write_not_visible_to_later_reads() {
+        // a <= 5; b = a;  → b reads the old a (2), a's update is NBA.
+        let (mut signals, map, types) = setup_byte_signals(&[2, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(
+                sig(0),
+                Expr::Literal(LogicVec::from_u64(5, 8)),
+                AssignKind::NonBlocking,
+            ),
+            assign(sig(1), read(0), AssignKind::Blocking),
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        assert_eq!(
+            last_update(&pending, &map, 0),
+            (Some(5), AssignKind::NonBlocking)
+        );
+        assert_eq!(
+            last_update(&pending, &map, 1),
+            (Some(2), AssignKind::Blocking)
+        );
+    }
+
+    #[test]
+    fn nonblocking_swap_samples_old_values() {
+        // a <= b; b <= a;  with a = 1, b = 2 → updates a := 2, b := 1.
+        let (mut signals, map, types) = setup_byte_signals(&[1, 2]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(sig(0), read(1), AssignKind::NonBlocking),
+            assign(sig(1), read(0), AssignKind::NonBlocking),
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        assert_eq!(
+            last_update(&pending, &map, 0),
+            (Some(2), AssignKind::NonBlocking)
+        );
+        assert_eq!(
+            last_update(&pending, &map, 1),
+            (Some(1), AssignKind::NonBlocking)
+        );
+    }
+
+    #[test]
+    fn blocking_swap_does_not_swap() {
+        // a = b; b = a;  with a = 1, b = 2 → both end up 2.
+        let (mut signals, map, types) = setup_byte_signals(&[1, 2]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(sig(0), read(1), AssignKind::Blocking),
+            assign(sig(1), read(0), AssignKind::Blocking),
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        assert_eq!(last_update(&pending, &map, 0).0, Some(2));
+        assert_eq!(last_update(&pending, &map, 1).0, Some(2));
+    }
+
+    #[test]
+    fn display_after_blocking_assign_shows_new_value() {
+        let (mut signals, map, types) = setup_byte_signals(&[0, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(
+                sig(0),
+                Expr::Literal(LogicVec::from_u64(9, 8)),
+                AssignKind::Blocking,
+            ),
+            assign(
+                sig(1),
+                Expr::Literal(LogicVec::from_u64(4, 8)),
+                AssignKind::NonBlocking,
+            ),
+            Statement::Display {
+                format: "a=%d b=%d".into(),
+                args: vec![read(0), read(1)],
+                span: Span::DUMMY,
+            },
+        ]);
+        let (_, display) = run_segment(&ctx, &stmt);
+        // a's blocking write is visible; b's non-blocking write is not yet.
+        assert_eq!(display, vec!["a=9 b=0".to_string()]);
+    }
+
+    #[test]
+    fn blocking_write_steers_later_condition() {
+        // a = 1; if (a) b = 7; else b = 8;
+        let (mut signals, map, types) = setup_byte_signals(&[0, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(
+                sig(0),
+                Expr::Literal(LogicVec::from_u64(1, 8)),
+                AssignKind::Blocking,
+            ),
+            Statement::If {
+                condition: read(0),
+                then_body: Box::new(assign(
+                    sig(1),
+                    Expr::Literal(LogicVec::from_u64(7, 8)),
+                    AssignKind::Blocking,
+                )),
+                else_body: Some(Box::new(assign(
+                    sig(1),
+                    Expr::Literal(LogicVec::from_u64(8, 8)),
+                    AssignKind::Blocking,
+                ))),
+                span: Span::DUMMY,
+            },
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        assert_eq!(last_update(&pending, &map, 1).0, Some(7));
+    }
+
+    #[test]
+    fn blocking_partial_writes_visible_to_later_reads() {
+        // x[3:0] = 4'hA; x[7:4] = 4'h5; y = x;  (x starts 0) → y = 0x5A.
+        let (mut signals, map, types) = setup_byte_signals(&[0, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let slice = |high, low| SignalRef::Slice {
+            signal: SignalId::from_raw(0),
+            high,
+            low,
+        };
+        let stmt = block(vec![
+            assign(
+                slice(3, 0),
+                Expr::Literal(LogicVec::from_u64(0xA, 4)),
+                AssignKind::Blocking,
+            ),
+            assign(
+                slice(7, 4),
+                Expr::Literal(LogicVec::from_u64(0x5, 4)),
+                AssignKind::Blocking,
+            ),
+            assign(sig(1), read(0), AssignKind::Blocking),
+            // A slice read also goes through the overlay.
+            assign(sig(1), Expr::Signal(slice(7, 4)), AssignKind::NonBlocking),
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        let y = map[&SignalId::from_raw(1)];
+        let ys: Vec<_> = pending.iter().filter(|u| u.target == y).collect();
+        assert_eq!(ys[0].value.to_u64(), Some(0x5A));
+        assert_eq!(ys[1].value.to_u64(), Some(0x5));
+    }
+
+    #[test]
+    fn blocking_concat_target_visible_to_later_reads() {
+        // {a, b} = 16'h1234; c = a; d = b;  → c = 0x12, d = 0x34.
+        let (mut signals, map, types) = setup_byte_signals(&[0, 0, 0, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(
+                SignalRef::Concat(vec![sig(0), sig(1)]),
+                Expr::Literal(LogicVec::from_u64(0x1234, 16)),
+                AssignKind::Blocking,
+            ),
+            assign(sig(2), read(0), AssignKind::Blocking),
+            assign(sig(3), read(1), AssignKind::Blocking),
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        assert_eq!(last_update(&pending, &map, 2).0, Some(0x12));
+        assert_eq!(last_update(&pending, &map, 3).0, Some(0x34));
+    }
+
+    #[test]
+    fn narrow_blocking_write_is_zero_extended() {
+        // x = 4'hF on an 8-bit x holding 0xA0 → overlay 0x0F: the value is
+        // zero-extended to the signal width, exactly as the kernel commits it.
+        let (mut signals, map, types) = setup_byte_signals(&[0xA0, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(
+                sig(0),
+                Expr::Literal(LogicVec::from_u64(0xF, 4)),
+                AssignKind::Blocking,
+            ),
+            assign(sig(1), read(0), AssignKind::Blocking),
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        assert_eq!(last_update(&pending, &map, 1).0, Some(0x0F));
+    }
+
+    #[test]
+    fn apply_write_full_resizes_to_signal_width() {
+        let current = LogicVec::from_u64(0xA5, 8);
+        // Narrower: zero-extended, width kept.
+        let narrow = apply_write(&current, &LogicVec::from_u64(1, 1), None);
+        assert_eq!((narrow.width(), narrow.to_u64()), (8, Some(1)));
+        // Wider: truncated to the signal width.
+        let wide = apply_write(&current, &LogicVec::from_u64(0x1FF, 12), None);
+        assert_eq!((wide.width(), wide.to_u64()), (8, Some(0xFF)));
+    }
+
+    #[test]
+    fn apply_write_slice_replaces_only_its_bits() {
+        let current = LogicVec::from_u64(0xA5, 8);
+        let v = apply_write(&current, &LogicVec::from_u64(0x3, 4), Some((7, 4)));
+        assert_eq!(v.to_u64(), Some(0x35));
+        // Out-of-range bits are ignored rather than panicking.
+        let v = apply_write(&current, &LogicVec::from_u64(0xF, 4), Some((9, 6)));
+        assert_eq!(v.to_u64(), Some(0xE5));
+    }
+
+    #[test]
+    fn out_of_range_blocking_slice_is_ignored_in_overlay() {
+        // x[11:8] = 4'hF on an 8-bit x must not panic; x reads unchanged.
+        let (mut signals, map, types) = setup_byte_signals(&[0x12, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(
+                SignalRef::Slice {
+                    signal: SignalId::from_raw(0),
+                    high: 11,
+                    low: 8,
+                },
+                Expr::Literal(LogicVec::from_u64(0xF, 4)),
+                AssignKind::Blocking,
+            ),
+            assign(sig(1), read(0), AssignKind::Blocking),
+        ]);
+        let (pending, _) = run_segment(&ctx, &stmt);
+        assert_eq!(last_update(&pending, &map, 1).0, Some(0x12));
+    }
+
+    #[test]
+    fn overlay_does_not_survive_between_segments() {
+        // Each exec_statement call is a fresh segment: without the kernel
+        // committing the first segment's writes, the second sees old state.
+        let (mut signals, map, types) = setup_byte_signals(&[0, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let first = assign(
+            sig(0),
+            Expr::Literal(LogicVec::from_u64(3, 8)),
+            AssignKind::Blocking,
+        );
+        let second = assign(sig(1), read(0), AssignKind::Blocking);
+        run_segment(&ctx, &first);
+        let (pending, _) = run_segment(&ctx, &second);
+        assert_eq!(last_update(&pending, &map, 1).0, Some(0));
+        // eval_expr (no process context) reads committed state only.
+        assert_eq!(eval_expr(&ctx, &read(0)).unwrap().to_u64(), Some(0));
+    }
+
+    #[test]
+    fn blocking_writes_before_delay_are_returned_for_commit() {
+        // a = 4; #1 b = a;  → the segment suspends; a's update is returned
+        // for the kernel to commit, and b's assignment is in the continuation.
+        let (mut signals, map, types) = setup_byte_signals(&[0, 0]);
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let stmt = block(vec![
+            assign(
+                sig(0),
+                Expr::Literal(LogicVec::from_u64(4, 8)),
+                AssignKind::Blocking,
+            ),
+            Statement::Delay {
+                duration_fs: 1,
+                body: Box::new(assign(sig(1), read(0), AssignKind::Blocking)),
+                span: Span::DUMMY,
+            },
+        ]);
+        let mut pending = Vec::new();
+        let mut display = Vec::new();
+        let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
+        assert!(matches!(result, ExecResult::Suspend { .. }));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            last_update(&pending, &map, 0),
+            (Some(4), AssignKind::Blocking)
+        );
     }
 }

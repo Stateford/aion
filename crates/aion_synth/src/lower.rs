@@ -587,6 +587,7 @@ mod tests {
     use super::*;
     use crate::netlist::Netlist;
     use aion_common::Interner;
+    use aion_ir::AssignKind;
     use aion_ir::{
         Arena, Assignment, Edge, EdgeSensitivity, Module, Process, ProcessId, ProcessKind,
         Sensitivity, Signal, SignalId, SignalKind, SignalRef, Statement, Type, TypeDb,
@@ -681,6 +682,7 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(2)),
                 value: Expr::Signal(SignalRef::Signal(SignalId::from_raw(1))),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             span: Span::DUMMY,
@@ -722,11 +724,13 @@ mod tests {
                 then_body: Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(2)),
                     value: Expr::Literal(LogicVec::from_bool(false)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 }),
                 else_body: Some(Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(2)),
                     value: Expr::Signal(SignalRef::Signal(SignalId::from_raw(1))),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 })),
                 span: Span::DUMMY,
@@ -769,11 +773,13 @@ mod tests {
                 then_body: Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(2)),
                     value: Expr::Literal(LogicVec::from_bool(true)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 }),
                 else_body: Some(Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(2)),
                     value: Expr::Literal(LogicVec::from_bool(false)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 })),
                 span: Span::DUMMY,
@@ -808,6 +814,7 @@ mod tests {
                 then_body: Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(2)),
                     value: Expr::Literal(LogicVec::from_bool(true)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 }),
                 else_body: None, // No else — incomplete
@@ -838,6 +845,7 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(2)),
                 value: Expr::Signal(SignalRef::Signal(SignalId::from_raw(0))),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             span: Span::DUMMY,
@@ -867,6 +875,7 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(2)),
                 value: Expr::Literal(LogicVec::from_bool(false)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             span: Span::DUMMY,
@@ -959,6 +968,7 @@ mod tests {
                         body: Statement::Assign {
                             target: SignalRef::Signal(SignalId::from_raw(2)),
                             value: Expr::Literal(LogicVec::from_bool(true)),
+                            kind: AssignKind::Blocking,
                             span: Span::DUMMY,
                         },
                         span: Span::DUMMY,
@@ -968,6 +978,7 @@ mod tests {
                         body: Statement::Assign {
                             target: SignalRef::Signal(SignalId::from_raw(2)),
                             value: Expr::Literal(LogicVec::from_bool(false)),
+                            kind: AssignKind::Blocking,
                             span: Span::DUMMY,
                         },
                         span: Span::DUMMY,
@@ -976,6 +987,7 @@ mod tests {
                 default: Some(Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(2)),
                     value: Expr::Literal(LogicVec::from_bool(false)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 })),
                 span: Span::DUMMY,
@@ -1017,11 +1029,13 @@ mod tests {
                     Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(2)),
                         value: Expr::Literal(LogicVec::from_bool(true)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                     Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(2)),
                         value: Expr::Literal(LogicVec::from_bool(false)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                 ],
@@ -1050,16 +1064,19 @@ mod tests {
                 Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: Expr::Literal(LogicVec::from_bool(true)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 },
                 Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: Expr::Literal(LogicVec::from_bool(false)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 },
                 Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(1)),
                     value: Expr::Literal(LogicVec::from_bool(true)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 },
             ],
@@ -1163,11 +1180,13 @@ mod tests {
                     Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(2)),
                         value: Expr::Signal(SignalRef::Signal(SignalId::from_raw(0))),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                     Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(3)),
                         value: Expr::Literal(LogicVec::from_u64(0, 8)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                 ],
@@ -1204,6 +1223,7 @@ mod tests {
                 then_body: Box::new(Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(2)),
                     value: Expr::Literal(LogicVec::from_bool(true)),
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 }),
                 else_body: None,

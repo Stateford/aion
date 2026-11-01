@@ -11,12 +11,12 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use aion_common::{Interner, Logic, LogicVec};
 use aion_ir::arena::Arena;
 use aion_ir::{
-    CellKind, ConstValue, Design, Edge, Expr, ModuleId, Process, ProcessKind, Sensitivity,
-    SignalId, SignalKind, SignalRef, Statement, TypeDb,
+    AssignKind, CellKind, ConstValue, Design, Edge, Expr, ModuleId, Process, ProcessKind,
+    Sensitivity, SignalId, SignalKind, SignalRef, Statement, TypeDb,
 };
 
 use crate::error::SimError;
-use crate::evaluator::{exec_statement, EvalContext, ExecResult, PendingUpdate};
+use crate::evaluator::{apply_write, exec_statement, EvalContext, ExecResult, PendingUpdate};
 use crate::time::SimTime;
 use crate::value::{DriveStrength, SimSignalId, SimSignalState};
 use crate::waveform::WaveformRecorder;
@@ -163,6 +163,14 @@ pub struct SimKernel {
     /// Holds at most one entry per process: a suspended process is not
     /// re-triggered by its sensitivity list until it resumes and completes.
     suspended_processes: Vec<(SimTime, SuspendedProcess)>,
+    /// Non-blocking assignment (NBA) region: updates from `<=` assignments
+    /// made at the current time, in execution order.
+    ///
+    /// They are applied by [`apply_nba_region`](Self::apply_nba_region) only
+    /// once no active work (signal events or due wakeups) remains at the
+    /// current timestamp, matching the IEEE 1364/1800 region order.
+    nba_queue: Vec<PendingUpdate>,
+
     /// Whether the time-0 start (initial blocks plus the initial
     /// combinational pass) has run; shared by `initialize()`, `run()`,
     /// `run_to_completion()` and `run_until()` so it happens exactly once.
@@ -199,6 +207,8 @@ impl SimKernel {
             max_delta_per_step: 10_000,
             total_deltas: 0,
             suspended_processes: Vec::new(),
+            nba_queue: Vec::new(),
+
             initialized: false,
             waveform_started: false,
         };
@@ -282,7 +292,19 @@ impl SimKernel {
     }
 
     /// Executes a single delta-cycle step.
+    ///
+    /// If no signal events remain at the current time but non-blocking
+    /// updates are waiting, the NBA region is applied first, so this step
+    /// processes those updates.
     pub fn step_delta(&mut self) -> Result<StepResult, SimError> {
+        if self
+            .event_queue
+            .peek()
+            .is_none_or(|e| e.0.time.fs != self.current_time.fs)
+        {
+            self.flush_nba_queue();
+        }
+
         if self.event_queue.is_empty() {
             return Ok(StepResult::Done);
         }
@@ -414,6 +436,9 @@ impl SimKernel {
             let proc_body = Statement::Assign {
                 target: assignment.target.clone(),
                 value: assignment.value.clone(),
+                // Continuous assignments update in the active region, like
+                // a blocking assignment in a single-statement process.
+                kind: AssignKind::Blocking,
                 span: assignment.span,
             };
             let read_sigs = collect_expr_read_signals(&assignment.value, &signal_map);
@@ -756,6 +781,9 @@ impl SimKernel {
         // Phase 3: Event loop — process events and wakeups
         let mut deltas_at_current_time = 0u32;
         while !self.finished {
+            // NBA region: once the active region at this time has drained.
+            self.apply_nba_region();
+
             // Determine next event time: min(event_queue, suspended wakeups)
             let next_event_time = self.event_queue.peek().map(|e| e.0.time.fs);
             let next_wakeup_time = self.next_wakeup_time();
@@ -783,8 +811,14 @@ impl SimKernel {
                 deltas_at_current_time = 0;
             }
 
-            // Process suspended wakeups at this time (before events)
-            self.process_wakeups(next_time_fs)?;
+            // Process suspended wakeups at this time (before events), unless
+            // signal events are already due now (see `wakeups_may_run`).
+            if self.wakeups_may_run(next_time_fs) {
+                self.process_wakeups(next_time_fs)?;
+                // Wakeups that only made non-blocking writes leave no active
+                // events, so their NBA region is applied in this iteration.
+                self.apply_nba_region();
+            }
 
             // Process signal events at this time
             let step = if self
@@ -977,7 +1011,75 @@ impl SimKernel {
     /// produce separate [`PendingUpdate`] entries. Without merging, each update reads the
     /// current signal value independently, so only the last update's bit survives. This
     /// method accumulates all partial writes into a single merged value per signal.
+    ///
+    /// Only blocking updates are scheduled at `time`. Non-blocking updates
+    /// are moved to the NBA queue instead (see
+    /// [`apply_nba_region`](Self::apply_nba_region)); their merge base is the
+    /// signal value when the NBA region runs, not the value now.
     fn merge_and_schedule(&mut self, updates: Vec<PendingUpdate>, time: SimTime) {
+        let (nonblocking, blocking): (Vec<_>, Vec<_>) = updates
+            .into_iter()
+            .partition(|u| u.kind == AssignKind::NonBlocking);
+        self.nba_queue.extend(nonblocking);
+        self.schedule_merged(blocking, time);
+    }
+
+    /// Returns `true` if signal events or suspended-process wakeups are due
+    /// at or before the current time, i.e. the active (or inactive) region
+    /// of the current time step still has work.
+    fn has_active_work_now(&self) -> bool {
+        let now = self.current_time.fs;
+        self.event_queue.peek().is_some_and(|e| e.0.time.fs <= now)
+            || self.suspended_processes.iter().any(|(t, _)| t.fs <= now)
+    }
+
+    /// Applies the NBA region if it is due.
+    ///
+    /// Non-blocking updates collected at the current time are applied only
+    /// after every active event and zero-delay wakeup at this time has run,
+    /// so all processes triggered by the same edge read the old values. The
+    /// updates are scheduled as events in the next delta (in execution
+    /// order, merging partial writes), so applying them goes through
+    /// `step_delta()`: changes trigger sensitive processes and the delta
+    /// counts against the per-time-step limit like any other delta cycle.
+    ///
+    /// Returns `true` if the NBA region was applied.
+    fn apply_nba_region(&mut self) -> bool {
+        if self.nba_queue.is_empty() || self.has_active_work_now() {
+            return false;
+        }
+        self.flush_nba_queue();
+        true
+    }
+
+    /// Unconditionally schedules every queued non-blocking update as an event
+    /// in the next delta of the current time.
+    fn flush_nba_queue(&mut self) {
+        if self.nba_queue.is_empty() {
+            return;
+        }
+        let updates = std::mem::take(&mut self.nba_queue);
+        let next_delta = self.current_time.next_delta();
+        self.schedule_merged(updates, next_delta);
+    }
+
+    /// Returns `true` if suspended processes may be resumed at `time_fs` in
+    /// this scheduler iteration.
+    ///
+    /// Signal events already due at `time_fs` (e.g. blocking writes made just
+    /// before a `#0`) are processed first, so a zero-delay resume runs in the
+    /// inactive region after the active events and sees every committed
+    /// blocking write, as IEEE 1364 requires.
+    fn wakeups_may_run(&self, time_fs: u64) -> bool {
+        !self
+            .event_queue
+            .peek()
+            .is_some_and(|e| e.0.time.fs <= time_fs)
+    }
+
+    /// Merges updates per target signal and schedules one event per signal
+    /// at `time`, regardless of their [`AssignKind`].
+    fn schedule_merged(&mut self, updates: Vec<PendingUpdate>, time: SimTime) {
         // Use a Vec of (SimSignalId, LogicVec) to preserve insertion order
         let mut merged: Vec<(SimSignalId, LogicVec)> = Vec::new();
         let mut index_map: HashMap<SimSignalId, usize> = HashMap::new();
@@ -986,29 +1088,12 @@ impl SimKernel {
             if let Some(&idx) = index_map.get(&update.target) {
                 // Merge into existing entry
                 let (_, ref mut val) = merged[idx];
-                if let Some((high, low)) = update.range {
-                    for i in 0..(high - low + 1) {
-                        if i < update.value.width() {
-                            val.set(low + i, update.value.get(i));
-                        }
-                    }
-                } else {
-                    *val = update.value;
-                }
+                *val = apply_write(val, &update.value, update.range);
             } else {
-                // New signal — start from current value and apply update
-                let base = if let Some((high, low)) = update.range {
-                    let sig = self.signals.get(update.target);
-                    let mut merged_val = sig.value.clone();
-                    for i in 0..(high - low + 1) {
-                        if i < update.value.width() {
-                            merged_val.set(low + i, update.value.get(i));
-                        }
-                    }
-                    merged_val
-                } else {
-                    update.value
-                };
+                // New signal — start from current value and apply update,
+                // resized to the signal's width (see `apply_write`).
+                let current = &self.signals.get(update.target).value;
+                let base = apply_write(current, &update.value, update.range);
                 index_map.insert(update.target, merged.len());
                 merged.push((update.target, base));
             }
@@ -1025,17 +1110,18 @@ impl SimKernel {
     }
 
     /// Applies an update immediately (for initial blocks).
+    ///
+    /// Non-blocking updates are not applied here: they go to the NBA queue
+    /// and take effect in the NBA region of time 0.
     fn apply_update_immediate(&mut self, update: &PendingUpdate) {
-        let sig = self.signals.get_mut(update.target);
-        if let Some((high, low)) = update.range {
-            for i in 0..(high - low + 1) {
-                if i < update.value.width() {
-                    sig.value.set(low + i, update.value.get(i));
-                }
-            }
-        } else {
-            sig.value = update.value.clone();
+        if update.kind == AssignKind::NonBlocking {
+            self.nba_queue.push(update.clone());
+            return;
         }
+        // Resize to the signal's width: `reg [7:0] c; initial c = 0;` must
+        // keep `c` 8 bits wide, not adopt the literal's width.
+        let sig = self.signals.get_mut(update.target);
+        sig.value = apply_write(&sig.value, &update.value, update.range);
     }
 
     /// Returns all signal names and their flat IDs.
@@ -1048,9 +1134,12 @@ impl SimKernel {
             .collect()
     }
 
-    /// Returns whether the simulation has pending events in the queue or suspended processes.
+    /// Returns whether the simulation has pending events in the queue, suspended
+    /// processes, or non-blocking updates waiting for the NBA region.
     pub fn has_pending_events(&self) -> bool {
-        !self.event_queue.is_empty() || !self.suspended_processes.is_empty()
+        !self.event_queue.is_empty()
+            || !self.suspended_processes.is_empty()
+            || !self.nba_queue.is_empty()
     }
 
     /// Returns whether the simulation has been terminated by `$finish`.
@@ -1104,6 +1193,9 @@ impl SimKernel {
         let mut deltas_at_current_time = 0u32;
 
         while !self.finished {
+            // NBA region: once the active region at this time has drained.
+            self.apply_nba_region();
+
             let next_event_time = self.event_queue.peek().map(|e| e.0.time.fs);
             let next_wakeup_time = self.next_wakeup_time();
             let next_time_fs = match (next_event_time, next_wakeup_time) {
@@ -1132,8 +1224,14 @@ impl SimKernel {
                 deltas_at_current_time = 0;
             }
 
-            // Process suspended wakeups at this time (before events)
-            self.process_wakeups(next_time_fs)?;
+            // Process suspended wakeups at this time (before events), unless
+            // signal events are already due now (see `wakeups_may_run`).
+            if self.wakeups_may_run(next_time_fs) {
+                self.process_wakeups(next_time_fs)?;
+                // Wakeups that only made non-blocking writes leave no active
+                // events, so their NBA region is applied in this iteration.
+                self.apply_nba_region();
+            }
 
             // Process signal events at this time
             let step = if self
@@ -1161,8 +1259,13 @@ impl SimKernel {
 
     /// Returns the earliest time at which a pending event or wakeup is scheduled.
     ///
-    /// Returns `None` if no events or wakeups are pending.
+    /// Waiting non-blocking updates count as work at the current time.
+    /// Returns `None` if no events, wakeups or non-blocking updates are
+    /// pending.
     pub fn next_event_time_fs(&self) -> Option<u64> {
+        if !self.nba_queue.is_empty() {
+            return Some(self.current_time.fs);
+        }
         let next_event = self.event_queue.peek().map(|e| e.0.time.fs);
         let next_wakeup = self.next_wakeup_time();
         match (next_event, next_wakeup) {
@@ -1585,6 +1688,7 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Literal(LogicVec::from_bool(true)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::All,
@@ -1731,6 +1835,7 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(1)),
                 value: Expr::Literal(LogicVec::from_bool(true)),
+                kind: AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::EdgeList(vec![EdgeSensitivity {
@@ -2008,6 +2113,7 @@ mod tests {
                         body: Box::new(Statement::Assign {
                             target: SignalRef::Signal(SignalId::from_raw(0)),
                             value: Expr::Literal(LogicVec::from_bool(true)),
+                            kind: AssignKind::Blocking,
                             span: Span::DUMMY,
                         }),
                         span: Span::DUMMY,
@@ -2065,6 +2171,7 @@ mod tests {
                     Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(0)),
                         value: Expr::Literal(LogicVec::from_bool(false)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                     Statement::Forever {
@@ -2080,6 +2187,7 @@ mod tests {
                                     ty: bit_ty,
                                     span: Span::DUMMY,
                                 },
+                                kind: AssignKind::Blocking,
                                 span: Span::DUMMY,
                             }),
                             span: Span::DUMMY,
@@ -2176,6 +2284,7 @@ mod tests {
                         ty: bit_ty,
                         span: Span::DUMMY,
                     },
+                    kind: AssignKind::Blocking,
                     span: Span::DUMMY,
                 }),
                 span: Span::DUMMY,
@@ -2384,6 +2493,7 @@ mod tests {
                                 ty: bit_ty,
                                 span: Span::DUMMY,
                             },
+                            kind: AssignKind::Blocking,
                             span: Span::DUMMY,
                         }),
                         span: Span::DUMMY,
@@ -2442,6 +2552,7 @@ mod tests {
                     Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(0)),
                         value: Expr::Literal(LogicVec::from_bool(false)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                     Statement::Delay {
@@ -2449,6 +2560,7 @@ mod tests {
                         body: Box::new(Statement::Assign {
                             target: SignalRef::Signal(SignalId::from_raw(0)),
                             value: Expr::Literal(LogicVec::from_bool(true)),
+                            kind: AssignKind::Blocking,
                             span: Span::DUMMY,
                         }),
                         span: Span::DUMMY,
@@ -2521,6 +2633,7 @@ mod tests {
                     Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(0)),
                         value: Expr::Literal(LogicVec::from_bool(false)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                     Statement::Forever {
@@ -2536,6 +2649,7 @@ mod tests {
                                     ty: bit_ty,
                                     span: Span::DUMMY,
                                 },
+                                kind: AssignKind::Blocking,
                                 span: Span::DUMMY,
                             }),
                             span: Span::DUMMY,
@@ -2559,6 +2673,7 @@ mod tests {
                     Statement::Assign {
                         target: SignalRef::Signal(SignalId::from_raw(1)),
                         value: Expr::Literal(LogicVec::from_bool(false)),
+                        kind: AssignKind::Blocking,
                         span: Span::DUMMY,
                     },
                     Statement::Delay {
@@ -2566,6 +2681,7 @@ mod tests {
                         body: Box::new(Statement::Assign {
                             target: SignalRef::Signal(SignalId::from_raw(1)),
                             value: Expr::Literal(LogicVec::from_bool(true)),
+                            kind: AssignKind::Blocking,
                             span: Span::DUMMY,
                         }),
                         span: Span::DUMMY,
@@ -2647,6 +2763,700 @@ mod tests {
         assert_eq!(kernel.suspended_processes[0].0.fs, 50_000_000);
     }
 
+    /// Blocking vs non-blocking assignment scheduling (active / NBA regions).
+    mod regions {
+        use super::*;
+        use crate::time::FS_PER_NS;
+
+        /// One test signal: name, width, initial value (`None` = X).
+        type SigSpec<'a> = (&'a str, u32, Option<u64>);
+
+        /// A process: kind, sensitivity, body.
+        type ProcSpec = (ProcessKind, Sensitivity, Statement);
+
+        /// Builds a single-module design named `top` whose IR signal `i` is
+        /// `sigs[i]`, with the given processes and continuous assignments.
+        fn build(
+            sigs: &[SigSpec<'_>],
+            procs: Vec<ProcSpec>,
+            assigns: Vec<(SignalRef, Expr)>,
+        ) -> (Design, Interner) {
+            let interner = Interner::new();
+            let mut types = TypeDb::new();
+            let mut top = empty_module(0, interner.get_or_intern("top"));
+            for (i, &(name, width, init)) in sigs.iter().enumerate() {
+                let ty = if width == 1 {
+                    types.intern(Type::Bit)
+                } else {
+                    types.intern(Type::BitVec {
+                        width,
+                        signed: false,
+                    })
+                };
+                top.signals.alloc(Signal {
+                    id: SignalId::from_raw(i as u32),
+                    name: interner.get_or_intern(name),
+                    ty,
+                    kind: SignalKind::Reg,
+                    init: init.map(|v| ConstValue::Logic(LogicVec::from_u64(v, width))),
+                    clock_domain: None,
+                    span: Span::DUMMY,
+                });
+            }
+            for (i, (kind, sensitivity, body)) in procs.into_iter().enumerate() {
+                top.processes.alloc(aion_ir::Process {
+                    id: aion_ir::ProcessId::from_raw(i as u32),
+                    name: None,
+                    kind,
+                    body,
+                    sensitivity,
+                    span: Span::DUMMY,
+                });
+            }
+            for (target, value) in assigns {
+                top.assignments.push(Assignment {
+                    target,
+                    value,
+                    span: Span::DUMMY,
+                });
+            }
+            let mut modules = Arena::new();
+            modules.alloc(top);
+            let design = Design {
+                modules,
+                top: ModuleId::from_raw(0),
+                types,
+                source_map: aion_ir::SourceMap::new(),
+            };
+            (design, interner)
+        }
+
+        fn s(i: u32) -> SignalRef {
+            SignalRef::Signal(SignalId::from_raw(i))
+        }
+
+        fn slice(i: u32, high: u32, low: u32) -> SignalRef {
+            SignalRef::Slice {
+                signal: SignalId::from_raw(i),
+                high,
+                low,
+            }
+        }
+
+        fn rd(i: u32) -> Expr {
+            Expr::Signal(s(i))
+        }
+
+        fn lit(v: u64, w: u32) -> Expr {
+            Expr::Literal(LogicVec::from_u64(v, w))
+        }
+
+        fn add(a: Expr, b: Expr) -> Expr {
+            Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(a),
+                rhs: Box::new(b),
+                ty: aion_ir::TypeId::from_raw(0),
+                span: Span::DUMMY,
+            }
+        }
+
+        fn not(e: Expr) -> Expr {
+            Expr::Unary {
+                op: aion_ir::UnaryOp::Not,
+                operand: Box::new(e),
+                ty: aion_ir::TypeId::from_raw(0),
+                span: Span::DUMMY,
+            }
+        }
+
+        /// Blocking assignment `target = value`.
+        fn ba(target: SignalRef, value: Expr) -> Statement {
+            Statement::Assign {
+                target,
+                value,
+                kind: AssignKind::Blocking,
+                span: Span::DUMMY,
+            }
+        }
+
+        /// Non-blocking assignment `target <= value`.
+        fn nb(target: SignalRef, value: Expr) -> Statement {
+            Statement::Assign {
+                target,
+                value,
+                kind: AssignKind::NonBlocking,
+                span: Span::DUMMY,
+            }
+        }
+
+        fn blk(stmts: Vec<Statement>) -> Statement {
+            Statement::Block {
+                stmts,
+                span: Span::DUMMY,
+            }
+        }
+
+        /// `#ns body`.
+        fn dly(ns: u64, body: Statement) -> Statement {
+            Statement::Delay {
+                duration_fs: ns * FS_PER_NS,
+                body: Box::new(body),
+                span: Span::DUMMY,
+            }
+        }
+
+        fn initial(body: Statement) -> ProcSpec {
+            (ProcessKind::Initial, Sensitivity::All, body)
+        }
+
+        /// `always @(posedge sig) body`.
+        fn at_posedge(sig: u32, body: Statement) -> ProcSpec {
+            (
+                ProcessKind::Sequential,
+                Sensitivity::EdgeList(vec![EdgeSensitivity {
+                    signal: SignalId::from_raw(sig),
+                    edge: Edge::Posedge,
+                }]),
+                body,
+            )
+        }
+
+        /// A clock generator on signal `clk`: `clk = 0;` then a rising edge
+        /// every 10 ns (at 5, 15, 25, ...) for `edges` edges.
+        fn clock(clk: u32, edges: u64) -> ProcSpec {
+            let mut body = Statement::Nop;
+            for _ in 0..edges {
+                body = dly(
+                    5,
+                    blk(vec![
+                        ba(s(clk), lit(1, 1)),
+                        dly(5, blk(vec![ba(s(clk), lit(0, 1)), body])),
+                    ]),
+                );
+            }
+            initial(blk(vec![ba(s(clk), lit(0, 1)), body]))
+        }
+
+        fn run(design: &Design, interner: &Interner) -> (SimKernel, SimResult) {
+            let mut kernel = SimKernel::new(design, interner).unwrap();
+            let result = kernel.run_to_completion().unwrap();
+            (kernel, result)
+        }
+
+        fn val(kernel: &SimKernel, name: &str) -> Option<u64> {
+            let id = kernel
+                .find_signal(&format!("top.{name}"))
+                .unwrap_or_else(|| panic!("no signal {name}"));
+            kernel.signal_value(id).to_u64()
+        }
+
+        #[test]
+        fn sim3_blocking_write_visible_in_same_initial() {
+            // initial begin a = 1; b = a; end  → a = 1, b = 1 (was X).
+            let (design, interner) = build(
+                &[("a", 1, None), ("b", 1, None)],
+                vec![initial(blk(vec![ba(s(0), lit(1, 1)), ba(s(1), rd(0))]))],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "a"), Some(1));
+            assert_eq!(val(&kernel, "b"), Some(1));
+        }
+
+        #[test]
+        fn blocking_temp_chain_in_clocked_process() {
+            // always @(posedge clk) begin tmp = x + y; z = tmp; end
+            let (design, interner) = build(
+                &[
+                    ("clk", 1, None),
+                    ("x", 8, Some(3)),
+                    ("y", 8, Some(4)),
+                    ("tmp", 8, None),
+                    ("z", 8, None),
+                ],
+                vec![
+                    clock(0, 1),
+                    at_posedge(0, blk(vec![ba(s(3), add(rd(1), rd(2))), ba(s(4), rd(3))])),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "tmp"), Some(7));
+            assert_eq!(val(&kernel, "z"), Some(7));
+        }
+
+        #[test]
+        fn nonblocking_swap_on_posedge() {
+            // always @(posedge clk) begin a <= b; b <= a; end
+            let (design, interner) = build(
+                &[("clk", 1, None), ("a", 8, Some(1)), ("b", 8, Some(2))],
+                vec![
+                    clock(0, 1),
+                    at_posedge(0, blk(vec![nb(s(1), rd(2)), nb(s(2), rd(1))])),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "a"), Some(2));
+            assert_eq!(val(&kernel, "b"), Some(1));
+        }
+
+        #[test]
+        fn blocking_swap_does_not_swap() {
+            // always @(posedge clk) begin a = b; b = a; end
+            let (design, interner) = build(
+                &[("clk", 1, None), ("a", 8, Some(1)), ("b", 8, Some(2))],
+                vec![
+                    clock(0, 1),
+                    at_posedge(0, blk(vec![ba(s(1), rd(2)), ba(s(2), rd(1))])),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "a"), Some(2));
+            assert_eq!(val(&kernel, "b"), Some(2));
+        }
+
+        /// d -> q1 -> q2 shift register built from two `<=` processes,
+        /// listed in the given order; returns (q1, q2) after `edges` edges.
+        fn shift_register(stage1_first: bool, edges: u64) -> (Option<u64>, Option<u64>) {
+            let stage1 = at_posedge(0, nb(s(2), rd(1)));
+            let stage2 = at_posedge(0, nb(s(3), rd(2)));
+            let procs = if stage1_first {
+                vec![clock(0, edges), stage1, stage2]
+            } else {
+                vec![clock(0, edges), stage2, stage1]
+            };
+            let (design, interner) = build(
+                &[
+                    ("clk", 1, None),
+                    ("d", 1, Some(1)),
+                    ("q1", 1, Some(0)),
+                    ("q2", 1, Some(0)),
+                ],
+                procs,
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            (val(&kernel, "q1"), val(&kernel, "q2"))
+        }
+
+        #[test]
+        fn nba_shift_register_is_process_order_independent() {
+            for stage1_first in [true, false] {
+                assert_eq!(
+                    shift_register(stage1_first, 1),
+                    (Some(1), Some(0)),
+                    "one edge, stage1_first = {stage1_first}"
+                );
+                assert_eq!(
+                    shift_register(stage1_first, 2),
+                    (Some(1), Some(1)),
+                    "two edges, stage1_first = {stage1_first}"
+                );
+            }
+        }
+
+        #[test]
+        fn nba_waits_for_active_region_to_drain() {
+            // assign clk2 = clk;
+            // always @(posedge clk)  q1 <= d;
+            // always @(posedge clk2) q2 <= q1;
+            // clk2 rises one delta after clk, but q1's NBA must not be
+            // applied before then: q2 samples the old q1, as in IEEE 1364.
+            let (design, interner) = build(
+                &[
+                    ("clk", 1, None),
+                    ("clk2", 1, Some(0)),
+                    ("d", 1, Some(1)),
+                    ("q1", 1, Some(0)),
+                    ("q2", 1, Some(0)),
+                ],
+                vec![
+                    clock(0, 1),
+                    at_posedge(0, nb(s(3), rd(2))),
+                    at_posedge(1, nb(s(4), rd(3))),
+                ],
+                vec![(s(1), rd(0))],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "clk2"), Some(0));
+            assert_eq!(val(&kernel, "q1"), Some(1));
+            assert_eq!(val(&kernel, "q2"), Some(0), "q2 must sample the old q1");
+        }
+
+        #[test]
+        fn nba_rhs_is_sampled_when_the_statement_runs() {
+            // always @(posedge clk) begin a <= b; b = 9; end
+            // a gets b's value at the `<=` (2), not the later blocking 9.
+            let (design, interner) = build(
+                &[("clk", 1, None), ("a", 8, Some(0)), ("b", 8, Some(2))],
+                vec![
+                    clock(0, 1),
+                    at_posedge(0, blk(vec![nb(s(1), rd(2)), ba(s(2), lit(9, 8))])),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "a"), Some(2));
+            assert_eq!(val(&kernel, "b"), Some(9));
+        }
+
+        #[test]
+        fn nonblocking_write_not_visible_later_in_same_process() {
+            // initial #1 begin a <= 5; b = a; end  → b reads the old a.
+            let (design, interner) = build(
+                &[("a", 8, Some(1)), ("b", 8, None)],
+                vec![initial(dly(
+                    1,
+                    blk(vec![nb(s(0), lit(5, 8)), ba(s(1), rd(0))]),
+                ))],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "a"), Some(5));
+            assert_eq!(val(&kernel, "b"), Some(1));
+        }
+
+        #[test]
+        fn display_after_blocking_assign_shows_new_value() {
+            // initial #1 begin a = 9; b <= 4; $display("a=%d b=%d", a, b); end
+            let display = Statement::Display {
+                format: "a=%d b=%d".into(),
+                args: vec![rd(0), rd(1)],
+                span: Span::DUMMY,
+            };
+            let (design, interner) = build(
+                &[("a", 8, Some(0)), ("b", 8, Some(0))],
+                vec![initial(dly(
+                    1,
+                    blk(vec![ba(s(0), lit(9, 8)), nb(s(1), lit(4, 8)), display]),
+                ))],
+                vec![],
+            );
+            let (_, result) = run(&design, &interner);
+            assert_eq!(result.display_output, vec!["a=9 b=0".to_string()]);
+        }
+
+        #[test]
+        fn blocking_writes_committed_before_delayed_resume() {
+            // P1: initial #2 begin a = 5; #1 b = a; end
+            // P2: initial #5 c = a;
+            // After P1's delay its earlier write is committed for everyone.
+            let (design, interner) = build(
+                &[("a", 8, Some(0)), ("b", 8, None), ("c", 8, None)],
+                vec![
+                    initial(dly(
+                        2,
+                        blk(vec![ba(s(0), lit(5, 8)), dly(1, ba(s(1), rd(0)))]),
+                    )),
+                    initial(dly(5, ba(s(2), rd(0)))),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "b"), Some(5));
+            assert_eq!(val(&kernel, "c"), Some(5));
+        }
+
+        #[test]
+        fn zero_delay_resume_sees_active_region_results() {
+            // assign w = a;
+            // initial #5 begin a = 7; #0 b = w; end
+            // `#0` resumes in the inactive region, after w has followed a.
+            let (design, interner) = build(
+                &[("a", 8, Some(0)), ("w", 8, None), ("b", 8, None)],
+                vec![initial(dly(
+                    5,
+                    blk(vec![
+                        ba(s(0), lit(7, 8)),
+                        Statement::Delay {
+                            duration_fs: 0,
+                            body: Box::new(ba(s(2), rd(1))),
+                            span: Span::DUMMY,
+                        },
+                    ]),
+                ))],
+                vec![(s(1), rd(0))],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "w"), Some(7));
+            assert_eq!(val(&kernel, "b"), Some(7));
+        }
+
+        #[test]
+        fn partial_blocking_writes_visible_and_committed() {
+            // initial #1 begin x[3:0] = 4'hA; x[7:4] = 4'h5; y = x; end
+            let (design, interner) = build(
+                &[("x", 8, Some(0)), ("y", 8, None)],
+                vec![initial(dly(
+                    1,
+                    blk(vec![
+                        ba(slice(0, 3, 0), lit(0xA, 4)),
+                        ba(slice(0, 7, 4), lit(0x5, 4)),
+                        ba(s(1), rd(0)),
+                    ]),
+                ))],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "x"), Some(0x5A));
+            assert_eq!(val(&kernel, "y"), Some(0x5A));
+        }
+
+        #[test]
+        fn concat_blocking_target_visible_and_committed() {
+            // initial #1 begin {a, b} = 16'h1234; c = a; end
+            let (design, interner) = build(
+                &[("a", 8, Some(0)), ("b", 8, Some(0)), ("c", 8, None)],
+                vec![initial(dly(
+                    1,
+                    blk(vec![
+                        ba(SignalRef::Concat(vec![s(0), s(1)]), lit(0x1234, 16)),
+                        ba(s(2), rd(0)),
+                    ]),
+                ))],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "a"), Some(0x12));
+            assert_eq!(val(&kernel, "b"), Some(0x34));
+            assert_eq!(val(&kernel, "c"), Some(0x12));
+        }
+
+        #[test]
+        fn partial_nonblocking_writes_merge() {
+            // always @(posedge clk) begin x[3:0] <= 4'hA; x[7:4] <= 4'h5; end
+            let (design, interner) = build(
+                &[("clk", 1, None), ("x", 8, Some(0))],
+                vec![
+                    clock(0, 1),
+                    at_posedge(
+                        0,
+                        blk(vec![
+                            nb(slice(1, 3, 0), lit(0xA, 4)),
+                            nb(slice(1, 7, 4), lit(0x5, 4)),
+                        ]),
+                    ),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "x"), Some(0x5A));
+        }
+
+        #[test]
+        fn last_nonblocking_write_wins() {
+            // always @(posedge clk) begin a <= 1; a <= 2; end
+            let (design, interner) = build(
+                &[("clk", 1, None), ("a", 8, Some(0))],
+                vec![
+                    clock(0, 1),
+                    at_posedge(0, blk(vec![nb(s(1), lit(1, 8)), nb(s(1), lit(2, 8))])),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "a"), Some(2));
+        }
+
+        #[test]
+        fn nonblocking_in_initial_applies_and_triggers_at_time_zero() {
+            // initial a <= 1;   always @(posedge a) b = 3;
+            let (design, interner) = build(
+                &[("a", 1, Some(0)), ("b", 8, Some(0))],
+                vec![
+                    initial(nb(s(0), lit(1, 1))),
+                    at_posedge(0, ba(s(1), lit(3, 8))),
+                ],
+                vec![],
+            );
+            let (kernel, result) = run(&design, &interner);
+            assert_eq!(val(&kernel, "a"), Some(1));
+            assert_eq!(val(&kernel, "b"), Some(3));
+            assert_eq!(result.final_time.fs, 0);
+        }
+
+        /// `always @(a) a <= ~a;` kicked by an event at 1 ns: every NBA
+        /// application re-triggers the process at the same time.
+        fn nba_oscillator() -> (Design, Interner) {
+            build(
+                &[("a", 1, Some(0))],
+                vec![(
+                    ProcessKind::Sequential,
+                    Sensitivity::SignalList(vec![SignalId::from_raw(0)]),
+                    nb(s(0), not(rd(0))),
+                )],
+                vec![],
+            )
+        }
+
+        #[test]
+        fn nba_oscillation_hits_delta_limit() {
+            let (design, interner) = nba_oscillator();
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            kernel.set_max_delta(50);
+            let a = kernel.find_signal("top.a").unwrap();
+            kernel.schedule_event(SimTime::from_ns(1), a, LogicVec::from_bool(true));
+            let err = kernel.run_to_completion().unwrap_err();
+            assert!(
+                matches!(err, SimError::DeltaCycleLimit { fs, max_deltas: 50 } if fs == FS_PER_NS),
+                "unexpected: {err:?}"
+            );
+        }
+
+        #[test]
+        fn nba_oscillation_hits_delta_limit_in_run_until() {
+            let (design, interner) = nba_oscillator();
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            kernel.set_max_delta(50);
+            kernel.initialize().unwrap();
+            let a = kernel.find_signal("top.a").unwrap();
+            kernel.schedule_event(SimTime::from_ns(1), a, LogicVec::from_bool(true));
+            let err = kernel.run_until(10 * FS_PER_NS).unwrap_err();
+            assert!(matches!(err, SimError::DeltaCycleLimit { .. }), "{err:?}");
+        }
+
+        #[test]
+        fn nba_applications_are_charged_as_deltas() {
+            // Two chained NBA stages after a clock edge need deltas for: the
+            // edge, q1's NBA and q2's NBA. A limit that only covers the edge
+            // must trip, one that covers all three must not.
+            let make = || {
+                build(
+                    &[
+                        ("clk", 1, None),
+                        ("d", 1, Some(1)),
+                        ("q1", 1, Some(0)),
+                        ("q2", 1, Some(0)),
+                    ],
+                    vec![
+                        clock(0, 1),
+                        at_posedge(0, nb(s(2), rd(1))),
+                        (
+                            ProcessKind::Sequential,
+                            Sensitivity::SignalList(vec![SignalId::from_raw(2)]),
+                            nb(s(3), rd(2)),
+                        ),
+                    ],
+                    vec![],
+                )
+            };
+            let (design, interner) = make();
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            kernel.set_max_delta(2);
+            assert!(matches!(
+                kernel.run_to_completion(),
+                Err(SimError::DeltaCycleLimit { .. })
+            ));
+
+            let (design, interner) = make();
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            kernel.set_max_delta(4);
+            kernel.run_to_completion().unwrap();
+            assert_eq!(val(&kernel, "q2"), Some(1));
+        }
+
+        #[test]
+        fn run_until_applies_nba_region() {
+            let (design, interner) = build(
+                &[("clk", 1, None), ("a", 8, Some(1)), ("b", 8, Some(2))],
+                vec![
+                    clock(0, 1),
+                    at_posedge(0, blk(vec![nb(s(1), rd(2)), nb(s(2), rd(1))])),
+                ],
+                vec![],
+            );
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            kernel.initialize().unwrap();
+            kernel.run_until(7 * FS_PER_NS).unwrap();
+            assert_eq!(val(&kernel, "a"), Some(2));
+            assert_eq!(val(&kernel, "b"), Some(1));
+            assert!(kernel.nba_queue.is_empty());
+        }
+
+        #[test]
+        fn initial_narrow_write_keeps_signal_width() {
+            // reg [7:0] count; initial count = 1'b0;  then on each of three
+            // clock edges count = count + 1'b1  → 3 (it wrapped mod 2 when
+            // the immediate write shrank count to one bit).
+            let (design, interner) = build(
+                &[("clk", 1, None), ("count", 8, None)],
+                vec![
+                    clock(0, 3),
+                    initial(ba(s(1), lit(0, 1))),
+                    at_posedge(0, ba(s(1), add(rd(1), lit(1, 1)))),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            let id = kernel.find_signal("top.count").unwrap();
+            assert_eq!(kernel.signal_value(id).width(), 8);
+            assert_eq!(val(&kernel, "count"), Some(3));
+        }
+
+        #[test]
+        fn merged_slice_after_narrow_full_write_does_not_panic() {
+            // x = 1'b1; x[7:4] = 4'h5;  in one segment → 0x51.
+            let (design, interner) = build(
+                &[("x", 8, Some(0xFF))],
+                vec![initial(dly(
+                    1,
+                    blk(vec![ba(s(0), lit(1, 1)), ba(slice(0, 7, 4), lit(5, 4))]),
+                ))],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "x"), Some(0x51));
+        }
+
+        #[test]
+        fn step_delta_applies_pending_nba_region() {
+            // Interactive stepping: after initialize(), the only work left is
+            // the initial block's NBA; step_delta() must apply it.
+            let (design, interner) = build(
+                &[("a", 8, Some(0))],
+                vec![initial(nb(s(0), lit(6, 8)))],
+                vec![],
+            );
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            kernel.initialize().unwrap();
+            assert!(kernel.has_pending_events());
+            assert_eq!(kernel.next_event_time_fs(), Some(0));
+            assert_eq!(val(&kernel, "a"), Some(0));
+            assert_eq!(kernel.step_delta().unwrap(), StepResult::Continued);
+            assert_eq!(val(&kernel, "a"), Some(6));
+            assert!(!kernel.has_pending_events());
+            assert_eq!(kernel.step_delta().unwrap(), StepResult::Done);
+        }
+
+        #[test]
+        fn apply_nba_region_waits_for_active_work() {
+            let (design, interner) = build(&[("a", 8, Some(0))], vec![], vec![]);
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            let a = kernel.find_signal("top.a").unwrap();
+            kernel.nba_queue.push(PendingUpdate {
+                target: a,
+                value: LogicVec::from_u64(3, 8),
+                range: None,
+                kind: AssignKind::NonBlocking,
+            });
+            // An event due now is active work: the NBA region must wait.
+            kernel.schedule_event(SimTime::zero(), a, LogicVec::from_u64(1, 8));
+            assert!(!kernel.apply_nba_region());
+            assert_eq!(kernel.nba_queue.len(), 1);
+            kernel.step_delta().unwrap();
+            // Active region drained: now it applies, one delta later.
+            assert!(kernel.apply_nba_region());
+            assert!(kernel.nba_queue.is_empty());
+            kernel.step_delta().unwrap();
+            assert_eq!(val(&kernel, "a"), Some(3));
+            // Nothing queued: a no-op.
+            assert!(!kernel.apply_nba_region());
+        }
+    }
+
     // ---- Unified process dispatch (#4: SIM-1, SIM-2, SIM-21) ----
 
     const NS: u64 = crate::time::FS_PER_NS;
@@ -2692,6 +3502,7 @@ mod tests {
         Statement::Assign {
             target: sref(i),
             value,
+            kind: AssignKind::Blocking,
             span: Span::DUMMY,
         }
     }

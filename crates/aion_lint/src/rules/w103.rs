@@ -303,6 +303,7 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(sig_id),
                 value: Expr::Literal(LogicVec::from_u64(0xFF, 8)),
+                kind: aion_ir::AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::All,

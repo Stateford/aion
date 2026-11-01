@@ -139,6 +139,7 @@ mod tests {
                     ty: TypeId::from_raw(0),
                     span: Span::DUMMY,
                 },
+                kind: aion_ir::AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::SignalList(vec![a]), // Missing b
@@ -188,6 +189,7 @@ mod tests {
                     ty: TypeId::from_raw(0),
                     span: Span::DUMMY,
                 },
+                kind: aion_ir::AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::SignalList(vec![a, b]),
@@ -209,6 +211,7 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Signal(SignalRef::Signal(SignalId::from_raw(1))),
+                kind: aion_ir::AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::All,
