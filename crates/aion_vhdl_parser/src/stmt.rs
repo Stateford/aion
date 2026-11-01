@@ -19,6 +19,7 @@ impl VhdlParser<'_> {
     pub fn parse_concurrent_statements(&mut self) -> Vec<ConcurrentStatement> {
         let mut stmts = Vec::new();
         loop {
+            let iter_start = self.pos;
             match self.current() {
                 VhdlToken::End | VhdlToken::Eof => break,
                 _ => {
@@ -27,6 +28,7 @@ impl VhdlParser<'_> {
                     }
                 }
             }
+            self.ensure_progress(iter_start, "concurrent statement part");
         }
         stmts
     }
@@ -373,6 +375,7 @@ impl VhdlParser<'_> {
     pub fn parse_sequential_statements(&mut self) -> Vec<SequentialStatement> {
         let mut stmts = Vec::new();
         loop {
+            let iter_start = self.pos;
             match self.current() {
                 VhdlToken::End
                 | VhdlToken::Elsif
@@ -385,6 +388,7 @@ impl VhdlParser<'_> {
                     }
                 }
             }
+            self.ensure_progress(iter_start, "sequential statement part");
         }
         stmts
     }
@@ -426,6 +430,7 @@ impl VhdlParser<'_> {
         let then_stmts = self.parse_sequential_statements();
 
         let mut elsif_branches = Vec::new();
+        // Progress: each iteration consumes the `elsif` keyword.
         while self.at(VhdlToken::Elsif) {
             let elsif_start = self.current_span();
             self.advance();
@@ -471,7 +476,9 @@ impl VhdlParser<'_> {
 
         let mut alternatives = Vec::new();
         while self.at(VhdlToken::When) {
+            let iter_start = self.pos;
             alternatives.push(self.parse_case_alternative());
+            self.ensure_progress(iter_start, "case statement");
         }
 
         self.expect(VhdlToken::End);
