@@ -5,6 +5,22 @@
 
 ---
 
+## 2026-11-01 — Lint: Panic-Proof Width Computation and Rule Isolation (Fixes #38)
+
+- **Shared width helpers:** W103 and W107 now share one overflow-checked width calculation in `aion_lint/src/helpers.rs`: `range_width` (uses `abs_diff`), `type_width`, `signal_ref_width` and `expr_width`. A TypeId(0) placeholder type counts as unknown width. Ascending slices, VHDL `to` ranges, `a[0 +: 8]` and `{1000000000{8'hFF}}` no longer panic (LINT-1, LINT-2).
+- **W107 port order:** W107 no longer depends on port order, because the TypeId(0) guard now applies to it too (LINT-3).
+- **Rule isolation:** `LintEngine::run` wraps each rule in `catch_unwind`. A panicking rule is reported as the new **E199** internal error, and the other rules still run.
+- **Review follow-up:** W107 treats right-hand-side slices and bit-selects as unknown. Part-selects are still lowered as `Slice { high: base, low: width }` (LINT-4), and trusting those widths gave false truncation warnings on correct designs.
+- **Tests:**
+  - helpers ×16, W103 ×6, W107 ×11, engine isolation ×5;
+  - `aion_conformance/tests/lint_width_robustness.rs`: 8 full-pipeline tests.
+- **Known gaps:**
+  - W103 still misreports `+:` part-selects; this needs the elaborator fix tracked in #42.
+  - Truncation from unresolved operator result types (TypeId(0)) is no longer reported.
+  - `TypeDb::bit_width` still multiplies without an overflow check, though lint no longer calls it.
+
+---
+
 ## 2026-11-01 — Sim: `forever` Without Timing Control No Longer Runs Once Silently
 
 - **Bug:** `forever` with no timing control (e.g. `forever clk = ~clk;`) ran its body once and then fell through to the next statement (`evaluator.rs`). That produced a wrong but plausible result with no diagnostic. Real simulators hang on this loop.
