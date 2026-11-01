@@ -37,7 +37,8 @@ fn indexed_part_select_does_not_panic() {
     // `a[0 +: 8]` is lowered as Slice { high: 0, low: 8 }, which used to
     // underflow `high - low + 1`. Until the elaborator lowers part-selects to
     // real bounds (tracked separately as LINT-4), the computed width is a
-    // meaningless 9 bits; this test only pins the "no crash" guarantee.
+    // meaningless 9 bits. W103 may still report it (pre-existing LINT-4
+    // behavior), but W107 must not raise a false truncation.
     let src = r#"
 module t(input [15:0] a, output [7:0] y);
     assign y = a[0 +: 8];
@@ -45,6 +46,33 @@ endmodule
 "#;
     let result = full_pipeline_verilog(src, "t");
     assert_no_internal_error(&result);
+    assert!(
+        warnings(&result, 107).is_empty(),
+        "part-select must not give a false W107: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn part_select_patterns_no_false_w107() {
+    // Byte-lane concatenation, high part-selects and constant-index memory
+    // writes all produced false W107 truncations when RHS slice bounds were
+    // trusted.
+    let src = r#"
+module t(input clk, input [31:0] a, output [31:0] y, output [7:0] z);
+    reg [7:0] mem [0:3];
+    assign y = {a[0 +: 8], a[8 +: 8], a[16 +: 8], a[24 +: 8]};
+    assign z = a[24 +: 8];
+    always @(posedge clk) mem[1] <= a[7:0];
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "t");
+    assert_no_internal_error(&result);
+    assert!(
+        warnings(&result, 107).is_empty(),
+        "no W107 expected: {:#?}",
+        result.diagnostics
+    );
 }
 
 #[test]

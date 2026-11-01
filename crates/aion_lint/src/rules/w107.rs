@@ -12,8 +12,12 @@ use crate::LintRule;
 /// Unlike W103 (width-mismatch) which fires on any width difference,
 /// this rule specifically flags truncation where data loss occurs.
 /// Widths come from the same overflow-checked helpers as W103
-/// ([`signal_ref_width`] and [`expr_width`]), so both rules agree on what is
-/// known and neither trusts the elaborator's placeholder result types.
+/// ([`signal_ref_width`] and [`expr_width`]), so neither rule trusts the
+/// elaborator's placeholder result types. W107 is deliberately more
+/// conservative on the RHS: bit-selects and slices are treated as unknown
+/// width (see [`rhs_width`]), because the elaborator currently lowers indexed
+/// part-selects (`a[b +: w]`) as `Slice { high: b, low: w }`, which is
+/// indistinguishable from a real `[b:w]` range in the IR.
 pub struct Truncation;
 
 impl LintRule for Truncation {
@@ -65,7 +69,7 @@ fn check_truncation(
     sink: &DiagnosticSink,
 ) {
     let lhs_width = signal_ref_width(target, module, design);
-    let rhs_width = expr_width(value, design);
+    let rhs_width = rhs_width(value, design);
     if let (Some(lw), Some(rw)) = (lhs_width, rhs_width) {
         if rw > lw {
             sink.emit(
@@ -80,6 +84,26 @@ fn check_truncation(
                 .with_label(Label::primary(span, "high bits will be truncated")),
             );
         }
+    }
+}
+
+/// Returns the RHS width W107 is willing to trust, or `None` if unknown.
+///
+/// Delegates to the shared [`expr_width`] helper, but treats `Expr::Slice` and
+/// `Expr::Index` (including inside concatenations and replications) as
+/// unknown. The IR cannot yet distinguish a part-select `a[b +: w]` (lowered as
+/// `Slice { high: b, low: w }`) from a genuine `a[b:w]` range, so trusting
+/// slice bounds here produces false truncation warnings on correct designs
+/// such as `assign y = a[0 +: 8];` or byte-lane concatenations. Remove this
+/// restriction once the elaborator lowers part-selects to real bounds.
+fn rhs_width(expr: &Expr, design: &Design) -> Option<u32> {
+    match expr {
+        Expr::Slice { .. } | Expr::Index { .. } => None,
+        Expr::Concat(exprs) => exprs
+            .iter()
+            .try_fold(0u32, |total, e| total.checked_add(rhs_width(e, design)?)),
+        Expr::Repeat { expr, count, .. } => rhs_width(expr, design)?.checked_mul(*count),
+        _ => expr_width(expr, design),
     }
 }
 
@@ -350,9 +374,88 @@ mod tests {
             span: Span::DUMMY,
         });
         let diags = run_rule(module, types);
-        // The 4-bit `0 to 3` slice into a 4-bit target is clean; only the
-        // part-select lowering (LINT-4) can produce a warning.
-        assert!(diags.len() <= 1, "{diags:#?}");
+        // Slices on the RHS are treated as unknown width (part-selects are
+        // lowered as `Slice { high: base, low: width }`), so neither fires.
+        assert!(diags.is_empty(), "{diags:#?}");
+    }
+
+    #[test]
+    fn part_select_rhs_no_false_truncation() {
+        // `assign y = a[24 +: 8];` lowers to Slice{24, 8} (17 "bits").
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let a = add_vec_signal(&mut module, &mut types, 32);
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: literal_slice(a, 24, 8),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn byte_lane_concat_of_part_selects_no_false_truncation() {
+        // `{a[0 +: 8], a[8 +: 8], a[16 +: 8], a[24 +: 8]}` into 32 bits.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let a = add_vec_signal(&mut module, &mut types, 32);
+        let y = add_vec_signal(&mut module, &mut types, 32);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Concat(vec![
+                literal_slice(a, 0, 8),
+                literal_slice(a, 8, 8),
+                literal_slice(a, 16, 8),
+                literal_slice(a, 24, 8),
+            ]),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn slice_rhs_into_one_bit_target_no_false_truncation() {
+        // Constant-index memory writes (`mem[1] <= a[7:0]`) and unsupported
+        // targets lower to 1-bit targets; a slice RHS must not trigger W107.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let a = add_vec_signal(&mut module, &mut types, 8);
+        let mem = add_vec_signal(&mut module, &mut types, 32);
+        module.assignments.push(Assignment {
+            target: SignalRef::Slice {
+                signal: mem,
+                high: 1,
+                low: 1,
+            },
+            value: literal_slice(a, 7, 0),
+            span: Span::DUMMY,
+        });
+        module.assignments.push(Assignment {
+            target: SignalRef::Const(LogicVec::all_zero(1)),
+            value: literal_slice(a, 7, 0),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn literal_concat_still_detects_truncation() {
+        // Non-slice RHS widths are still trusted, including inside concats.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Concat(vec![
+                Expr::Literal(LogicVec::from_u64(0xAB, 8)),
+                Expr::Literal(LogicVec::from_u64(0xCD, 8)),
+            ]),
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, types);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("losing 8 bits"));
     }
 
     #[test]
