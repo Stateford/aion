@@ -23,8 +23,6 @@
       "Bash(rm *)"
     ],
     "deny": [
-      "Bash(git push*)",
-      "Bash(git rebase*)",
       "Bash(cargo publish*)"
     ]
   },
