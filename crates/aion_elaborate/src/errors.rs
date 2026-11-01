@@ -1,9 +1,9 @@
 //! Diagnostic codes and helper functions for elaboration errors and warnings.
 //!
 //! Error codes `E200`--`E211` cover elaboration failures (unknown modules,
-//! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W202`
+//! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W203`
 //! cover non-fatal issues (width mismatches, unconnected ports, `forever`
-//! loops with no timing control).
+//! loops and `always` blocks with no timing control).
 
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode};
 use aion_source::Span;
@@ -98,6 +98,12 @@ pub const W202: DiagnosticCode = DiagnosticCode {
     number: 202,
 };
 
+/// `always` block with no event control whose body contains no timing control.
+pub const W203: DiagnosticCode = DiagnosticCode {
+    category: Category::Warning,
+    number: 203,
+};
+
 /// Creates a diagnostic for an unknown module in an instantiation.
 pub fn error_unknown_module(name: &str, span: Span) -> Diagnostic {
     Diagnostic::error(E200, format!("unknown module `{name}`"), span)
@@ -185,6 +191,23 @@ pub fn warn_forever_without_timing(span: Span) -> Diagnostic {
     Diagnostic::warning(W202, "`forever` loop has no timing control", span)
         .with_note("the loop never yields, so it repeats forever at the same simulation time")
         .with_help("add a delay such as `#5` to the loop body, or `$finish` to end the simulation")
+}
+
+/// Creates a warning for an `always` block with no timing control at all.
+///
+/// An `always` block without an event control restarts as soon as its body
+/// ends, so it is lowered as a `forever` loop; with no delay or event control
+/// in the body it never yields. Simulators hang on it, and Aion's simulator
+/// stops with an error.
+pub fn warn_always_without_timing(span: Span) -> Diagnostic {
+    Diagnostic::warning(W203, "`always` block has no timing control", span)
+        .with_note(
+            "an `always` block without an event control restarts as soon as its body ends, \
+             so it repeats forever at time 0",
+        )
+        .with_help(
+            "add an event control such as `@(*)` or `@(posedge clk)`, or a delay such as `#5`",
+        )
 }
 
 /// Creates a warning for an unconnected port.
@@ -280,6 +303,13 @@ mod tests {
         assert_eq!(format!("{W202}"), "W202");
         assert!(d.message.contains("forever"));
         assert!(!d.notes.is_empty());
+
+        let d = warn_always_without_timing(Span::DUMMY);
+        assert_eq!(d.code, W203);
+        assert_eq!(format!("{W203}"), "W203");
+        assert!(d.message.contains("`always`"));
+        assert!(!d.notes.is_empty());
+        assert!(!d.help.is_empty());
     }
 
     #[test]

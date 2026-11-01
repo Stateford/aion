@@ -393,4 +393,190 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    // ---- End-to-end process dispatch (#4): HDL source → elaborate → sim ----
+
+    /// Parses `src` (`.v` or `.sv`), elaborates it with `top` as the top
+    /// module, and simulates it for `duration_ns`. Returns the kernel (for
+    /// signal inspection, names are `top.<signal>`), the result, and the
+    /// elaboration diagnostic codes.
+    fn simulate_source(
+        file_name: &str,
+        src: &str,
+        top: &str,
+        duration_ns: u64,
+    ) -> (aion_sim::SimKernel, aion_sim::SimResult, Vec<String>) {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source(file_name, src.to_string());
+        let mut parsed = aion_elaborate::ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![],
+        };
+        if file_name.ends_with(".sv") {
+            parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else {
+            parsed.verilog_files.push(aion_verilog_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        }
+        let base = aion_config::load_config_from_str(
+            "[project]\nname=\"e2e\"\nversion=\"0.1.0\"\ntop=\"top\"",
+        )
+        .unwrap();
+        let config = make_config_with_top(&base, top);
+        let design =
+            aion_elaborate::elaborate(&parsed, &config, &source_db, &interner, &sink).unwrap();
+        assert!(!sink.has_errors(), "{:?}", sink.diagnostics());
+        let codes = sink
+            .diagnostics()
+            .iter()
+            .map(|d| d.code.to_string())
+            .collect();
+        let mut kernel = aion_sim::SimKernel::new(&design, &interner).unwrap();
+        let result = kernel.run(duration_ns * aion_sim::time::FS_PER_NS).unwrap();
+        (kernel, result, codes)
+    }
+
+    fn sig(kernel: &aion_sim::SimKernel, name: &str) -> Option<u64> {
+        kernel
+            .signal_value(kernel.find_signal(name).unwrap())
+            .to_u64()
+    }
+
+    #[test]
+    fn e2e_verilog_always_delay_clock_generator() {
+        let (kernel, result, codes) = simulate_source(
+            "clk_tb.v",
+            "module clk_tb;\n\
+               reg clk;\n\
+               reg [7:0] count;\n\
+               initial begin clk = 0; count = 8'd0; end\n\
+               always #5 clk = ~clk;\n\
+               always @(posedge clk) count = count + 1;\n\
+               initial begin #52 $display(\"count=%d\", count); $finish; end\n\
+             endmodule\n",
+            "clk_tb",
+            1000,
+        );
+        assert!(codes.is_empty(), "{codes:?}");
+        assert!(result.finished_by_user);
+        assert_eq!(result.final_time.fs, 52 * aion_sim::time::FS_PER_NS);
+        // Rising edges at 5, 15, 25, 35 and 45 ns.
+        assert_eq!(sig(&kernel, "top.count"), Some(5));
+        assert_eq!(
+            result.display_output.len(),
+            1,
+            "{:?}",
+            result.display_output
+        );
+        assert!(result.display_output[0].contains("count=5"));
+    }
+
+    #[test]
+    fn e2e_sv_always_block_with_two_delays() {
+        // (Sized `8'd0`: an unsized literal in an initial block currently
+        // narrows the signal's stored value, an unrelated existing bug.)
+        let (kernel, _, codes) = simulate_source(
+            "clk_tb.sv",
+            "module clk_tb;\n\
+               logic clk;\n\
+               logic [7:0] rises;\n\
+               initial rises = 8'd0;\n\
+               always begin #5 clk = 0; #5 clk = 1; end\n\
+               always_ff @(posedge clk) rises <= rises + 1;\n\
+             endmodule\n",
+            "clk_tb",
+            47,
+        );
+        assert!(codes.is_empty(), "{codes:?}");
+        // clk: X, 0 at 5, 1 at 10, 0 at 15, ..., 1 at 40, 0 at 45.
+        assert_eq!(sig(&kernel, "top.clk"), Some(0));
+        // Rising edges (0 -> 1) at 10, 20, 30 and 40 ns.
+        assert_eq!(sig(&kernel, "top.rises"), Some(4));
+    }
+
+    #[test]
+    fn e2e_initial_block_not_rerun_by_continuous_assign() {
+        let (kernel, result, _) = simulate_source(
+            "a_tb.v",
+            "module a_tb;\n\
+               reg b;\n\
+               wire a;\n\
+               assign a = ~b;\n\
+               initial begin b = 0; #10 begin b = 1; $display(\"a=%b\", a); end end\n\
+             endmodule\n",
+            "a_tb",
+            100,
+        );
+        assert_eq!(sig(&kernel, "top.b"), Some(1));
+        assert_eq!(sig(&kernel, "top.a"), Some(0));
+        assert_eq!(
+            result.display_output.len(),
+            1,
+            "{:?}",
+            result.display_output
+        );
+    }
+
+    #[test]
+    fn e2e_delay_inside_edge_triggered_always() {
+        let (kernel, _, _) = simulate_source(
+            "q_tb.v",
+            "module q_tb;\n\
+               reg clk;\n\
+               reg q;\n\
+               initial begin clk = 0; q = 0; #5 clk = 1; end\n\
+               always @(posedge clk) begin q = 1; #2 q = 0; end\n\
+             endmodule\n",
+            "q_tb",
+            50,
+        );
+        assert_eq!(sig(&kernel, "top.q"), Some(0));
+    }
+
+    #[test]
+    fn sim_always_without_timing_control_errors_instead_of_hanging() {
+        let tmp = TempDir::new().unwrap();
+        let project_dir = tmp.path().join("sim_proj");
+        crate::init::run(
+            Some(project_dir.to_str().unwrap().to_string()),
+            crate::HdlLanguage::Verilog,
+            None,
+        )
+        .unwrap();
+        let tb = project_dir.join("tests").join("always_tb.v");
+        std::fs::write(
+            &tb,
+            "module always_tb;\n  reg clk;\n  initial clk = 0;\n  always clk = ~clk;\nendmodule\n",
+        )
+        .unwrap();
+
+        let args = SimArgs {
+            testbench: tb.to_str().unwrap().to_string(),
+            time: Some("100ns".to_string()),
+            waveform: None,
+            output: None,
+            no_waveform: true,
+            top: None,
+            interactive: false,
+        };
+        let global = GlobalArgs {
+            quiet: true,
+            verbose: false,
+            color: false,
+            config: Some(project_dir.join("aion.toml").to_str().unwrap().to_string()),
+        };
+
+        let err = run(&args, &global).expect_err("zero-time always block must fail");
+        assert!(
+            err.to_string()
+                .contains("`always` block without an event control"),
+            "unexpected error: {err}"
+        );
+    }
 }
