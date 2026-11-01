@@ -539,11 +539,10 @@ fn build_verilog_connections(
         .iter()
         .filter_map(|conn| {
             let formal = conn.formal?;
-            let signal = if let Some(ref actual) = conn.actual {
-                lower_to_signal_ref(actual, sig_env, ctx.source_db, ctx.interner, ctx.sink)
-            } else {
-                return None;
-            };
+            // Unconnected ports (`.p()`) produce no connection.
+            let actual = conn.actual.as_ref()?;
+            let signal =
+                lower_to_signal_ref(actual, sig_env, ctx.source_db, ctx.interner, ctx.sink);
             let direction = lookup_port_direction(target_module, formal, ctx);
             Some(Connection {
                 port_name: formal,

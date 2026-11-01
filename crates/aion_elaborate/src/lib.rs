@@ -120,6 +120,60 @@ mod tests {
         toml::from_str(&toml_str).unwrap()
     }
 
+    /// Elaborates `child u(.a(x), .b());` from source and returns the names of
+    /// the instance's connected ports.
+    fn connected_ports(file_name: &str, src: &str) -> Vec<String> {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source(file_name, src.to_string());
+        let mut parsed = ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![],
+        };
+        if file_name.ends_with(".sv") {
+            parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else {
+            parsed.verilog_files.push(aion_verilog_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        }
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        let design = elaborate(&parsed, &make_config("top"), &source_db, &interner, &sink).unwrap();
+        let top = &design.modules[design.top];
+        let (_, cell) = top.cells.iter().next().expect("one instance");
+        let aion_ir::CellKind::Instance { .. } = cell.kind else {
+            panic!("expected instance cell");
+        };
+        cell.connections
+            .iter()
+            .map(|c| interner.resolve(c.port_name).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn verilog_unconnected_named_port_is_skipped() {
+        let ports = connected_ports(
+            "top.v",
+            "module child(input wire a, output wire b); assign b = a; endmodule\n\
+             module top; wire x; child u(.a(x), .b()); endmodule",
+        );
+        assert_eq!(ports, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn sv_unconnected_named_port_is_skipped() {
+        let ports = connected_ports(
+            "top.sv",
+            "module child(input logic a, output logic b); assign b = a; endmodule\n\
+             module top; logic x; child u(.a(x), .b()); endmodule",
+        );
+        assert_eq!(ports, vec!["a".to_string()]);
+    }
+
     #[test]
     fn elaborate_simple_verilog_counter() {
         let interner = Interner::new();

@@ -414,10 +414,9 @@ fn parse_set_max_delay(
                     to.push(interner.get_or_intern(args[i]));
                 }
             }
-            s if !s.starts_with('-') => {
-                if delay.is_none() {
-                    delay = s.parse().ok();
-                }
+            // The first positional argument is the delay; later ones are ignored.
+            s if !s.starts_with('-') && delay.is_none() => {
+                delay = s.parse().ok();
             }
             _ => {}
         }
@@ -528,6 +527,13 @@ mod tests {
     #[test]
     fn set_max_delay() {
         let (tc, _) = parse("set_max_delay 15.0 -from src -to dst");
+        assert_eq!(tc.max_delay_paths.len(), 1);
+        assert_eq!(tc.max_delay_paths[0].delay_ns, 15.0);
+    }
+
+    #[test]
+    fn set_max_delay_first_positional_wins() {
+        let (tc, _) = parse("set_max_delay 15.0 99.0 -from src -to dst");
         assert_eq!(tc.max_delay_paths.len(), 1);
         assert_eq!(tc.max_delay_paths[0].delay_ns, 15.0);
     }

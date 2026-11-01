@@ -76,19 +76,16 @@ impl ClockConstraint {
     /// Returns the duty cycle as a fraction (0.0 to 1.0).
     pub fn duty_cycle(&self) -> f64 {
         match self.waveform {
-            Some((rise, fall)) => {
-                if self.period_ns > 0.0 {
-                    let high_time = if fall > rise {
-                        fall - rise
-                    } else {
-                        self.period_ns - rise + fall
-                    };
-                    high_time / self.period_ns
+            Some((rise, fall)) if self.period_ns > 0.0 => {
+                let high_time = if fall > rise {
+                    fall - rise
                 } else {
-                    0.5
-                }
+                    self.period_ns - rise + fall
+                };
+                high_time / self.period_ns
             }
-            None => 0.5,
+            // No waveform, or a degenerate (non-positive) period.
+            _ => 0.5,
         }
     }
 }
@@ -204,6 +201,31 @@ mod tests {
             waveform: Some((0.0, 7.0)),
         };
         assert!((clk.duty_cycle() - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn clock_constraint_duty_cycle_wrapping_waveform() {
+        // Falling edge before rising edge: high from 8 ns, wraps, low at 3 ns.
+        let interner = make_interner();
+        let clk = ClockConstraint {
+            name: interner.get_or_intern("clk"),
+            period_ns: 10.0,
+            port: interner.get_or_intern("clk_port"),
+            waveform: Some((8.0, 3.0)),
+        };
+        assert!((clk.duty_cycle() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn clock_constraint_duty_cycle_zero_period_with_waveform() {
+        let interner = make_interner();
+        let clk = ClockConstraint {
+            name: interner.get_or_intern("clk"),
+            period_ns: 0.0,
+            port: interner.get_or_intern("clk_port"),
+            waveform: Some((0.0, 7.0)),
+        };
+        assert!((clk.duty_cycle() - 0.5).abs() < 0.001);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use aion_ir::{
 /// After this pass, the netlist contains only cells (no behavioral code).
 pub(crate) fn lower_module(module: &Module, netlist: &mut Netlist, sink: &DiagnosticSink) {
     // Lower concurrent assignments first
-    let assignments: Vec<_> = netlist.assignments.drain(..).collect();
+    let assignments = std::mem::take(&mut netlist.assignments);
     for assign in &assignments {
         let value = lower_expr(&assign.value, netlist);
         wire_signal_ref(&assign.target, &value, netlist);

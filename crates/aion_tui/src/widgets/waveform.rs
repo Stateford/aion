@@ -105,11 +105,9 @@ fn render_time_ruler(app: &TuiApp, inner: Rect, buf: &mut Buffer) {
     let max_label_width = end_label.len() + 2; // label + 2 chars gap
 
     // Number of ticks that fit without overlapping
-    let num_ticks = if max_label_width == 0 {
-        2
-    } else {
-        (width / max_label_width).clamp(2, 12)
-    };
+    let num_ticks = width
+        .checked_div(max_label_width)
+        .map_or(2, |n| n.clamp(2, 12));
 
     let mut last_label_end: usize = 0;
     for i in 0..=num_ticks {
