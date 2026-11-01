@@ -65,9 +65,14 @@ fn simulate(file_name: &str, src: &str, top: &str) -> (SimKernel, SimResult) {
 
 /// Returns the final value of `top.<name>` as an integer (`None` if X/Z).
 fn value(kernel: &SimKernel, name: &str) -> Option<u64> {
+    value_of(kernel, &format!("top.{name}"))
+}
+
+/// Returns the final value of the signal with hierarchical name `full`.
+fn value_of(kernel: &SimKernel, full: &str) -> Option<u64> {
     let id = kernel
-        .find_signal(&format!("top.{name}"))
-        .unwrap_or_else(|| panic!("signal {name} not found"));
+        .find_signal(full)
+        .unwrap_or_else(|| panic!("signal {full} not found"));
     kernel.signal_value(id).to_u64()
 }
 
@@ -219,4 +224,153 @@ end architecture;
     let (kernel, _) = simulate("tb.vhd", src, "tb");
     assert_eq!(value(&kernel, "a"), Some(0));
     assert_eq!(value(&kernel, "q"), Some(0xFF));
+}
+
+#[test]
+fn vhdl_process_constant_and_variable_defaults_are_honoured() {
+    // Process-local declarations keep their declared defaults.
+    let src = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity tb is
+end entity;
+
+architecture sim of tb is
+  signal a : std_logic;
+  signal y : std_logic_vector(3 downto 0);
+begin
+  p : process (a)
+    constant K : std_logic_vector(3 downto 0) := "1010";
+    variable t : std_logic_vector(3 downto 0) := "0110";
+  begin
+    y <= K xor t;
+  end process;
+end architecture;
+"#;
+    let (kernel, _) = simulate("tb.vhd", src, "tb");
+    assert_eq!(value_of(&kernel, "top.p.K"), Some(0b1010));
+    assert_eq!(value_of(&kernel, "top.p.t"), Some(0b0110));
+    assert_eq!(value(&kernel, "y"), Some(0b1100));
+}
+
+#[test]
+fn vhdl_architecture_constant_and_signal_defaults_are_honoured() {
+    let src = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity tb is
+end entity;
+
+architecture sim of tb is
+  constant K : std_logic_vector(7 downto 0) := x"5A";
+  constant Z : std_logic_vector(7 downto 0) := (others => '0');
+  signal s : std_logic := '1';
+  signal y : std_logic_vector(7 downto 0);
+begin
+  process (s)
+  begin
+    y <= K or Z;
+  end process;
+end architecture;
+"#;
+    let (kernel, _) = simulate("tb.vhd", src, "tb");
+    assert_eq!(value(&kernel, "K"), Some(0x5A));
+    assert_eq!(value(&kernel, "Z"), Some(0));
+    assert_eq!(value(&kernel, "s"), Some(1));
+    assert_eq!(value(&kernel, "y"), Some(0x5A));
+}
+
+#[test]
+fn vhdl_process_all_does_not_wake_on_its_own_variable() {
+    // `process(all)` is sensitive to signals only; writing the variable
+    // `v` must not re-trigger the process (it used to loop until the
+    // delta-cycle limit at 0 fs).
+    let src = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity tb is
+end entity;
+
+architecture sim of tb is
+  signal a : std_logic;
+  signal y : std_logic;
+begin
+  process (all)
+    variable v : std_logic;
+  begin
+    if v = '1' then
+      v := '0';
+    else
+      v := '1';
+    end if;
+    y <= v and not a;
+  end process;
+end architecture;
+"#;
+    let (kernel, _) = simulate("tb.vhd", src, "tb");
+    // Ran exactly once (the time-0 pass): v toggled from X to '1' once; a
+    // second run would have flipped it back to '0'.
+    assert_eq!(value_of(&kernel, "top._process0.v"), Some(1));
+    assert_eq!(value(&kernel, "y"), Some(1));
+}
+
+#[test]
+fn vhdl_same_named_variables_in_two_processes_stay_distinct() {
+    let src = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity tb is
+end entity;
+
+architecture sim of tb is
+  signal a : std_logic;
+  signal y1 : std_logic;
+  signal y2 : std_logic;
+begin
+  first : process (a)
+    variable t : std_logic := '1';
+  begin
+    y1 <= t;
+  end process;
+  process (a)
+    variable t : std_logic := '0';
+  begin
+    y2 <= t;
+  end process;
+end architecture;
+"#;
+    let (kernel, _) = simulate("tb.vhd", src, "tb");
+    let names: Vec<&str> = kernel.all_signals().iter().map(|(_, n, _)| *n).collect();
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "duplicate names: {names:?}");
+    assert_eq!(value_of(&kernel, "top.first.t"), Some(1));
+    assert_eq!(value(&kernel, "y1"), Some(1));
+    assert_eq!(value(&kernel, "y2"), Some(0));
+}
+
+#[test]
+fn verilog_partial_write_zero_extends_to_slice_width() {
+    // The unsized `0` must clear all four bits of the slice, for `=` and
+    // for `<=`.
+    let src = r#"
+module tb;
+  reg [7:0] q;
+  reg [7:0] r;
+  initial begin
+    q = 8'hFF;
+    q[7:4] = 0;
+    r = 8'hFF;
+    #1 r[7:4] <= 0;
+  end
+endmodule
+"#;
+    let (kernel, _) = simulate("tb.v", src, "tb");
+    assert_eq!(value(&kernel, "q"), Some(0x0F));
+    assert_eq!(value(&kernel, "r"), Some(0x0F));
 }

@@ -720,8 +720,9 @@ fn contains_wait(stmt: &Statement) -> bool {
 /// - A full write (`range == None`) is resized to the signal: a narrower
 ///   value is zero-extended and a wider one truncated, as for a Verilog
 ///   assignment of an unsigned value.
-/// - A partial write (`Some((high, low))`) replaces only bits `low..=high`;
-///   bits outside the signal are ignored instead of panicking.
+/// - A partial write (`Some((high, low))`) replaces only bits `low..=high`,
+///   with the value fitted to the slice width the same way (zero-extended or
+///   truncated); bits outside the signal are ignored instead of panicking.
 ///
 /// The overlay, the kernel's update merging and the immediate commit of
 /// initial-block writes all use this, so a process reads exactly what is
@@ -741,9 +742,15 @@ pub fn apply_write(current: &LogicVec, value: &LogicVec, range: Option<(u32, u32
         }
         Some((high, low)) => {
             for i in 0..(high.saturating_sub(low) + 1) {
-                if i < value.width() && low + i < new_val.width() {
-                    new_val.set(low + i, value.get(i));
+                if low + i >= new_val.width() {
+                    break;
                 }
+                let bit = if i < value.width() {
+                    value.get(i)
+                } else {
+                    Logic::Zero
+                };
+                new_val.set(low + i, bit);
             }
         }
     }
@@ -2349,6 +2356,18 @@ mod tests {
         // Out-of-range bits are ignored rather than panicking.
         let v = apply_write(&current, &LogicVec::from_u64(0xF, 4), Some((9, 6)));
         assert_eq!(v.to_u64(), Some(0xE5));
+    }
+
+    #[test]
+    fn apply_write_slice_fits_value_to_slice_width() {
+        // q = 8'hFF; q[7:4] = 1'b0;  → 0x0F (the narrow value is zero-extended
+        // to the 4-bit slice, not merged into its low bit only).
+        let current = LogicVec::from_u64(0xFF, 8);
+        let v = apply_write(&current, &LogicVec::from_u64(0, 1), Some((7, 4)));
+        assert_eq!(v.to_u64(), Some(0x0F));
+        // A wider value is truncated to the slice.
+        let v = apply_write(&current, &LogicVec::from_u64(0x1A, 8), Some((3, 0)));
+        assert_eq!(v.to_u64(), Some(0xFA));
     }
 
     #[test]
