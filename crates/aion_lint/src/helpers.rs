@@ -3,10 +3,20 @@
 //! These functions walk the statement and expression trees in the AionIR to
 //! collect signal usage information needed for checks like unused signals,
 //! undriven signals, and incomplete sensitivity lists.
+//!
+//! It also hosts the single, shared bit-width computation used by the
+//! width-mismatch (W103) and truncation (W107) rules. All width arithmetic is
+//! checked: ranges of either direction, overflowing concatenations or
+//! replications, and placeholder types yield `None` ("width unknown") rather
+//! than panicking or wrapping around.
 
 use std::collections::HashSet;
 
-use aion_ir::{CellKind, Connection, Expr, Module, PortDirection, SignalId, SignalRef, Statement};
+use aion_ir::ids::TypeId;
+use aion_ir::{
+    CellKind, Connection, Design, Expr, Module, PortDirection, SignalId, SignalRef, Statement,
+    Type, TypeDb,
+};
 
 /// Collects all `SignalId`s referenced (read) in a signal reference.
 ///
@@ -266,6 +276,108 @@ pub enum PortMatchIssue {
     ExtraConnection(Connection),
     /// A module port has no corresponding connection in the cell instance.
     MissingConnection(aion_common::Ident),
+}
+
+/// Computes the number of bits covered by the inclusive range between `high`
+/// and `low`, regardless of range direction.
+///
+/// Descending ranges (`[7:0]`), ascending ranges (Verilog `[0:7]`, VHDL
+/// `0 to 7`), and single-bit ranges (`[3:3]`) are all handled: the width is
+/// `|high - low| + 1`. Returns `None` if the width does not fit in a `u32`
+/// (e.g. `[u64::MAX:0]`), so callers treat it as unknown instead of
+/// overflowing.
+pub fn range_width(high: u64, low: u64) -> Option<u32> {
+    let span = high.abs_diff(low).checked_add(1)?;
+    u32::try_from(span).ok()
+}
+
+/// Returns the bit width of the type `ty` in `types`, using checked arithmetic.
+///
+/// Mirrors [`TypeDb::bit_width`] but never panics: an out-of-range `TypeId`
+/// yields `None`, and an array whose total width (`element width * size`)
+/// overflows a `u32` yields `None`. Types without a fixed width (integers,
+/// reals, strings, enums, records, error types) also yield `None`.
+pub fn type_width(types: &TypeDb, ty: TypeId) -> Option<u32> {
+    if ty.as_raw() as usize >= types.len() {
+        return None;
+    }
+    match types.get(ty) {
+        Type::Bit | Type::Bool => Some(1),
+        Type::BitVec { width, .. } => Some(*width),
+        Type::Array { element, size } => type_width(types, *element)?.checked_mul(*size),
+        _ => None,
+    }
+}
+
+/// Returns the bit width of an assignment target (`SignalRef`), if it can be
+/// determined from the module's signal types.
+///
+/// Whole-signal references use the signal's declared type; slices use
+/// [`range_width`] so ascending and descending ranges are both supported;
+/// concatenations sum their parts with overflow checking; constants use
+/// their literal width. Returns `None` whenever any part is unknown or the
+/// total overflows a `u32`.
+pub fn signal_ref_width(sref: &SignalRef, module: &Module, design: &Design) -> Option<u32> {
+    match sref {
+        SignalRef::Signal(id) => {
+            let signal = module.signals.get(*id);
+            type_width(&design.types, signal.ty)
+        }
+        SignalRef::Slice { high, low, .. } => range_width(u64::from(*high), u64::from(*low)),
+        SignalRef::Concat(refs) => refs.iter().try_fold(0u32, |total, r| {
+            total.checked_add(signal_ref_width(r, module, design)?)
+        }),
+        SignalRef::Const(lv) => Some(lv.width()),
+    }
+}
+
+/// Returns the bit width of an expression, if it can be determined without
+/// module context, using checked arithmetic throughout.
+///
+/// This is the shared width oracle for the W103 (width-mismatch) and W107
+/// (truncation) rules. It returns `None` ("unknown, do not warn") for:
+///
+/// - whole-signal and concatenated-signal references (no module context);
+/// - 1-bit all-zero / all-one literals, which represent context-dependent
+///   VHDL `(others => '0')` / `(others => '1')` aggregates;
+/// - unary, binary, ternary, and function-call expressions stamped with the
+///   `TypeId::from_raw(0)` placeholder, which the elaborator uses for
+///   unresolved result types and which may alias an unrelated real type;
+/// - slices whose bounds are not literals, or exceed 64 bits;
+/// - concatenations or replications whose total width overflows a `u32`.
+pub fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
+    match expr {
+        Expr::Signal(sref) => match sref {
+            SignalRef::Slice { high, low, .. } => range_width(u64::from(*high), u64::from(*low)),
+            SignalRef::Const(lv) => Some(lv.width()),
+            // Would need module context to resolve signal types.
+            SignalRef::Signal(_) | SignalRef::Concat(_) => None,
+        },
+        Expr::Literal(lv) => {
+            if lv.width() == 1 && (lv.is_all_zero() || lv.is_all_one()) {
+                return None;
+            }
+            Some(lv.width())
+        }
+        Expr::Unary { ty, .. }
+        | Expr::Binary { ty, .. }
+        | Expr::Ternary { ty, .. }
+        | Expr::FuncCall { ty, .. } => {
+            if *ty == TypeId::from_raw(0) {
+                return None;
+            }
+            type_width(&design.types, *ty)
+        }
+        Expr::Concat(exprs) => exprs
+            .iter()
+            .try_fold(0u32, |total, e| total.checked_add(expr_width(e, design)?)),
+        Expr::Repeat { expr, count, .. } => expr_width(expr, design)?.checked_mul(*count),
+        Expr::Index { .. } => Some(1),
+        Expr::Slice { high, low, .. } => match (high.as_ref(), low.as_ref()) {
+            (Expr::Literal(h), Expr::Literal(l)) => range_width(h.to_u64()?, l.to_u64()?),
+            _ => None,
+        },
+    }
 }
 
 // ---- Internal helpers ----
@@ -834,5 +946,285 @@ mod tests {
     #[test]
     fn no_assign_nop() {
         assert!(!has_assign(&Statement::Nop));
+    }
+
+    // ---- Width helpers (issue #38) ----
+
+    fn mk_design_with(module: Module, types: TypeDb) -> Design {
+        let mut modules = Arena::new();
+        let top = modules.alloc(module);
+        Design {
+            modules,
+            top,
+            types,
+            source_map: SourceMap::new(),
+        }
+    }
+
+    fn lit(value: u64, width: u32) -> Expr {
+        Expr::Literal(LogicVec::from_u64(value, width))
+    }
+
+    fn binary(ty: TypeId) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(lit(1, 8)),
+            rhs: Box::new(lit(2, 8)),
+            ty,
+            span: dummy_span(),
+        }
+    }
+
+    fn slice_expr(high: u64, low: u64) -> Expr {
+        Expr::Slice {
+            expr: Box::new(mk_signal_expr(SignalId::from_raw(0))),
+            high: Box::new(lit(high, 32)),
+            low: Box::new(lit(low, 32)),
+            span: dummy_span(),
+        }
+    }
+
+    #[test]
+    fn range_width_descending() {
+        assert_eq!(range_width(7, 0), Some(8));
+        assert_eq!(range_width(15, 8), Some(8));
+    }
+
+    #[test]
+    fn range_width_ascending() {
+        // Verilog `[0:3]`, VHDL `0 to 3`, and the `[0 +: 8]` lowering.
+        assert_eq!(range_width(0, 3), Some(4));
+        assert_eq!(range_width(0, 8), Some(9));
+    }
+
+    #[test]
+    fn range_width_equal_bounds() {
+        assert_eq!(range_width(0, 0), Some(1));
+        assert_eq!(range_width(5, 5), Some(1));
+    }
+
+    #[test]
+    fn range_width_overflow_is_none() {
+        assert_eq!(range_width(u64::MAX, 0), None);
+        assert_eq!(range_width(0, u64::MAX), None);
+        // Exactly u32::MAX bits fits; one more does not.
+        assert_eq!(range_width(u64::from(u32::MAX) - 1, 0), Some(u32::MAX));
+        assert_eq!(range_width(u64::from(u32::MAX), 0), None);
+    }
+
+    #[test]
+    fn type_width_basic_types() {
+        let mut types = TypeDb::new();
+        let bit = types.intern(Type::Bit);
+        let v8 = types.intern(Type::BitVec {
+            width: 8,
+            signed: false,
+        });
+        let int = types.intern(Type::Integer);
+        assert_eq!(type_width(&types, bit), Some(1));
+        assert_eq!(type_width(&types, v8), Some(8));
+        assert_eq!(type_width(&types, int), None);
+    }
+
+    #[test]
+    fn type_width_array_overflow_and_out_of_range() {
+        let mut types = TypeDb::new();
+        let v8 = types.intern(Type::BitVec {
+            width: 8,
+            signed: false,
+        });
+        let small = types.intern(Type::Array {
+            element: v8,
+            size: 4,
+        });
+        let huge = types.intern(Type::Array {
+            element: v8,
+            size: u32::MAX,
+        });
+        assert_eq!(type_width(&types, small), Some(32));
+        assert_eq!(type_width(&types, huge), None);
+        assert_eq!(type_width(&types, TypeId::from_raw(1000)), None);
+    }
+
+    #[test]
+    fn signal_ref_width_slices_both_directions() {
+        let module = mk_module();
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        let desc = SignalRef::Slice {
+            signal: SignalId::from_raw(0),
+            high: 7,
+            low: 4,
+        };
+        let asc = SignalRef::Slice {
+            signal: SignalId::from_raw(0),
+            high: 0,
+            low: 3,
+        };
+        assert_eq!(signal_ref_width(&desc, &module, &design), Some(4));
+        assert_eq!(signal_ref_width(&asc, &module, &design), Some(4));
+    }
+
+    #[test]
+    fn signal_ref_width_signal_and_concat() {
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let v8 = types.intern(Type::BitVec {
+            width: 8,
+            signed: false,
+        });
+        let sig = module.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: Ident::from_raw(1),
+            ty: v8,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: dummy_span(),
+        });
+        let design = mk_design_with(mk_module(), types);
+        let cat = SignalRef::Concat(vec![
+            SignalRef::Signal(sig),
+            SignalRef::Slice {
+                signal: sig,
+                high: 0,
+                low: 1,
+            },
+        ]);
+        assert_eq!(signal_ref_width(&cat, &module, &design), Some(10));
+    }
+
+    #[test]
+    fn signal_ref_width_concat_overflow_is_none() {
+        let module = mk_module();
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        let max = SignalRef::Slice {
+            signal: SignalId::from_raw(0),
+            high: u32::MAX - 1,
+            low: 0,
+        };
+        assert_eq!(signal_ref_width(&max, &module, &design), Some(u32::MAX));
+        let cat = SignalRef::Concat(vec![max.clone(), max]);
+        assert_eq!(signal_ref_width(&cat, &module, &design), None);
+        // u32::MAX:0 is 2^32 bits wide, which itself does not fit.
+        let too_wide = SignalRef::Slice {
+            signal: SignalId::from_raw(0),
+            high: u32::MAX,
+            low: 0,
+        };
+        assert_eq!(signal_ref_width(&too_wide, &module, &design), None);
+    }
+
+    #[test]
+    fn expr_width_slice_both_directions() {
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        assert_eq!(expr_width(&slice_expr(7, 0), &design), Some(8));
+        assert_eq!(expr_width(&slice_expr(0, 3), &design), Some(4));
+        assert_eq!(expr_width(&slice_expr(2, 2), &design), Some(1));
+        // A slice bound so large the width exceeds u32 is unknown, not wrapped.
+        let huge = Expr::Slice {
+            expr: Box::new(mk_signal_expr(SignalId::from_raw(0))),
+            high: Box::new(lit(u64::MAX, 64)),
+            low: Box::new(lit(0, 64)),
+            span: dummy_span(),
+        };
+        assert_eq!(expr_width(&huge, &design), None);
+    }
+
+    #[test]
+    fn expr_width_non_literal_slice_bounds_unknown() {
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        let e = Expr::Slice {
+            expr: Box::new(mk_signal_expr(SignalId::from_raw(0))),
+            high: Box::new(mk_signal_expr(SignalId::from_raw(1))),
+            low: Box::new(lit(0, 32)),
+            span: dummy_span(),
+        };
+        assert_eq!(expr_width(&e, &design), None);
+    }
+
+    #[test]
+    fn expr_width_concat_and_repeat() {
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        let cat = Expr::Concat(vec![lit(0xA, 4), lit(0xBC, 8)]);
+        assert_eq!(expr_width(&cat, &design), Some(12));
+        let rep = Expr::Repeat {
+            expr: Box::new(lit(0xFF, 8)),
+            count: 4,
+            span: dummy_span(),
+        };
+        assert_eq!(expr_width(&rep, &design), Some(32));
+    }
+
+    #[test]
+    fn expr_width_repeat_overflow_is_none() {
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        let rep = Expr::Repeat {
+            expr: Box::new(lit(0xFF, 8)),
+            count: 1_000_000_000,
+            span: dummy_span(),
+        };
+        assert_eq!(expr_width(&rep, &design), None);
+    }
+
+    #[test]
+    fn expr_width_concat_overflow_is_none() {
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        let big = Expr::Repeat {
+            expr: Box::new(lit(0xF, 4)),
+            count: u32::MAX / 4,
+            span: dummy_span(),
+        };
+        assert_eq!(expr_width(&big, &design), Some(u32::MAX - 3));
+        let cat = Expr::Concat(vec![big, lit(0xFF, 8)]);
+        assert_eq!(expr_width(&cat, &design), None);
+    }
+
+    #[test]
+    fn expr_width_placeholder_type_is_none() {
+        // TypeId(0) aliases a real 8-bit type here, exactly as when the first
+        // port of a module is 8 bits wide; it must still be treated as unknown.
+        let mut types = TypeDb::new();
+        let v8 = types.intern(Type::BitVec {
+            width: 8,
+            signed: false,
+        });
+        assert_eq!(v8, TypeId::from_raw(0));
+        let v4 = types.intern(Type::BitVec {
+            width: 4,
+            signed: false,
+        });
+        let design = mk_design_with(mk_module(), types);
+        assert_eq!(expr_width(&binary(TypeId::from_raw(0)), &design), None);
+        assert_eq!(expr_width(&binary(v4), &design), Some(4));
+    }
+
+    #[test]
+    fn expr_width_placeholder_type_with_empty_typedb() {
+        // An empty TypeDb would panic in `TypeDb::get`; the guard and the
+        // bounds check must both prevent that.
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        assert_eq!(expr_width(&binary(TypeId::from_raw(0)), &design), None);
+        assert_eq!(expr_width(&binary(TypeId::from_raw(7)), &design), None);
+    }
+
+    #[test]
+    fn expr_width_literals_and_signals() {
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        assert_eq!(expr_width(&lit(0xA5, 8), &design), Some(8));
+        // 1-bit all-zero/all-one literals are context-dependent aggregates.
+        assert_eq!(
+            expr_width(&Expr::Literal(LogicVec::all_zero(1)), &design),
+            None
+        );
+        assert_eq!(
+            expr_width(&mk_signal_expr(SignalId::from_raw(0)), &design),
+            None
+        );
+        let idx = Expr::Index {
+            expr: Box::new(mk_signal_expr(SignalId::from_raw(0))),
+            index: Box::new(lit(3, 32)),
+            span: dummy_span(),
+        };
+        assert_eq!(expr_width(&idx, &design), Some(1));
     }
 }

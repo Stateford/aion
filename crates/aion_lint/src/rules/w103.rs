@@ -1,15 +1,17 @@
 //! W103: Width mismatch — LHS and RHS of assignment have different bit widths.
 
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
-use aion_ir::ids::TypeId;
-use aion_ir::{Design, Expr, Module, SignalRef, Statement};
+use aion_ir::{Design, Module, Statement};
 
+use crate::helpers::{expr_width, signal_ref_width};
 use crate::LintRule;
 
 /// Detects assignments where the LHS and RHS have different bit widths.
 ///
 /// This checks both continuous assignments and assignments within processes.
-/// Width information is obtained from the `TypeDb`.
+/// Widths come from the shared, overflow-checked helpers
+/// [`signal_ref_width`] and [`expr_width`]; when either side's width is
+/// unknown the assignment is skipped rather than guessed.
 pub struct WidthMismatch;
 
 impl LintRule for WidthMismatch {
@@ -51,81 +53,6 @@ impl LintRule for WidthMismatch {
         // Check assignments in processes
         for (_pid, process) in module.processes.iter() {
             check_stmt_widths(&process.body, module, design, self.code(), sink);
-        }
-    }
-}
-
-/// Returns the bit width of a signal reference, if known.
-fn signal_ref_width(sref: &SignalRef, module: &Module, design: &Design) -> Option<u32> {
-    match sref {
-        SignalRef::Signal(id) => {
-            let signal = module.signals.get(*id);
-            design.types.bit_width(signal.ty)
-        }
-        SignalRef::Slice { high, low, .. } => Some(high - low + 1),
-        SignalRef::Concat(refs) => {
-            let mut total = 0u32;
-            for r in refs {
-                total += signal_ref_width(r, module, design)?;
-            }
-            Some(total)
-        }
-        SignalRef::Const(lv) => Some(lv.width()),
-    }
-}
-
-/// Returns the bit width of an expression, if known from its type annotation.
-///
-/// Returns `None` for context-dependent widths such as VHDL `(others => '0')`
-/// aggregates (which lower to 1-bit all-zero/all-one literals) and small integer
-/// literals used in arithmetic expressions.
-fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
-    match expr {
-        Expr::Signal(sref) => match sref {
-            SignalRef::Slice { high, low, .. } => Some(high - low + 1),
-            SignalRef::Const(lv) => Some(lv.width()),
-            _ => None, // Would need module context to resolve signal types
-        },
-        Expr::Literal(lv) => {
-            // 1-bit all-zero or all-one literals are context-dependent in VHDL:
-            // they represent `(others => '0')` or `(others => '1')` aggregates
-            // whose actual width matches the assignment target.
-            if lv.width() == 1 && (lv.is_all_zero() || lv.is_all_one()) {
-                return None;
-            }
-            Some(lv.width())
-        }
-        Expr::Unary { ty, .. }
-        | Expr::Binary { ty, .. }
-        | Expr::Ternary { ty, .. }
-        | Expr::FuncCall { ty, .. } => {
-            // TypeId::from_raw(0) is used as a placeholder for unresolved types
-            // throughout elaboration. Since this ID may coincidentally alias with a
-            // real type (e.g., std_logic → Bit → 1 bit), treat it as unknown to
-            // avoid false width-mismatch warnings.
-            if *ty == TypeId::from_raw(0) {
-                return None;
-            }
-            design.types.bit_width(*ty)
-        }
-        Expr::Concat(exprs) => {
-            let mut total = 0u32;
-            for e in exprs {
-                total += expr_width(e, design)?;
-            }
-            Some(total)
-        }
-        Expr::Repeat { expr, count, .. } => expr_width(expr, design).map(|w| w * count),
-        Expr::Index { .. } => Some(1), // Single-bit index
-        Expr::Slice { high, low, .. } => {
-            // If high/low are literals, we can compute width
-            if let (Expr::Literal(h), Expr::Literal(l)) = (high.as_ref(), low.as_ref()) {
-                let hv = h.to_u64()?;
-                let lv = l.to_u64()?;
-                Some((hv - lv + 1) as u32)
-            } else {
-                None
-            }
         }
     }
 }
@@ -411,5 +338,138 @@ mod tests {
             1,
             "4-bit literal assigned to 8-bit should still fire W103"
         );
+    }
+
+    // ---- Issue #38 regressions: panic-proof widths ----
+
+    fn add_vec_signal(module: &mut Module, types: &mut TypeDb, width: u32) -> SignalId {
+        let ty = types.intern(Type::BitVec {
+            width,
+            signed: false,
+        });
+        let n = module.signals.len() as u32;
+        module.signals.alloc(Signal {
+            id: SignalId::from_raw(n),
+            name: Ident::from_raw(10 + n),
+            ty,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        })
+    }
+
+    fn literal_slice(sig: SignalId, high: u64, low: u64) -> Expr {
+        Expr::Slice {
+            expr: Box::new(Expr::Signal(SignalRef::Signal(sig))),
+            high: Box::new(Expr::Literal(LogicVec::from_u64(high, 32))),
+            low: Box::new(Expr::Literal(LogicVec::from_u64(low, 32))),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn run_rule(module: Module, types: TypeDb) -> Vec<aion_diagnostics::Diagnostic> {
+        let design = mk_design(module, types);
+        let sink = DiagnosticSink::new();
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        sink.take_all()
+    }
+
+    #[test]
+    fn ascending_lhs_slice_matching_width_no_warning() {
+        // `assign y[0:3] = 4'hF;` on `output [0:7] y` (high < low).
+        let (mut module, mut types) = mk_module_with_types();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Slice {
+                signal: y,
+                high: 0,
+                low: 3,
+            },
+            value: Expr::Literal(LogicVec::from_u64(0xF, 4)),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn ascending_lhs_slice_mismatch_reports_real_width() {
+        let (mut module, mut types) = mk_module_with_types();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Slice {
+                signal: y,
+                high: 0,
+                low: 3,
+            },
+            value: Expr::Literal(LogicVec::from_u64(0xFF, 8)),
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, types);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("LHS is 4 bits, RHS is 8 bits"));
+    }
+
+    #[test]
+    fn ascending_rhs_slice_no_panic() {
+        // VHDL `y <= a(0 to 3);` lowers to an Expr::Slice with high < low.
+        let (mut module, mut types) = mk_module_with_types();
+        let a = add_vec_signal(&mut module, &mut types, 8);
+        let y = add_vec_signal(&mut module, &mut types, 4);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: literal_slice(a, 0, 3),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn part_select_lowering_no_panic() {
+        // `a[0 +: 8]` lowers to Slice { high: 0, low: 8 } (see LINT-4). The
+        // width is not meaningful yet, but the rule must not panic.
+        let (mut module, mut types) = mk_module_with_types();
+        let a = add_vec_signal(&mut module, &mut types, 16);
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: literal_slice(a, 0, 8),
+            span: Span::DUMMY,
+        });
+        let _ = run_rule(module, types);
+    }
+
+    #[test]
+    fn huge_replication_no_panic_no_warning() {
+        // `assign y = {1000000000{8'hFF}};` overflows u32 -> width unknown.
+        let (mut module, mut types) = mk_module_with_types();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Repeat {
+                expr: Box::new(Expr::Literal(LogicVec::from_u64(0xFF, 8))),
+                count: 1_000_000_000,
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn overflowing_lhs_concat_no_panic_no_warning() {
+        let (mut module, mut types) = mk_module_with_types();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        let wide = SignalRef::Slice {
+            signal: y,
+            high: u32::MAX - 1,
+            low: 0,
+        };
+        module.assignments.push(Assignment {
+            target: SignalRef::Concat(vec![wide.clone(), wide]),
+            value: Expr::Literal(LogicVec::from_u64(0xFF, 8)),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
     }
 }
