@@ -5,6 +5,32 @@
 
 ---
 
+## 2026-11-01 — Critical-Issue Sweep: #3, #4, #14, #38
+
+All four `priority:critical` issues fixed in parallel worktrees, merged, independently reviewed, and the review findings fixed.
+
+- **#38 Lint (panic-proof widths, engine isolation):** One shared, overflow-checked width oracle in `aion_lint/src/helpers.rs` (`range_width` with `abs_diff`, `type_width`, `signal_ref_width`, `expr_width`; TypeId(0) placeholder = unknown) used by W103 and W107. Ascending slices, VHDL `to` ranges, `a[0 +: 8]` and `{1000000000{8'hFF}}` no longer panic. `LintEngine::run` wraps each rule in `catch_unwind` and reports new **E199** (internal error) instead of crashing. W107 no longer depends on port order. Review follow-up: W107 treats RHS slices/bit-selects as unknown, because part-selects are still lowered as `Slice { high: base, low: width }` (LINT-4); without this, correct designs got false truncations.
+- **#14 VHDL parser (record-body hang):** `parse_record_type_def` now recovers on non-identifier tokens and `:=` defaults ("record elements cannot have a default value"). Added `ensure_progress` guards to all top-level/declaration/statement/case/record loops, plus a 1000-errors-at-one-token backstop that aborts with exactly one diagnostic. Added `tests/adversarial.rs` (~20.6k truncated/deleted/keyword-injected/token-soup inputs under a watchdog, ~3s).
+- **#4 Sim (unified process execution):** Single `SimKernel::run_process` handles Finish/Suspend for every path (delta step, initial, time-0 combinational pass, wakeups). Initial and top-level-`forever` processes are not in the sensitivity map; suspended processes are not re-triggered. `always` without event control is lowered as a `forever` loop (new warning **W203** when it has no timing control; runtime `ZeroTimeLoop`). `initialized`/`waveform_started` flags make `run()`/`initialize()`/`run_until()` idempotent (SIM-21). `run_until` now sets `time_limit`.
+- **#3 Sim (blocking vs non-blocking, NBA region):** New `aion_ir::AssignKind { Blocking, NonBlocking }` on `Statement::Assign`, set by the elaborator for Verilog/SV/VHDL. The evaluator keeps a per-segment blocking-write overlay. The kernel has an `nba_queue` applied once the active region and due wakeups drain, and `#0` resumes run after active events. `apply_write` fits writes to the signal/slice width (fixes `reg [7:0] c; initial c = 0;` shrinking to 1 bit and `q[7:4] = 0` clearing only one bit).
+- **VHDL process declarations (part of #3 + review follow-up):** Process-local variables and constants are now registered, as new `SignalKind::Variable`, scoped as `<label>.<name>` / `_process<N>.<name>`. Declared defaults (`:= "1010"`, `x"…"`, `(others => c)`, constants, integer expressions) become `init`. Unevaluable defaults raise new **W204** rather than being dropped. This also fixes architecture-level constant/signal defaults. Variables are excluded from `process(all)` sensitivity, and W105 ignores variable/constant reads.
+- **Tests added:** ~200 across `aion_lint` (helpers, W103/W107, engine isolation), `aion_conformance` (`lint_width_robustness.rs`, `sim_assign_semantics.rs`), `aion_vhdl_parser` (record recovery, progress helpers, backstop, adversarial corpus), `aion_sim` (kernel region/process tests, evaluator overlay/`apply_write`), `aion_elaborate` (assign kinds, initial/always lowering, W203/W204, VHDL scoping/defaults), `aion_ir` (`AssignKind`/`SignalKind::Variable` serde + bincode), and `aion_cli` end-to-end sim tests.
+- **Status:** `cargo test --workspace` 2327 passed / 0 failed; clippy `-D warnings` clean; fmt clean. `examples/blinky_vhdl` lints clean, and `examples/blinky_soc` simulates to `$finish` at 510 ns.
+- **Known gaps found during review (not fixed here, mostly tracked):**
+  - `+:` part-select lowering is wrong, so W103 still misreports it (LINT-4, #42).
+  - Verilog/SV declaration initializers (`reg clk = 0;`) are dropped (#11).
+  - Same-time wakeups overwrite each other's bit writes (#11).
+  - The VCD time-0 dump is taken before initial blocks run, and `$dumpvars` has no `$end` (#10).
+  - `InteractiveSim` can't advance time (#8).
+  - Context-determined expression widths (#6).
+  - Nested `@(...)`/`wait` in procedural code are not simulated and report `ZeroTimeLoop` (#7).
+  - Posedge from X/Z is not detected.
+  - Statements still run after `$finish` in the same step.
+  - The VHDL parser has no recursion-depth limit (#25).
+  - The `else generate` branch is unreachable (#18).
+  - VHDL string literals in expressions lower to 1 bit.
+  - `$display` keeps the format string's quotes.
+
 ## 2026-11-01 — Sim: `forever` Without Timing Control No Longer Runs Once Silently
 
 - **Bug:** `forever` with no timing control (e.g. `forever clk = ~clk;`) ran its body once and then fell through to the next statement (`evaluator.rs`). That produced a wrong but plausible result with no diagnostic. Real simulators hang on this loop.
