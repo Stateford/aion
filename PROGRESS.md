@@ -5,6 +5,18 @@
 
 ---
 
+## 2026-11-01 — Sim: Unified Process Execution (Fixes #4)
+
+- **One execution path:** a single `SimKernel::run_process` handles Finish and Suspend for every path: delta step, initial blocks, the time-0 combinational pass and wakeups. Delays inside `always` blocks are no longer dropped (SIM-2).
+- **Re-triggering:** Initial processes and top-level-`forever` processes are no longer in the sensitivity map, and suspended processes are not re-triggered. Initial blocks no longer re-run (SIM-1).
+- **Plain `always`:** an `always` block without event control is lowered as a `forever` loop. If it has no timing control at all, the new warning **W203** fires and the simulator returns `ZeroTimeLoop` at run time.
+- **Run once (SIM-21):** new `initialized`/`waveform_started` flags make `run()`, `initialize()` and `run_until()` safe to call repeatedly.
+- **Extra fix:** `run_until` now sets `time_limit`.
+- **Tests:** 19 kernel, 9 elaborator and 5 CLI end-to-end tests, covering the clock idioms, repros A/B/B2 and the SIM-21 cases.
+- **Known gaps:** a nested `@(...)` inside procedural code reports `ZeroTimeLoop` rather than "unsupported" (#7). `InteractiveSim` cannot advance time (#8).
+
+---
+
 ## 2026-11-01 — Sim: `forever` Without Timing Control No Longer Runs Once Silently
 
 - **Bug:** `forever` with no timing control (e.g. `forever clk = ~clk;`) ran its body once and then fell through to the next statement (`evaluator.rs`). That produced a wrong but plausible result with no diagnostic. Real simulators hang on this loop.
