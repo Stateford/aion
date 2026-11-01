@@ -3,6 +3,7 @@
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
 use aion_ir::{Design, Expr, Module, SignalRef, Statement};
 
+use crate::helpers::{expr_width, signal_ref_width};
 use crate::LintRule;
 
 /// Detects assignments where the RHS is wider than the LHS, causing
@@ -10,6 +11,13 @@ use crate::LintRule;
 ///
 /// Unlike W103 (width-mismatch) which fires on any width difference,
 /// this rule specifically flags truncation where data loss occurs.
+/// Widths come from the same overflow-checked helpers as W103
+/// ([`signal_ref_width`] and [`expr_width`]), so neither rule trusts the
+/// elaborator's placeholder result types. W107 is deliberately more
+/// conservative on the RHS: bit-selects and slices are treated as unknown
+/// width (see [`rhs_width`]), because the elaborator currently lowers indexed
+/// part-selects (`a[b +: w]`) as `Slice { high: b, low: w }`, which is
+/// indistinguishable from a real `[b:w]` range in the IR.
 pub struct Truncation;
 
 impl LintRule for Truncation {
@@ -50,43 +58,6 @@ impl LintRule for Truncation {
     }
 }
 
-fn signal_ref_width(sref: &SignalRef, module: &Module, design: &Design) -> Option<u32> {
-    match sref {
-        SignalRef::Signal(id) => {
-            let signal = module.signals.get(*id);
-            design.types.bit_width(signal.ty)
-        }
-        SignalRef::Slice { high, low, .. } => Some(high - low + 1),
-        SignalRef::Concat(refs) => {
-            let mut total = 0u32;
-            for r in refs {
-                total += signal_ref_width(r, module, design)?;
-            }
-            Some(total)
-        }
-        SignalRef::Const(lv) => Some(lv.width()),
-    }
-}
-
-fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
-    match expr {
-        Expr::Literal(lv) => Some(lv.width()),
-        Expr::Unary { ty, .. }
-        | Expr::Binary { ty, .. }
-        | Expr::Ternary { ty, .. }
-        | Expr::FuncCall { ty, .. } => design.types.bit_width(*ty),
-        Expr::Concat(exprs) => {
-            let mut total = 0u32;
-            for e in exprs {
-                total += expr_width(e, design)?;
-            }
-            Some(total)
-        }
-        Expr::Repeat { expr, count, .. } => expr_width(expr, design).map(|w| w * count),
-        _ => None,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn check_truncation(
     target: &SignalRef,
@@ -98,7 +69,7 @@ fn check_truncation(
     sink: &DiagnosticSink,
 ) {
     let lhs_width = signal_ref_width(target, module, design);
-    let rhs_width = expr_width(value, design);
+    let rhs_width = rhs_width(value, design);
     if let (Some(lw), Some(rw)) = (lhs_width, rhs_width) {
         if rw > lw {
             sink.emit(
@@ -113,6 +84,26 @@ fn check_truncation(
                 .with_label(Label::primary(span, "high bits will be truncated")),
             );
         }
+    }
+}
+
+/// Returns the RHS width W107 is willing to trust, or `None` if unknown.
+///
+/// Delegates to the shared [`expr_width`] helper, but treats `Expr::Slice` and
+/// `Expr::Index` (including inside concatenations and replications) as
+/// unknown. The IR cannot yet distinguish a part-select `a[b +: w]` (lowered as
+/// `Slice { high: b, low: w }`) from a genuine `a[b:w]` range, so trusting
+/// slice bounds here produces false truncation warnings on correct designs
+/// such as `assign y = a[0 +: 8];` or byte-lane concatenations. Remove this
+/// restriction once the elaborator lowers part-selects to real bounds.
+fn rhs_width(expr: &Expr, design: &Design) -> Option<u32> {
+    match expr {
+        Expr::Slice { .. } | Expr::Index { .. } => None,
+        Expr::Concat(exprs) => exprs
+            .iter()
+            .try_fold(0u32, |total, e| total.checked_add(rhs_width(e, design)?)),
+        Expr::Repeat { expr, count, .. } => rhs_width(expr, design)?.checked_mul(*count),
+        _ => expr_width(expr, design),
     }
 }
 
@@ -278,5 +269,282 @@ mod tests {
         let sink = DiagnosticSink::new();
         Truncation.check_module(design.modules.get(design.top), &design, &sink);
         assert!(sink.take_all().is_empty());
+    }
+
+    // ---- Issue #38 regressions: panic-proof widths ----
+
+    fn add_vec_signal(module: &mut Module, types: &mut TypeDb, width: u32) -> SignalId {
+        let ty = types.intern(Type::BitVec {
+            width,
+            signed: false,
+        });
+        let n = module.signals.len() as u32;
+        module.signals.alloc(Signal {
+            id: SignalId::from_raw(n),
+            name: Ident::from_raw(10 + n),
+            ty,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        })
+    }
+
+    fn literal_slice(sig: SignalId, high: u64, low: u64) -> Expr {
+        Expr::Slice {
+            expr: Box::new(Expr::Signal(SignalRef::Signal(sig))),
+            high: Box::new(Expr::Literal(LogicVec::from_u64(high, 32))),
+            low: Box::new(Expr::Literal(LogicVec::from_u64(low, 32))),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn run_rule(module: Module, types: TypeDb) -> Vec<aion_diagnostics::Diagnostic> {
+        let design = mk_design(module, types);
+        let sink = DiagnosticSink::new();
+        Truncation.check_module(design.modules.get(design.top), &design, &sink);
+        sink.take_all()
+    }
+
+    fn eq_expr(lhs: SignalId, rhs: SignalId, ty: aion_ir::ids::TypeId) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(Expr::Signal(SignalRef::Signal(lhs))),
+            rhs: Box::new(Expr::Signal(SignalRef::Signal(rhs))),
+            ty,
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn ascending_lhs_slice_truncation_reports_real_width() {
+        // `assign y[0:3] = 8'hFF;` on `output [0:7] y`.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Slice {
+                signal: y,
+                high: 0,
+                low: 3,
+            },
+            value: Expr::Literal(LogicVec::from_u64(0xFF, 8)),
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, types);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0]
+            .message
+            .contains("8-bit value assigned to 4-bit target"));
+    }
+
+    #[test]
+    fn ascending_lhs_slice_no_truncation() {
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Slice {
+                signal: y,
+                high: 0,
+                low: 3,
+            },
+            value: Expr::Literal(LogicVec::from_u64(0xF, 4)),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn ascending_and_part_select_rhs_no_panic() {
+        // VHDL `a(0 to 3)` and Verilog `a[0 +: 8]` both lower to slices with
+        // high < low; neither may panic.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let a = add_vec_signal(&mut module, &mut types, 16);
+        let y = add_vec_signal(&mut module, &mut types, 4);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: literal_slice(a, 0, 3),
+            span: Span::DUMMY,
+        });
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: literal_slice(a, 0, 8),
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, types);
+        // Slices on the RHS are treated as unknown width (part-selects are
+        // lowered as `Slice { high: base, low: width }`), so neither fires.
+        assert!(diags.is_empty(), "{diags:#?}");
+    }
+
+    #[test]
+    fn part_select_rhs_no_false_truncation() {
+        // `assign y = a[24 +: 8];` lowers to Slice{24, 8} (17 "bits").
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let a = add_vec_signal(&mut module, &mut types, 32);
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: literal_slice(a, 24, 8),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn byte_lane_concat_of_part_selects_no_false_truncation() {
+        // `{a[0 +: 8], a[8 +: 8], a[16 +: 8], a[24 +: 8]}` into 32 bits.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let a = add_vec_signal(&mut module, &mut types, 32);
+        let y = add_vec_signal(&mut module, &mut types, 32);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Concat(vec![
+                literal_slice(a, 0, 8),
+                literal_slice(a, 8, 8),
+                literal_slice(a, 16, 8),
+                literal_slice(a, 24, 8),
+            ]),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn slice_rhs_into_one_bit_target_no_false_truncation() {
+        // Constant-index memory writes (`mem[1] <= a[7:0]`) and unsupported
+        // targets lower to 1-bit targets; a slice RHS must not trigger W107.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let a = add_vec_signal(&mut module, &mut types, 8);
+        let mem = add_vec_signal(&mut module, &mut types, 32);
+        module.assignments.push(Assignment {
+            target: SignalRef::Slice {
+                signal: mem,
+                high: 1,
+                low: 1,
+            },
+            value: literal_slice(a, 7, 0),
+            span: Span::DUMMY,
+        });
+        module.assignments.push(Assignment {
+            target: SignalRef::Const(LogicVec::all_zero(1)),
+            value: literal_slice(a, 7, 0),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn literal_concat_still_detects_truncation() {
+        // Non-slice RHS widths are still trusted, including inside concats.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Concat(vec![
+                Expr::Literal(LogicVec::from_u64(0xAB, 8)),
+                Expr::Literal(LogicVec::from_u64(0xCD, 8)),
+            ]),
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, types);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("losing 8 bits"));
+    }
+
+    #[test]
+    fn huge_replication_no_panic_no_warning() {
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Repeat {
+                expr: Box::new(Expr::Literal(LogicVec::from_u64(0xFF, 8))),
+                count: 1_000_000_000,
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn overflowing_rhs_concat_no_panic_no_warning() {
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        let big = Expr::Repeat {
+            expr: Box::new(Expr::Literal(LogicVec::from_u64(0xF, 4))),
+            count: u32::MAX / 4,
+            span: Span::DUMMY,
+        };
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Concat(vec![big.clone(), big]),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn placeholder_type_ignored_regardless_of_port_order() {
+        // `assign y = a == b;` - the comparison carries the TypeId(0)
+        // placeholder. Whether TypeId(0) happens to be the 8-bit type (a
+        // declared first) or the 1-bit type (y declared first), W107 must
+        // give the same verdict: no truncation.
+        for wide_first in [true, false] {
+            let mut module = mk_module();
+            let mut types = TypeDb::new();
+            let (a, b, y) = if wide_first {
+                let a = add_vec_signal(&mut module, &mut types, 8);
+                let b = add_vec_signal(&mut module, &mut types, 8);
+                let y = add_vec_signal(&mut module, &mut types, 1);
+                (a, b, y)
+            } else {
+                let y = add_vec_signal(&mut module, &mut types, 1);
+                let a = add_vec_signal(&mut module, &mut types, 8);
+                let b = add_vec_signal(&mut module, &mut types, 8);
+                (a, b, y)
+            };
+            module.assignments.push(Assignment {
+                target: SignalRef::Signal(y),
+                value: eq_expr(a, b, aion_ir::ids::TypeId::from_raw(0)),
+                span: Span::DUMMY,
+            });
+            let diags = run_rule(module, types);
+            assert!(diags.is_empty(), "wide_first={wide_first}: {diags:#?}");
+        }
+    }
+
+    #[test]
+    fn resolved_binary_type_still_detects_truncation() {
+        // A non-placeholder result type is trusted: 8-bit sum into 4 bits.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 4);
+        let a = add_vec_signal(&mut module, &mut types, 8);
+        let ty8 = module.signals.get(a).ty;
+        assert_ne!(ty8, aion_ir::ids::TypeId::from_raw(0));
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(Expr::Signal(SignalRef::Signal(a))),
+                rhs: Box::new(Expr::Signal(SignalRef::Signal(a))),
+                ty: ty8,
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, types);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("losing 4 bits"));
     }
 }
