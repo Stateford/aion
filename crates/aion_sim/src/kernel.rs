@@ -1097,10 +1097,20 @@ impl SimKernel {
     /// has not been called.
     pub fn run_until(&mut self, target_fs: u64) -> Result<StepResult, SimError> {
         self.ensure_initialized()?;
-        // Like `run()`, the run's end time bounds `step_delta()`. Without this
-        // a stale limit from an earlier `run()` would make `step_delta()`
-        // refuse events this loop has already chosen to process.
-        self.time_limit = Some(target_fs);
+        // The target bounds `step_delta()` for this call only. Without it, a
+        // stale limit from an earlier `run()` would make `step_delta()` refuse
+        // events this loop has already chosen to process. The caller's limit is
+        // restored on every return path so later `step_delta()` /
+        // `run_to_completion()` calls are not cut off at this target.
+        let saved_limit = self.time_limit.replace(target_fs);
+        let result = self.run_until_inner(target_fs);
+        self.time_limit = saved_limit;
+        result
+    }
+
+    /// The body of [`run_until`](Self::run_until), run with `time_limit`
+    /// temporarily set to `target_fs`.
+    fn run_until_inner(&mut self, target_fs: u64) -> Result<StepResult, SimError> {
         let mut deltas_at_current_time = 0u32;
 
         while !self.finished {
@@ -3113,6 +3123,47 @@ mod tests {
         kernel.run(5 * NS).unwrap();
         assert_eq!(kernel.take_display_output(), vec!["hello".to_string()]);
         assert_eq!(kernel.suspended_processes.len(), 1);
+    }
+
+    #[test]
+    fn run_until_does_not_leave_its_target_as_time_limit() {
+        // The 5 ns wakeup is beyond run_until(2 ns). Afterwards, an unbounded
+        // run_to_completion() must still process it rather than stopping at
+        // the 2 ns target left behind as a stale limit.
+        // initial #5 clk = 1; — a single wakeup, then the design is idle.
+        let design = build_design(
+            &[(2, 0, None)],
+            vec![(
+                ProcessKind::Initial,
+                Sensitivity::All,
+                after(5, set(0, lit(1, 1))),
+            )],
+            vec![],
+        );
+        let mut kernel = kernel_for(&design);
+        assert_eq!(kernel.run_until(2 * NS).unwrap(), StepResult::Continued);
+        assert_eq!(kernel.time_limit, None);
+        kernel.run_to_completion().unwrap();
+        assert_eq!(value_of(&kernel, "top.clk"), Some(1));
+        assert_eq!(kernel.current_time().fs, 5 * NS);
+    }
+
+    #[test]
+    fn run_until_restores_caller_time_limit() {
+        let mut kernel = kernel_for(&hello_design());
+        kernel.set_time_limit(9 * NS);
+        kernel.run_until(2 * NS).unwrap();
+        assert_eq!(kernel.time_limit, Some(9 * NS));
+    }
+
+    #[test]
+    fn run_until_restores_time_limit_on_error() {
+        // `initial forever #0;` trips the delta limit inside run_until; the
+        // caller's (absent) limit must still be restored.
+        let mut kernel = kernel_for(&make_initial_design(forever_zero_delay()));
+        kernel.set_max_delta(10);
+        assert!(kernel.run_until(5 * NS).is_err());
+        assert_eq!(kernel.time_limit, None);
     }
 
     #[test]
