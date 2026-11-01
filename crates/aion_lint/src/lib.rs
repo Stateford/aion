@@ -19,8 +19,9 @@ mod rules;
 pub use engine::LintEngine;
 pub use helpers::{
     check_cell_port_match, collect_expr_signals, collect_read_signals, collect_signal_ref_signals,
-    collect_written_signals, count_drivers, has_assign, is_signal_driven_in_module,
-    is_signal_read_in_module, stmt_has_full_else_coverage, PortMatchIssue,
+    collect_written_signals, count_drivers, expr_width, has_assign, is_signal_driven_in_module,
+    is_signal_read_in_module, range_width, signal_ref_width, stmt_has_full_else_coverage,
+    type_width, PortMatchIssue,
 };
 pub use rules::register_builtin_rules;
 pub use rules::{
@@ -30,8 +31,20 @@ pub use rules::{
     UnusedSignal, WidthMismatch,
 };
 
-use aion_diagnostics::{DiagnosticCode, DiagnosticSink, Severity};
+use aion_diagnostics::{Category, DiagnosticCode, DiagnosticSink, Severity};
 use aion_ir::{Design, Module};
+
+/// Diagnostic code `E199`, emitted by [`LintEngine::run`] when a lint rule
+/// panics while checking a module.
+///
+/// A panic inside a rule is a bug in Aion, not in the user's design. The
+/// engine catches it, reports this internal error (including the rule name,
+/// module, and panic message), and keeps running the remaining rules so one
+/// faulty rule cannot abort the whole lint pass.
+pub const LINT_INTERNAL_ERROR: DiagnosticCode = DiagnosticCode {
+    category: Category::Error,
+    number: 199,
+};
 
 /// A single lint rule that checks a module for design issues.
 ///
