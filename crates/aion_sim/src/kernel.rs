@@ -661,9 +661,10 @@ impl SimKernel {
                 None
             };
 
-            // Every iteration at the same time counts — including pure
-            // wakeup iterations — so zero-delay loops trip the limit.
-            self.charge_delta(&mut deltas_at_current_time)?;
+            // Delta-cycle iterations always count; pure-wakeup iterations
+            // count only when they leave more work at this same time (a
+            // zero-delay resume), so zero-delay loops trip the limit.
+            self.charge_iteration(step.is_some(), &mut deltas_at_current_time)?;
 
             if step == Some(StepResult::Done) {
                 break;
@@ -687,17 +688,33 @@ impl SimKernel {
     /// Charges one scheduler iteration against the per-time-step delta budget.
     ///
     /// Called once per iteration of the `run_simulation()` / `run_until()`
-    /// loops, whether that iteration resumed suspended processes, ran a
-    /// `step_delta()`, or both. Counting pure wakeup iterations is what stops a
-    /// zero-delay loop (e.g. `initial forever #0;`) from spinning forever at
-    /// one timestamp: each `#0` resume re-queues the process at the same time
-    /// without producing signal events, so it would otherwise never reach the
-    /// limit. The caller resets `deltas_at_current_time` whenever simulation
-    /// time advances.
+    /// loops, after suspended processes were resumed and (if events were due)
+    /// `step_delta()` ran. `stepped` says whether `step_delta()` ran.
     ///
-    /// Returns [`SimError::DeltaCycleLimit`] once `max_delta_per_step`
+    /// - Iterations that ran `step_delta()` are always charged, exactly as
+    ///   delta cycles were before.
+    /// - Pure-wakeup iterations (no signal events) are charged only when they
+    ///   leave more work at the *same* timestamp. That is the signature of a
+    ///   zero-delay loop such as `initial forever #0;`: each `#0` resume
+    ///   re-queues the process at the same time without producing events, so
+    ///   without this charge it would spin forever and never reach the limit.
+    ///   A wakeup that finishes, calls `$finish`, or reschedules into the
+    ///   future cannot loop, so it is not charged; otherwise a tight limit
+    ///   (e.g. `max_delta_per_step == 1`) would reject finite processes.
+    ///
+    /// The caller resets `deltas_at_current_time` whenever time advances.
+    /// Returns [`SimError::DeltaCycleLimit`] once `max_delta_per_step` charged
     /// iterations have run at the current time.
-    fn charge_delta(&self, deltas_at_current_time: &mut u32) -> Result<(), SimError> {
+    fn charge_iteration(
+        &self,
+        stepped: bool,
+        deltas_at_current_time: &mut u32,
+    ) -> Result<(), SimError> {
+        let zero_delay_resume =
+            !self.finished && self.next_event_time_fs() == Some(self.current_time.fs);
+        if !stepped && !zero_delay_resume {
+            return Ok(());
+        }
         *deltas_at_current_time += 1;
         if *deltas_at_current_time >= self.max_delta_per_step {
             return Err(SimError::DeltaCycleLimit {
@@ -1051,9 +1068,10 @@ impl SimKernel {
                 None
             };
 
-            // Every iteration at the same time counts — including pure
-            // wakeup iterations — so zero-delay loops trip the limit.
-            self.charge_delta(&mut deltas_at_current_time)?;
+            // Delta-cycle iterations always count; pure-wakeup iterations
+            // count only when they leave more work at this same time (a
+            // zero-delay resume), so zero-delay loops trip the limit.
+            self.charge_iteration(step.is_some(), &mut deltas_at_current_time)?;
 
             if step == Some(StepResult::Done) && !self.has_pending_events() {
                 return Ok(StepResult::Done);
@@ -2181,6 +2199,79 @@ mod tests {
         let r = kernel.run_until(32 * crate::time::FS_PER_NS).unwrap();
         assert_eq!(r, StepResult::Continued);
         assert_eq!(kernel.signal_value(clk).to_u64(), Some(0));
+    }
+
+    // PR #47 review: a finite pure-wakeup process must not trip a tight limit.
+    #[test]
+    fn terminal_zero_delay_wakeup_not_charged() {
+        // initial #0;  — one zero-delay resume, then nothing left to do.
+        let body = Statement::Delay {
+            duration_fs: 0,
+            body: Box::new(Statement::Nop),
+            span: Span::DUMMY,
+        };
+
+        let design = make_initial_design(body.clone());
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        kernel.set_max_delta(1);
+        let result = kernel.run(100 * crate::time::FS_PER_NS).unwrap();
+        assert_eq!(result.final_time.fs, 0);
+
+        let design = make_initial_design(body);
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        kernel.set_max_delta(1);
+        kernel.initialize().unwrap();
+        assert_eq!(
+            kernel.run_until(100 * crate::time::FS_PER_NS).unwrap(),
+            StepResult::Done
+        );
+    }
+
+    #[test]
+    fn future_rescheduling_wakeup_not_charged() {
+        // initial forever #5;  — pure wakeups that always move time forward.
+        let body = Statement::Forever {
+            body: Box::new(Statement::Delay {
+                duration_fs: 5 * crate::time::FS_PER_NS,
+                body: Box::new(Statement::Nop),
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+
+        let design = make_initial_design(body.clone());
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        kernel.set_max_delta(1);
+        let result = kernel.run(50 * crate::time::FS_PER_NS).unwrap();
+        assert_eq!(result.final_time.fs, 50 * crate::time::FS_PER_NS);
+
+        let design = make_initial_design(body);
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        kernel.set_max_delta(1);
+        kernel.initialize().unwrap();
+        assert_eq!(
+            kernel.run_until(52 * crate::time::FS_PER_NS).unwrap(),
+            StepResult::Continued
+        );
+    }
+
+    #[test]
+    fn zero_delay_loop_trips_limit_of_one() {
+        // The tightest limit still catches the runaway loop immediately.
+        let design = make_initial_design(forever_zero_delay());
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        kernel.set_max_delta(1);
+        let err = kernel.run(100 * crate::time::FS_PER_NS).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SimError::DeltaCycleLimit {
+                    fs: 0,
+                    max_deltas: 1
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
