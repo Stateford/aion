@@ -170,6 +170,9 @@ pub struct SimKernel {
     /// once no active work (signal events or due wakeups) remains at the
     /// current timestamp, matching the IEEE 1364/1800 region order.
     nba_queue: Vec<PendingUpdate>,
+    /// Flat signals that back VHDL process-local variables
+    /// ([`SignalKind::Variable`]); never part of an implicit sensitivity set.
+    variables: HashSet<SimSignalId>,
 
     /// Whether the time-0 start (initial blocks plus the initial
     /// combinational pass) has run; shared by `initialize()`, `run()`,
@@ -208,6 +211,7 @@ impl SimKernel {
             total_deltas: 0,
             suspended_processes: Vec::new(),
             nba_queue: Vec::new(),
+            variables: HashSet::new(),
 
             initialized: false,
             waveform_started: false,
@@ -404,12 +408,13 @@ impl SimKernel {
             let width = self.types.bit_width(signal.ty).unwrap_or(1);
 
             let init_value = match &signal.init {
-                Some(ConstValue::Logic(lv)) => lv.clone(),
+                // Fit the declared value to the signal's width.
+                Some(ConstValue::Logic(lv)) => apply_write(&LogicVec::new(width), lv, None),
                 Some(ConstValue::Int(v)) => LogicVec::from_u64(*v as u64, width),
                 Some(ConstValue::Bool(b)) => LogicVec::from_bool(*b),
                 _ => match signal.kind {
                     SignalKind::Wire | SignalKind::Port => LogicVec::new(width),
-                    SignalKind::Reg | SignalKind::Latch => {
+                    SignalKind::Reg | SignalKind::Latch | SignalKind::Variable => {
                         let mut v = LogicVec::new(width);
                         for i in 0..width {
                             v.set(i, Logic::X);
@@ -424,6 +429,9 @@ impl SimKernel {
                 .signals
                 .alloc(SimSignalState::new(name, width, init_value));
             signal_map.insert(sig_id, sim_id);
+            if signal.kind == SignalKind::Variable {
+                self.variables.insert(sim_id);
+            }
         }
 
         // Create processes
@@ -524,9 +532,13 @@ impl SimKernel {
             }
             match &proc.sensitivity {
                 Sensitivity::All => {
-                    // Sensitive to all read signals
+                    // Sensitive to all read signals, but not to VHDL
+                    // variables: `process(all)` covers signals only, and a
+                    // variable written by `:=` must not wake its process.
                     for &sig in &proc.read_signals {
-                        self.sensitivity_map.entry(sig).or_default().push(idx);
+                        if !self.variables.contains(&sig) {
+                            self.sensitivity_map.entry(sig).or_default().push(idx);
+                        }
                     }
                 }
                 Sensitivity::EdgeList(edges) => {
@@ -3374,6 +3386,71 @@ mod tests {
             assert_eq!(val(&kernel, "a"), Some(2));
             assert_eq!(val(&kernel, "b"), Some(1));
             assert!(kernel.nba_queue.is_empty());
+        }
+
+        /// `process(all)` that counts its own runs in `n` and drives
+        /// `y <= a`; `n` is a VHDL variable when `n_is_variable`.
+        fn counting_process(n_is_variable: bool) -> (Design, Interner) {
+            let (mut design, interner) = build(
+                &[("a", 1, Some(0)), ("n", 8, Some(0)), ("y", 1, None)],
+                vec![(
+                    ProcessKind::Combinational,
+                    Sensitivity::All,
+                    blk(vec![ba(s(1), add(rd(1), lit(1, 8))), nb(s(2), rd(0))]),
+                )],
+                vec![],
+            );
+            if n_is_variable {
+                design
+                    .modules
+                    .get_mut(ModuleId::from_raw(0))
+                    .signals
+                    .get_mut(SignalId::from_raw(1))
+                    .kind = SignalKind::Variable;
+            }
+            (design, interner)
+        }
+
+        #[test]
+        fn variable_write_does_not_wake_its_process_all() {
+            // Runs at time 0 and once per change of `a` (1 ns, 2 ns): n = 3.
+            let (design, interner) = counting_process(true);
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            let a = kernel.find_signal("top.a").unwrap();
+            kernel.schedule_event(SimTime::from_ns(1), a, LogicVec::from_bool(true));
+            kernel.schedule_event(SimTime::from_ns(2), a, LogicVec::from_bool(false));
+            kernel.run_to_completion().unwrap();
+            assert_eq!(val(&kernel, "n"), Some(3));
+            assert_eq!(val(&kernel, "y"), Some(0));
+        }
+
+        #[test]
+        fn signal_write_still_wakes_its_process_all() {
+            // The same body with `n` as an ordinary signal re-triggers itself
+            // forever, which the delta-cycle limit reports.
+            let (design, interner) = counting_process(false);
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            kernel.set_max_delta(100);
+            assert!(matches!(
+                kernel.run_to_completion(),
+                Err(SimError::DeltaCycleLimit { fs: 0, .. })
+            ));
+        }
+
+        #[test]
+        fn declared_init_is_fitted_to_signal_width() {
+            // A 4-bit init on an 8-bit signal is zero-extended, not adopted.
+            let (mut design, interner) = build(&[("x", 8, None)], vec![], vec![]);
+            design
+                .modules
+                .get_mut(ModuleId::from_raw(0))
+                .signals
+                .get_mut(SignalId::from_raw(0))
+                .init = Some(ConstValue::Logic(LogicVec::from_u64(0xA, 4)));
+            let kernel = SimKernel::new(&design, &interner).unwrap();
+            let id = kernel.find_signal("top.x").unwrap();
+            assert_eq!(kernel.signal_value(id).width(), 8);
+            assert_eq!(kernel.signal_value(id).to_u64(), Some(0x0A));
         }
 
         #[test]

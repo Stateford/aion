@@ -1536,4 +1536,120 @@ mod tests {
             .collect();
         assert_eq!(unknown, vec!["unknown signal `v`".to_string()], "{diags:?}");
     }
+
+    /// A top-module IR signal as `(name, kind, init as u64)`.
+    type VhdlObject = (String, aion_ir::SignalKind, Option<u64>);
+
+    /// Elaborates a VHDL architecture body `arch_body` (declarations, then
+    /// `begin` and statements) of entity `t`, returning every top-module
+    /// signal as `(name, kind, init as u64)` plus the diagnostics.
+    fn vhdl_objects(arch_body: &str) -> (Vec<VhdlObject>, Vec<aion_diagnostics::Diagnostic>) {
+        let src = format!(
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\
+             entity t is port (a : in std_logic; y : out std_logic); end entity;\n\
+             architecture rtl of t is\n{arch_body}\nend architecture;"
+        );
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source("t.vhd", src);
+        let parsed = crate::ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![aion_vhdl_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            )],
+        };
+        let config: aion_config::ProjectConfig =
+            toml::from_str("[project]\nname = \"t\"\nversion = \"0.1.0\"\ntop = \"t\"\n").unwrap();
+        let design = crate::elaborate(&parsed, &config, &source_db, &interner, &sink).unwrap();
+        let objects = design.modules[design.top]
+            .signals
+            .iter()
+            .map(|(_, s)| {
+                let init = match &s.init {
+                    Some(aion_ir::ConstValue::Logic(lv)) => lv.to_u64(),
+                    Some(aion_ir::ConstValue::Int(v)) => Some(*v as u64),
+                    _ => None,
+                };
+                (interner.resolve(s.name).to_string(), s.kind, init)
+            })
+            .collect();
+        (objects, sink.diagnostics())
+    }
+
+    fn find<'a>(objects: &'a [VhdlObject], name: &str) -> &'a VhdlObject {
+        objects
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .unwrap_or_else(|| panic!("no object {name} in {objects:?}"))
+    }
+
+    #[test]
+    fn vhdl_process_locals_get_scoped_names_kinds_and_defaults() {
+        use aion_ir::SignalKind;
+        let (objects, diags) = vhdl_objects(
+            "begin\n\
+             p : process (a)\n\
+               constant K : std_logic_vector(3 downto 0) := \"1010\";\n\
+               variable t : std_logic_vector(3 downto 0) := \"0110\";\n\
+               variable n : integer := 3;\n\
+               variable u : std_logic;\n\
+             begin y <= a; end process;\n\
+             process (a) variable v : std_logic := '1'; begin y <= v; end process;",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(find(&objects, "p.K").1, SignalKind::Const);
+        assert_eq!(find(&objects, "p.K").2, Some(0b1010));
+        assert_eq!(find(&objects, "p.t").1, SignalKind::Variable);
+        assert_eq!(find(&objects, "p.t").2, Some(0b0110));
+        assert_eq!(find(&objects, "p.n").2, Some(3));
+        // No default: no init (the simulator starts it as X).
+        assert_eq!(find(&objects, "p.u").2, None);
+        // Unlabelled process: `_process<N>` scope (N = its index).
+        assert_eq!(find(&objects, "_process1.v").1, SignalKind::Variable);
+        assert_eq!(find(&objects, "_process1.v").2, Some(1));
+        assert!(objects.iter().all(|(n, _, _)| n != "t" && n != "v"));
+    }
+
+    #[test]
+    fn vhdl_architecture_defaults_and_shared_variable_kind() {
+        use aion_ir::SignalKind;
+        let (objects, diags) = vhdl_objects(
+            "constant K : std_logic_vector(7 downto 0) := x\"5A\";\n\
+             constant Z : std_logic_vector(7 downto 0) := (others => '1');\n\
+             constant P : std_logic_vector(1 downto 0) := ('1', '0');\n\
+             constant K2 : std_logic_vector(7 downto 0) := K;\n\
+             constant B : boolean := true;\n\
+             signal s : std_logic := '0';\n\
+             shared variable sv : std_logic;\n\
+             begin\n y <= a;",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(find(&objects, "K").2, Some(0x5A));
+        assert_eq!(find(&objects, "Z").2, Some(0xFF));
+        assert_eq!(find(&objects, "P").2, Some(0b10));
+        assert_eq!(find(&objects, "K2").2, Some(0x5A));
+        assert_eq!(find(&objects, "B").2, Some(1));
+        assert_eq!(
+            find(&objects, "s"),
+            &("s".to_string(), SignalKind::Wire, Some(0))
+        );
+        // Shared variables are visible to all processes: not process-local.
+        assert_eq!(find(&objects, "sv").1, SignalKind::Reg);
+    }
+
+    #[test]
+    fn vhdl_unevaluable_default_is_reported_not_dropped_silently() {
+        let (objects, diags) = vhdl_objects(
+            "begin\n\
+             p : process (a)\n\
+               variable t : std_logic := a;\n\
+             begin y <= t; end process;",
+        );
+        let w204: Vec<_> = diags.iter().filter(|d| d.code == errors::W204).collect();
+        assert_eq!(w204.len(), 1, "{diags:?}");
+        assert!(w204[0].message.contains("`t`"), "{}", w204[0].message);
+        assert_eq!(find(&objects, "p.t").2, None);
+    }
 }
