@@ -5,6 +5,18 @@
 
 ---
 
+## 2026-11-01 — VHDL Parser: Record-Body Hang and No-Progress Guards (Fixes #14)
+
+- **Record body:** `parse_record_type_def` now skips an element that doesn't start with an identifier to the next `;` or `end`. A `:=` default gets the error "record elements cannot have a default value". `end record <name>` is accepted.
+- **Progress guards:** added the `ensure_progress` guard to the design-file, library/use, declaration, concurrent-statement, sequential-statement, case and record loops. The remaining list loops were audited and always consume a separator.
+- **Backstop:** after 1000 errors in a row at one token, the parse aborts with exactly one diagnostic.
+- **Tests:**
+  - 17 parser unit tests covering both repros under a watchdog;
+  - `tests/adversarial.rs`: about 20.6k inputs (truncated, token-deleted, keyword-injected and token soup), each with a 5 s watchdog, about 3 s in total.
+- **Known gaps:** no recursion-depth limit, so 50k nested `(` overflows the stack (#25). An `if … generate` `else` branch is unreachable (#18).
+
+---
+
 ## 2026-11-01 — Sim: `forever` Without Timing Control No Longer Runs Once Silently
 
 - **Bug:** `forever` with no timing control (e.g. `forever clk = ~clk;`) ran its body once and then fell through to the next statement (`evaluator.rs`). That produced a wrong but plausible result with no diagnostic. Real simulators hang on this loop.
