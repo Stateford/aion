@@ -2275,6 +2275,69 @@ mod tests {
     }
 
     #[test]
+    fn forever_without_delay_errors_instead_of_running_once() {
+        // initial begin clk = 0; forever clk = ~clk; $display("unreachable"); end
+        let types = make_type_db();
+        let bit_ty = aion_ir::TypeId::from_raw(0);
+        let mut top = empty_module(0, Ident::from_raw(1));
+        top.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: Ident::from_raw(2),
+            ty: bit_ty,
+            kind: SignalKind::Wire,
+            init: Some(ConstValue::Int(0)),
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        top.processes.alloc(aion_ir::Process {
+            id: aion_ir::ProcessId::from_raw(0),
+            name: None,
+            kind: ProcessKind::Initial,
+            body: Statement::Block {
+                stmts: vec![
+                    Statement::Forever {
+                        body: Box::new(Statement::Assign {
+                            target: SignalRef::Signal(SignalId::from_raw(0)),
+                            value: Expr::Unary {
+                                op: aion_ir::UnaryOp::Not,
+                                operand: Box::new(Expr::Signal(SignalRef::Signal(
+                                    SignalId::from_raw(0),
+                                ))),
+                                ty: bit_ty,
+                                span: Span::DUMMY,
+                            },
+                            span: Span::DUMMY,
+                        }),
+                        span: Span::DUMMY,
+                    },
+                    Statement::Display {
+                        format: "\"unreachable\"".into(),
+                        args: Vec::new(),
+                        span: Span::DUMMY,
+                    },
+                ],
+                span: Span::DUMMY,
+            },
+            sensitivity: Sensitivity::All,
+            span: Span::DUMMY,
+        });
+        let mut modules = Arena::new();
+        modules.alloc(top);
+        let design = Design {
+            modules,
+            top: ModuleId::from_raw(0),
+            types,
+            source_map: aion_ir::SourceMap::new(),
+        };
+
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        let err = kernel.run(100 * crate::time::FS_PER_NS).unwrap_err();
+        assert!(matches!(err, SimError::ZeroTimeLoop), "got {err:?}");
+        // The statement after the loop must not have run.
+        assert!(kernel.take_display_output().is_empty());
+    }
+
+    #[test]
     fn multiple_initial_delays() {
         let types = make_type_db();
         let bit_ty = aion_ir::TypeId::from_raw(0);

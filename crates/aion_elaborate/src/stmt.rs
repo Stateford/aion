@@ -13,6 +13,7 @@ use aion_ir::stmt::{CaseArm as IrCaseArm, Statement as IrStmt};
 use aion_source::SourceDb;
 
 use crate::const_eval;
+use crate::errors;
 use crate::expr::{
     self, lower_sv_expr, lower_sv_to_signal_ref, lower_to_signal_ref, lower_verilog_expr,
     lower_vhdl_expr, lower_vhdl_to_signal_ref, SignalEnv,
@@ -127,6 +128,9 @@ pub fn lower_verilog_stmt(
             lower_verilog_stmt(body, sig_env, source_db, interner, sink)
         }
         Statement::Forever { body, span } => {
+            if !verilog_may_yield(body, interner) {
+                sink.emit(errors::warn_forever_without_timing(*span));
+            }
             let ir_body = lower_verilog_stmt(body, sig_env, source_db, interner, sink);
             IrStmt::Forever {
                 body: Box::new(ir_body),
@@ -186,6 +190,112 @@ pub fn lower_verilog_stmt(
         Statement::Disable { .. } => IrStmt::Nop,
         Statement::Null { .. } => IrStmt::Nop,
         Statement::Error(_) => IrStmt::Nop,
+    }
+}
+
+/// Returns `true` if a system task name ends the simulation (`$finish`/`$stop`).
+fn is_finish_task(name: aion_common::Ident, interner: &Interner) -> bool {
+    matches!(
+        interner.resolve(name).to_lowercase().as_str(),
+        "$finish" | "$stop"
+    )
+}
+
+/// Returns `true` if a Verilog statement can suspend or leave an enclosing
+/// `forever` loop.
+///
+/// Used to flag `forever` loops that can only ever spin at one simulation
+/// time (W202). The check is deliberately conservative so it never fires on a
+/// loop that might be fine: delays, event controls, `wait`, `disable`,
+/// `$finish`/`$stop`, user task calls (which may contain delays) and error
+/// nodes all count as "may yield". It runs on the AST because lowering drops
+/// nested event controls, so the IR alone cannot tell `forever @(posedge clk)`
+/// apart from a loop with no timing control.
+fn verilog_may_yield(stmt: &aion_verilog_parser::ast::Statement, interner: &Interner) -> bool {
+    use aion_verilog_parser::ast::Statement;
+    match stmt {
+        Statement::Delay { .. }
+        | Statement::EventControl { .. }
+        | Statement::Wait { .. }
+        | Statement::Disable { .. }
+        | Statement::TaskCall { .. }
+        | Statement::Error(_) => true,
+        Statement::SystemTaskCall { name, .. } => is_finish_task(*name, interner),
+        Statement::Block { stmts, .. } => stmts.iter().any(|s| verilog_may_yield(s, interner)),
+        Statement::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            verilog_may_yield(then_stmt, interner)
+                || else_stmt
+                    .as_deref()
+                    .is_some_and(|s| verilog_may_yield(s, interner))
+        }
+        Statement::Case { arms, .. } => arms.iter().any(|a| verilog_may_yield(&a.body, interner)),
+        Statement::For {
+            init, step, body, ..
+        } => {
+            verilog_may_yield(init, interner)
+                || verilog_may_yield(step, interner)
+                || verilog_may_yield(body, interner)
+        }
+        Statement::While { body, .. }
+        | Statement::Forever { body, .. }
+        | Statement::Repeat { body, .. } => verilog_may_yield(body, interner),
+        Statement::Blocking { .. } | Statement::NonBlocking { .. } | Statement::Null { .. } => {
+            false
+        }
+    }
+}
+
+/// SystemVerilog counterpart of [`verilog_may_yield`].
+///
+/// Additionally treats `break` and `return` as leaving the loop.
+fn sv_may_yield(stmt: &aion_sv_parser::ast::Statement, interner: &Interner) -> bool {
+    use aion_sv_parser::ast::Statement;
+    match stmt {
+        Statement::Delay { .. }
+        | Statement::EventControl { .. }
+        | Statement::Wait { .. }
+        | Statement::Disable { .. }
+        | Statement::TaskCall { .. }
+        | Statement::Break { .. }
+        | Statement::Return { .. }
+        | Statement::Error(_) => true,
+        Statement::SystemTaskCall { name, .. } => is_finish_task(*name, interner),
+        Statement::Block { stmts, .. } => stmts.iter().any(|s| sv_may_yield(s, interner)),
+        Statement::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            sv_may_yield(then_stmt, interner)
+                || else_stmt
+                    .as_deref()
+                    .is_some_and(|s| sv_may_yield(s, interner))
+        }
+        Statement::Case { arms, .. } => arms.iter().any(|a| sv_may_yield(&a.body, interner)),
+        Statement::For {
+            init, step, body, ..
+        } => {
+            sv_may_yield(init, interner)
+                || sv_may_yield(step, interner)
+                || sv_may_yield(body, interner)
+        }
+        Statement::While { body, .. }
+        | Statement::DoWhile { body, .. }
+        | Statement::Forever { body, .. }
+        | Statement::Repeat { body, .. }
+        | Statement::Foreach { body, .. } => sv_may_yield(body, interner),
+        Statement::Blocking { .. }
+        | Statement::NonBlocking { .. }
+        | Statement::CompoundAssign { .. }
+        | Statement::IncrDecr { .. }
+        | Statement::Continue { .. }
+        | Statement::Assertion(_)
+        | Statement::LocalVarDecl(_)
+        | Statement::Null { .. } => false,
     }
 }
 
@@ -342,6 +452,9 @@ pub fn lower_sv_stmt(
         Statement::While { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
         Statement::DoWhile { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
         Statement::Forever { body, span } => {
+            if !sv_may_yield(body, interner) {
+                sink.emit(errors::warn_forever_without_timing(*span));
+            }
             let ir_body = lower_sv_stmt(body, sig_env, source_db, interner, sink);
             IrStmt::Forever {
                 body: Box::new(ir_body),
@@ -950,6 +1063,88 @@ mod tests {
         } else {
             panic!("expected Forever, got {:?}", ir);
         }
+        // `forever ;` has no timing control → W202.
+        let diags = sink.diagnostics();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, crate::errors::W202);
+    }
+
+    #[test]
+    fn verilog_may_yield_conservative_cases() {
+        use aion_verilog_parser::ast::{Expr, Statement};
+        let interner = Interner::new();
+        let null = Statement::Null { span: Span::DUMMY };
+        assert!(!verilog_may_yield(&null, &interner));
+        // User task calls may contain delays; error nodes must not cascade.
+        let task = Statement::TaskCall {
+            name: Expr::Identifier {
+                name: interner.get_or_intern("my_task"),
+                span: Span::DUMMY,
+            },
+            args: vec![],
+            span: Span::DUMMY,
+        };
+        assert!(verilog_may_yield(&task, &interner));
+        assert!(verilog_may_yield(&Statement::Error(Span::DUMMY), &interner));
+        let display = Statement::SystemTaskCall {
+            name: interner.get_or_intern("$display"),
+            args: vec![],
+            span: Span::DUMMY,
+        };
+        assert!(!verilog_may_yield(&display, &interner));
+        let stop = Statement::SystemTaskCall {
+            name: interner.get_or_intern("$STOP"),
+            args: vec![],
+            span: Span::DUMMY,
+        };
+        assert!(verilog_may_yield(&stop, &interner));
+    }
+
+    #[test]
+    fn sv_may_yield_break_return_continue() {
+        use aion_sv_parser::ast::Statement;
+        let interner = Interner::new();
+        assert!(sv_may_yield(
+            &Statement::Break { span: Span::DUMMY },
+            &interner
+        ));
+        assert!(sv_may_yield(
+            &Statement::Return {
+                value: None,
+                span: Span::DUMMY
+            },
+            &interner
+        ));
+        // `continue` restarts the loop; it does not leave it.
+        assert!(!sv_may_yield(
+            &Statement::Continue { span: Span::DUMMY },
+            &interner
+        ));
+    }
+
+    #[test]
+    fn forever_with_delay_emits_no_w202() {
+        let mut sdb = SourceDb::new();
+        let file_id = sdb.add_source("test.sv", "5".into());
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let env = SignalEnv::new();
+        let stmt = aion_sv_parser::ast::Statement::Forever {
+            body: Box::new(aion_sv_parser::ast::Statement::Delay {
+                delay: aion_sv_parser::ast::Expr::Literal {
+                    span: aion_source::Span {
+                        file: file_id,
+                        start: 0,
+                        end: 1,
+                    },
+                },
+                body: Box::new(aion_sv_parser::ast::Statement::Null { span: Span::DUMMY }),
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+        lower_sv_stmt(&stmt, &env, &sdb, &interner, &sink);
+        assert!(sink.diagnostics().is_empty());
     }
 
     #[test]
@@ -995,5 +1190,9 @@ mod tests {
         } else {
             panic!("expected Forever, got {:?}", ir);
         }
+        // `forever ;` has no timing control → W202.
+        let diags = sink.diagnostics();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, crate::errors::W202);
     }
 }

@@ -580,8 +580,21 @@ pub fn exec_statement(
                 }
                 ExecResult::Finish => Ok(ExecResult::Finish),
                 ExecResult::Continue => {
-                    // Forever without delay → would loop infinitely, just continue
-                    Ok(ExecResult::Continue)
+                    // The body finished without suspending. Signals only change
+                    // when this process yields, so every further iteration
+                    // would be identical: a zero-time infinite loop. Never
+                    // silently fall through (the old behaviour ran the body
+                    // once and continued, producing a wrong result).
+                    if contains_wait(body) {
+                        Err(SimError::Unsupported {
+                            reason: "`wait` inside a `forever` loop with no delay; \
+                                     wait statements are not yet supported by the \
+                                     simulator"
+                                .into(),
+                        })
+                    } else {
+                        Err(SimError::ZeroTimeLoop)
+                    }
                 }
             }
         }
@@ -589,6 +602,33 @@ pub fn exec_statement(
         Statement::Finish { .. } => Ok(ExecResult::Finish),
 
         Statement::Nop => Ok(ExecResult::Continue),
+    }
+}
+
+/// Returns `true` if `stmt` contains a [`Statement::Wait`] anywhere inside it.
+///
+/// The simulator executes `Wait` as a no-op, so a `forever` body that
+/// contains one but never reaches a delay is reported as an unsupported
+/// construct rather than as a zero-time loop in the user's design.
+fn contains_wait(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Wait { .. } => true,
+        Statement::Block { stmts, .. } => stmts.iter().any(contains_wait),
+        Statement::If {
+            then_body,
+            else_body,
+            ..
+        } => contains_wait(then_body) || else_body.as_deref().is_some_and(contains_wait),
+        Statement::Case { arms, default, .. } => {
+            arms.iter().any(|a| contains_wait(&a.body))
+                || default.as_deref().is_some_and(contains_wait)
+        }
+        Statement::Delay { body, .. } | Statement::Forever { body, .. } => contains_wait(body),
+        Statement::Assign { .. }
+        | Statement::Assertion { .. }
+        | Statement::Display { .. }
+        | Statement::Finish { .. }
+        | Statement::Nop => false,
     }
 }
 
@@ -1603,18 +1643,135 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exec_forever_without_delay_continues() {
+    /// Executes `forever <body>` against a single 4-bit signal.
+    fn exec_forever(body: Statement) -> Result<ExecResult, SimError> {
         let (mut signals, map, types) = setup_one_signal(LogicVec::new(4));
         let ctx = make_ctx_with_signals(&mut signals, &map, &types);
         let stmt = Statement::Forever {
-            body: Box::new(Statement::Nop),
+            body: Box::new(body),
             span: Span::DUMMY,
         };
         let mut pending = Vec::new();
         let mut display = Vec::new();
-        let result = exec_statement(&ctx, &stmt, &mut pending, &mut display).unwrap();
-        assert!(matches!(result, ExecResult::Continue));
+        exec_statement(&ctx, &stmt, &mut pending, &mut display)
+    }
+
+    fn assign_sig0(value: u64) -> Statement {
+        Statement::Assign {
+            target: SignalRef::Signal(SignalId::from_raw(0)),
+            value: Expr::Literal(LogicVec::from_u64(value, 4)),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn delay_5ns(body: Statement) -> Statement {
+        Statement::Delay {
+            duration_fs: 5_000_000,
+            body: Box::new(body),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn if_literal(cond: bool, then_body: Statement) -> Statement {
+        Statement::If {
+            condition: Expr::Literal(LogicVec::from_bool(cond)),
+            then_body: Box::new(then_body),
+            else_body: None,
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn exec_forever_empty_body_is_zero_time_loop() {
+        assert!(matches!(
+            exec_forever(Statement::Nop),
+            Err(SimError::ZeroTimeLoop)
+        ));
+    }
+
+    #[test]
+    fn exec_forever_assign_without_delay_is_zero_time_loop() {
+        // forever x = 1;  — used to run once and silently continue.
+        assert!(matches!(
+            exec_forever(assign_sig0(1)),
+            Err(SimError::ZeroTimeLoop)
+        ));
+    }
+
+    #[test]
+    fn exec_forever_untaken_delay_branch_is_zero_time_loop() {
+        // forever if (0) #5 x = 1;  — the delay exists but is never reached,
+        // and the condition cannot change because the loop never yields.
+        assert!(matches!(
+            exec_forever(if_literal(false, delay_5ns(assign_sig0(1)))),
+            Err(SimError::ZeroTimeLoop)
+        ));
+    }
+
+    #[test]
+    fn exec_forever_taken_delay_branch_suspends() {
+        let result = exec_forever(if_literal(true, delay_5ns(assign_sig0(1)))).unwrap();
+        assert!(matches!(
+            result,
+            ExecResult::Suspend {
+                delay_fs: 5_000_000,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn exec_forever_finish_without_delay_finishes() {
+        // forever $finish;  — terminates, so it is not a zero-time loop.
+        let result = exec_forever(Statement::Finish { span: Span::DUMMY }).unwrap();
+        assert!(matches!(result, ExecResult::Finish));
+    }
+
+    #[test]
+    fn exec_forever_wait_without_delay_is_unsupported() {
+        let body = Statement::Block {
+            stmts: vec![
+                Statement::Wait {
+                    duration: None,
+                    span: Span::DUMMY,
+                },
+                assign_sig0(1),
+            ],
+            span: Span::DUMMY,
+        };
+        match exec_forever(body) {
+            Err(SimError::Unsupported { reason }) => assert!(reason.contains("wait")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contains_wait_finds_nested_wait() {
+        let wait = Statement::Wait {
+            duration: None,
+            span: Span::DUMMY,
+        };
+        assert!(contains_wait(&wait));
+        assert!(contains_wait(&if_literal(true, delay_5ns(wait))));
+        assert!(contains_wait(&Statement::Case {
+            subject: Expr::Literal(LogicVec::from_u64(0, 4)),
+            arms: Vec::new(),
+            default: Some(Box::new(Statement::Wait {
+                duration: None,
+                span: Span::DUMMY,
+            })),
+            span: Span::DUMMY,
+        }));
+    }
+
+    #[test]
+    fn contains_wait_false_without_wait() {
+        assert!(!contains_wait(&Statement::Nop));
+        assert!(!contains_wait(&delay_5ns(assign_sig0(1))));
+        assert!(!contains_wait(&Statement::Block {
+            stmts: vec![assign_sig0(1), Statement::Finish { span: Span::DUMMY }],
+            span: Span::DUMMY,
+        }));
     }
 
     #[test]

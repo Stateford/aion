@@ -71,8 +71,14 @@ pub fn run(args: &SimArgs, global: &GlobalArgs) -> Result<i32, Box<dyn std::erro
     let elab_config = make_config_with_top(&config, &top_module);
     let design = aion_elaborate::elaborate(&parsed, &elab_config, &source_db, &interner, &sink)?;
 
-    if sink.has_errors() {
+    // Show elaboration warnings too (e.g. W202 `forever` without timing
+    // control): testbenches live outside `src/`, so `aion lint` never sees
+    // them and this is the only place they can surface.
+    let has_errors = sink.has_errors();
+    if has_errors || !global.quiet {
         render_diagnostics(&sink, &source_db, global.color);
+    }
+    if has_errors {
         return Ok(1);
     }
 
@@ -344,5 +350,47 @@ mod tests {
 
         let result = run(&args, &global);
         assert!(result.is_ok(), "sim failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn sim_forever_without_delay_errors_instead_of_hanging() {
+        let tmp = TempDir::new().unwrap();
+        let project_dir = tmp.path().join("sim_proj");
+        crate::init::run(
+            Some(project_dir.to_str().unwrap().to_string()),
+            crate::HdlLanguage::Verilog,
+            None,
+        )
+        .unwrap();
+        let tb = project_dir.join("tests").join("loop_tb.v");
+        std::fs::write(
+            &tb,
+            "module loop_tb;\n  reg clk;\n  initial begin\n    clk = 0;\n    \
+             forever clk = ~clk;\n  end\nendmodule\n",
+        )
+        .unwrap();
+
+        let args = SimArgs {
+            testbench: tb.to_str().unwrap().to_string(),
+            time: Some("100ns".to_string()),
+            waveform: None,
+            output: None,
+            no_waveform: true,
+            top: None,
+            interactive: false,
+        };
+        let global = GlobalArgs {
+            quiet: true,
+            verbose: false,
+            color: false,
+            config: Some(project_dir.join("aion.toml").to_str().unwrap().to_string()),
+        };
+
+        let err = run(&args, &global).expect_err("zero-time forever loop must fail");
+        assert!(
+            err.to_string()
+                .contains("forever loop completed an iteration"),
+            "unexpected error: {err}"
+        );
     }
 }

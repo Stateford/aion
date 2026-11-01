@@ -174,6 +174,101 @@ mod tests {
         assert_eq!(ports, vec!["a".to_string()]);
     }
 
+    /// Parses `src` as Verilog (`.v`) or SystemVerilog (`.sv`), elaborates it
+    /// with top `tb`, and returns the source text of every W202 span.
+    fn forever_warnings(file_name: &str, src: &str) -> Vec<String> {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source(file_name, src.to_string());
+        let mut parsed = ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![],
+        };
+        if file_name.ends_with(".sv") {
+            parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else {
+            parsed.verilog_files.push(aion_verilog_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        }
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        elaborate(&parsed, &make_config("tb"), &source_db, &interner, &sink).unwrap();
+        sink.diagnostics()
+            .into_iter()
+            .filter(|d| d.code == errors::W202)
+            .map(|d| source_db.snippet(d.primary_span).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn w202_verilog_forever_without_timing() {
+        let w = forever_warnings(
+            "tb.v",
+            "module tb; reg clk; initial forever clk = ~clk; endmodule",
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("forever"),
+            "span should cover the loop: {w:?}"
+        );
+    }
+
+    #[test]
+    fn w202_verilog_nested_no_timing() {
+        // Nested statements without timing control still never yield.
+        let w = forever_warnings(
+            "tb.v",
+            "module tb; reg a; reg b; initial forever begin if (a) b = 1; else b = 0; end endmodule",
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn w202_silent_on_verilog_delay_clock() {
+        let w = forever_warnings(
+            "tb.v",
+            "module tb; reg clk; initial begin clk = 0; forever #5 clk = ~clk; end endmodule",
+        );
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn w202_silent_on_verilog_event_control_and_finish() {
+        let w = forever_warnings(
+            "tb.v",
+            "module tb; reg clk; reg q; \
+             initial forever @(posedge clk) q = ~q; \
+             initial forever begin if (q) $finish; end \
+             endmodule",
+        );
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn w202_sv_forever_without_timing() {
+        let w = forever_warnings(
+            "tb.sv",
+            "module tb; logic a; initial forever a = ~a; endmodule",
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn w202_silent_on_sv_break_and_delay() {
+        let w = forever_warnings(
+            "tb.sv",
+            "module tb; logic [3:0] i; logic clk; \
+             initial forever begin i++; if (i > 3) break; end \
+             initial forever #5 clk = ~clk; \
+             endmodule",
+        );
+        assert!(w.is_empty(), "{w:?}");
+    }
+
     #[test]
     fn elaborate_simple_verilog_counter() {
         let interner = Interner::new();

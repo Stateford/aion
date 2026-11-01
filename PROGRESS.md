@@ -5,6 +5,18 @@
 
 ---
 
+## 2026-11-01 — Sim: `forever` Without Timing Control No Longer Runs Once Silently
+
+- **Bug:** `forever` with no timing control (e.g. `forever clk = ~clk;`) ran its body once and then fell through to the next statement (`evaluator.rs`). That produced a wrong but plausible result with no diagnostic. Real simulators hang on this loop.
+- **Runtime fix (`aion_sim`):** When a `forever` body finishes an iteration without suspending, the evaluator now returns the new `SimError::ZeroTimeLoop`. Every further iteration would be identical, because signals only change when the process yields. A body containing a `wait` (not yet modelled) returns `SimError::Unsupported` instead. The error message also notes that `@(...)`, `wait` and `break` inside `forever` are not yet supported, since lowering drops them.
+- **Elaboration warning (`aion_elaborate`):** New **W202** "`forever` loop has no timing control" for Verilog/SV, with the loop's span, a note and a help. It is computed on the AST (`verilog_may_yield` / `sv_may_yield`) because lowering drops nested event controls. It is conservative: delays, `@`, `wait`, `disable`, `$finish`/`$stop`, user task calls, SV `break`/`return` and error nodes all count as "may yield", so there are no false positives on `forever @(posedge clk)`.
+- **CLI (`aion sim`):** Elaboration warnings are now rendered when not `--quiet`. Previously they were only shown if there were errors. Testbenches live outside `src/`, so `aion lint` never sees them.
+- **Tests added:** sim evaluator (empty body, assign, untaken delay branch, taken branch suspends, `$finish` finishes, `wait` → Unsupported, `contains_wait` ×2), a kernel test (the statement after the loop never runs), the error Display test, elaborate (6 source-based W202 tests covering Verilog/SV positive and negative cases, `may_yield` unit tests, the existing `*_forever_preserved` tests now assert W202), and a CLI end-to-end test (`aion sim` on a zero-time loop returns the error).
+- **Known gaps (not addressed):** Nested `@(...)`/`wait`/`break` in procedural code are still not simulated. `for`/`while`/`repeat` loops are lowered to a single execution of their body. The VHDL `aion init` testbench fails elaboration with `E204 unknown signal 'false'` (an existing bug).
+- Workspace `cargo test` passes and clippy is clean.
+
+---
+
 ## 2026-11-01 — Sim: Zero-Delay Loop Guard (Fixes #5, SIM-4)
 
 - **Bug:** `SimKernel::run()` / `run_to_completion()` / `run_until()` hung forever on a zero-delay loop such as `initial forever #0;`. The per-time `deltas_at_current_time` counter was only incremented when `step_delta()` ran (i.e. when signal events were queued). A `#0` resume re-queues the process at the same fs without producing events, so the loop spun at one timestamp and never reached `max_delta_per_step`.
