@@ -14,6 +14,15 @@
 - **Extra fix:** `run_until` now sets `time_limit`.
 - **Tests:** 19 kernel, 9 elaborator and 5 CLI end-to-end tests, covering the clock idioms, repros A/B/B2 and the SIM-21 cases.
 - **Known gaps:** a nested `@(...)` inside procedural code reports `ZeroTimeLoop` rather than "unsupported" (#7). `InteractiveSim` cannot advance time (#8).
+## 2026-11-01 — VHDL Parser: Record-Body Hang and No-Progress Guards (Fixes #14)
+
+- **Record body:** `parse_record_type_def` now skips an element that doesn't start with an identifier to the next `;` or `end`. A `:=` default gets the error "record elements cannot have a default value". `end record <name>` is accepted.
+- **Progress guards:** added the `ensure_progress` guard to the design-file, library/use, declaration, concurrent-statement, sequential-statement, case and record loops. The remaining list loops were audited and always consume a separator.
+- **Backstop:** after 1000 errors in a row at one token, the parse aborts with exactly one diagnostic.
+- **Tests:**
+  - 17 parser unit tests covering both repros under a watchdog;
+  - `tests/adversarial.rs`: about 20.6k inputs (truncated, token-deleted, keyword-injected and token soup), each with a 5 s watchdog, about 3 s in total.
+- **Known gaps:** no recursion-depth limit, so 50k nested `(` overflows the stack (#25). An `if … generate` `else` branch is unreachable (#18).
 ## 2026-11-01 — Lint: Panic-Proof Width Computation and Rule Isolation (Fixes #38)
 
 - **Shared width helpers:** W103 and W107 now share one overflow-checked width calculation in `aion_lint/src/helpers.rs`: `range_width` (uses `abs_diff`), `type_width`, `signal_ref_width` and `expr_width`. A TypeId(0) placeholder type counts as unknown width. Ascending slices, VHDL `to` ranges, `a[0 +: 8]` and `{1000000000{8'hFF}}` no longer panic (LINT-1, LINT-2).

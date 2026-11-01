@@ -10,6 +10,15 @@ use aion_common::{Ident, Interner};
 use aion_diagnostics::code::{Category, DiagnosticCode};
 use aion_diagnostics::{Diagnostic, DiagnosticSink};
 use aion_source::{FileId, Span};
+use std::cell::Cell;
+
+/// Number of consecutive error diagnostics the parser may emit at a single
+/// (non-EOF) token position before the no-progress backstop aborts parsing.
+///
+/// Legitimate error cascades at one token are bounded by nesting depth times
+/// a handful of `expect` calls, so this is far above anything well-behaved
+/// recovery produces, while still capping a runaway loop's output.
+const MAX_ERRORS_WITHOUT_PROGRESS: u32 = 1000;
 
 /// A recursive descent parser for VHDL-2008 source text.
 ///
@@ -24,6 +33,13 @@ pub struct VhdlParser<'src> {
     file: FileId,
     pub(crate) interner: &'src Interner,
     sink: &'src DiagnosticSink,
+    /// Token position at which the most recent error diagnostic was emitted.
+    last_error_pos: Cell<usize>,
+    /// Number of consecutive error diagnostics emitted at `last_error_pos`.
+    errors_at_pos: Cell<u32>,
+    /// Set once the no-progress backstop fires; the parser then reports EOF
+    /// so every loop unwinds.
+    aborted: Cell<bool>,
 }
 
 impl<'src> VhdlParser<'src> {
@@ -42,6 +58,9 @@ impl<'src> VhdlParser<'src> {
             file,
             interner,
             sink,
+            last_error_pos: Cell::new(usize::MAX),
+            errors_at_pos: Cell::new(0),
+            aborted: Cell::new(false),
         }
     }
 
@@ -50,8 +69,15 @@ impl<'src> VhdlParser<'src> {
     // ========================================================================
 
     /// Returns the kind of the current token.
+    ///
+    /// Once the no-progress backstop has fired this always reports
+    /// [`VhdlToken::Eof`], forcing every parsing loop to terminate.
     pub(crate) fn current(&self) -> VhdlToken {
-        self.tokens[self.pos].kind
+        if self.aborted.get() {
+            VhdlToken::Eof
+        } else {
+            self.tokens[self.pos].kind
+        }
     }
 
     /// Returns the current token.
@@ -178,22 +204,63 @@ impl<'src> VhdlParser<'src> {
     // ========================================================================
 
     /// Emits an error diagnostic at the current position.
+    ///
+    /// Once the no-progress backstop has aborted the parse, further errors are
+    /// suppressed so the abort produces exactly one diagnostic.
     pub(crate) fn error(&self, msg: &str) {
+        if self.aborted.get() {
+            return;
+        }
         self.sink.emit(Diagnostic::error(
             DiagnosticCode::new(Category::Error, 101),
             msg,
             self.current_span(),
         ));
+        self.note_error();
     }
 
     /// Emits an "expected X" error at the current position.
+    ///
+    /// Suppressed after the no-progress backstop has aborted the parse.
     pub(crate) fn expected(&self, what: &str) {
+        if self.aborted.get() {
+            return;
+        }
         let actual = format!("{:?}", self.current());
         self.sink.emit(Diagnostic::error(
             DiagnosticCode::new(Category::Error, 101),
             format!("expected {what}, found {actual}"),
             self.current_span(),
         ));
+        self.note_error();
+    }
+
+    /// Records that an error was emitted at the current position and fires
+    /// the no-progress backstop if too many errors piled up at one token.
+    ///
+    /// This is defense in depth: every list loop is individually guarded
+    /// (see [`Self::ensure_progress`]), but should a future loop forget, the
+    /// parser still terminates with bounded output instead of hanging. Errors
+    /// at EOF are not counted because every loop already stops at EOF.
+    fn note_error(&self) {
+        if self.aborted.get() || self.at_eof() {
+            return;
+        }
+        if self.last_error_pos.get() == self.pos {
+            let n = self.errors_at_pos.get() + 1;
+            self.errors_at_pos.set(n);
+            if n >= MAX_ERRORS_WITHOUT_PROGRESS {
+                self.sink.emit(Diagnostic::error(
+                    DiagnosticCode::new(Category::Error, 101),
+                    "parser made no progress at this token; aborting parse of this file",
+                    self.current_span(),
+                ));
+                self.aborted.set(true);
+            }
+        } else {
+            self.last_error_pos.set(self.pos);
+            self.errors_at_pos.set(1);
+        }
     }
 
     /// Recovers to a semicolon, consuming everything before it (including the semicolon).
@@ -202,6 +269,39 @@ impl<'src> VhdlParser<'src> {
             self.advance();
         }
         self.eat(VhdlToken::Semicolon);
+    }
+
+    /// Recovers to a semicolon or to one of `stops`, whichever comes first.
+    ///
+    /// A semicolon is consumed; a stop token is left in place so the
+    /// enclosing construct (e.g. the `end` of a record) can still be parsed.
+    pub(crate) fn recover_to_semicolon_or(&mut self, stops: &[VhdlToken]) {
+        while !self.at_eof() && !self.at(VhdlToken::Semicolon) && !stops.contains(&self.current()) {
+            self.advance();
+        }
+        self.eat(VhdlToken::Semicolon);
+    }
+
+    /// Guarantees forward progress for one iteration of a list loop.
+    ///
+    /// `start` is the token position recorded at the top of the iteration.
+    /// If the iteration consumed nothing (and we are not at EOF), an error is
+    /// reported naming `context` and the offending token is skipped, so the
+    /// next iteration starts on a different token. Returns `true` if the
+    /// iteration had made progress on its own.
+    pub(crate) fn ensure_progress(&mut self, start: usize, context: &str) -> bool {
+        if self.pos != start || self.at_eof() {
+            return true;
+        }
+        let actual = format!("{:?}", self.current());
+        self.error(&format!("unexpected {actual} in {context}; skipping it"));
+        self.advance();
+        false
+    }
+
+    /// Returns `true` if the current token is a basic or extended identifier.
+    pub(crate) fn at_identifier(&self) -> bool {
+        self.at(VhdlToken::Identifier) || self.at(VhdlToken::ExtendedIdentifier)
     }
 
     /// Recovers to a design unit boundary (entity, architecture, package, or EOF).
@@ -236,6 +336,7 @@ impl<'src> VhdlParser<'src> {
         let mut units = Vec::new();
 
         while !self.at_eof() {
+            let iter_start = self.pos;
             match self.parse_design_unit() {
                 Some(unit) => units.push(unit),
                 None => {
@@ -248,6 +349,7 @@ impl<'src> VhdlParser<'src> {
                     }
                 }
             }
+            self.ensure_progress(iter_start, "design file");
         }
 
         let span = if units.is_empty() {
@@ -309,11 +411,13 @@ impl<'src> VhdlParser<'src> {
     fn parse_context_items(&mut self) -> Vec<ContextItem> {
         let mut items = Vec::new();
         loop {
+            let iter_start = self.pos;
             match self.current() {
                 VhdlToken::Library => items.push(self.parse_library_clause()),
                 VhdlToken::Use => items.push(self.parse_use_clause()),
                 _ => break,
             }
+            self.ensure_progress(iter_start, "context clause");
         }
         items
     }
@@ -518,6 +622,7 @@ impl<'src> VhdlParser<'src> {
         self.expect(VhdlToken::LeftParen);
         let mut decls = Vec::new();
 
+        // Progress: the loop only continues after consuming a `;`.
         loop {
             decls.push(self.parse_interface_decl());
             if !self.eat(VhdlToken::Semicolon) {
@@ -1579,5 +1684,261 @@ mod tests {
                 assert!(c.port_map.is_some());
             }
         }
+    }
+
+    // ========================================================================
+    // No-progress guards (issue #14)
+    // ========================================================================
+
+    /// Parses `source` on a helper thread and fails (instead of hanging) if
+    /// the parser does not finish within a few seconds.
+    fn parse_with_watchdog(source: &'static str) -> (VhdlDesignFile, Vec<Diagnostic>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(parse_vhdl(source));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("parser did not terminate on: {source}"))
+    }
+
+    /// Returns the fields of the first record type declared in the first package.
+    fn first_record_fields(ast: &VhdlDesignFile) -> &[RecordField] {
+        let DesignUnit::ContextUnit {
+            unit: DesignUnitKind::Package(p),
+            ..
+        } = &ast.units[0]
+        else {
+            panic!("expected package");
+        };
+        for decl in &p.decls {
+            if let Declaration::Type(TypeDecl {
+                def: TypeDef::Record { fields, .. },
+                ..
+            }) = decl
+            {
+                return fields;
+            }
+        }
+        panic!("expected a record type declaration");
+    }
+
+    #[test]
+    fn record_field_with_default_terminates() {
+        let (ast, errors) = parse_with_watchdog(
+            "package p is type r is record a : bit := '0'; end record; end package;",
+        );
+        assert!(!errors.is_empty());
+        assert!(
+            errors.len() < 10,
+            "bounded diagnostics, got {}",
+            errors.len()
+        );
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("cannot have a default value")));
+        // The element itself is still recorded.
+        assert_eq!(first_record_fields(&ast).len(), 1);
+    }
+
+    #[test]
+    fn record_field_with_object_class_terminates() {
+        let (ast, errors) = parse_with_watchdog(
+            "package p is type r is record signal a : bit; end record; end package;",
+        );
+        assert!(!errors.is_empty());
+        assert!(
+            errors.len() < 10,
+            "bounded diagnostics, got {}",
+            errors.len()
+        );
+        assert!(first_record_fields(&ast).is_empty());
+    }
+
+    #[test]
+    fn record_recovers_and_keeps_later_fields() {
+        let (ast, errors) = parse_with_watchdog(
+            "package p is
+                type r is record
+                    signal a : bit;
+                    b : bit := '1';
+                    c, d : integer;
+                end record;
+                constant K : integer := 1;
+            end package;",
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        let fields = first_record_fields(&ast);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[1].names.len(), 2);
+        // The declaration after the record is still parsed.
+        if let DesignUnit::ContextUnit {
+            unit: DesignUnitKind::Package(p),
+            ..
+        } = &ast.units[0]
+        {
+            assert!(matches!(p.decls[1], Declaration::Constant(_)));
+        }
+    }
+
+    #[test]
+    fn record_missing_semicolon_stops_at_end() {
+        // Recovery must not skip past `end record`.
+        let (ast, errors) = parse_with_watchdog(
+            "package p is type r is record a : bit end record; constant K : integer := 1; end package;",
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(first_record_fields(&ast).len(), 1);
+    }
+
+    #[test]
+    fn record_garbage_body_terminates() {
+        let (_, errors) = parse_with_watchdog(
+            "package p is type r is record := ; , ) ( 42 'x' process => end record; end package;",
+        );
+        assert!(!errors.is_empty());
+        assert!(
+            errors.len() < 20,
+            "bounded diagnostics, got {}",
+            errors.len()
+        );
+    }
+
+    #[test]
+    fn record_truncated_at_eof_terminates() {
+        let (_, errors) = parse_with_watchdog("package p is type r is record a : bit := ");
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn well_formed_record_has_no_diagnostics() {
+        let (ast, errors) = parse_with_watchdog(
+            "package p is
+                type r is record
+                    a : bit;
+                    b, c : std_logic_vector(7 downto 0);
+                end record;
+            end package;",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(first_record_fields(&ast).len(), 2);
+    }
+
+    #[test]
+    fn record_end_with_simple_name() {
+        let ast = parse_ok("package p is type r is record a : bit; end record r; end package;");
+        assert_eq!(first_record_fields(&ast).len(), 1);
+    }
+
+    /// Builds a parser over `source` for exercising primitive helpers.
+    fn with_parser<R>(
+        source: &str,
+        f: impl FnOnce(&mut VhdlParser<'_>) -> R,
+    ) -> (R, Vec<Diagnostic>) {
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let tokens = lexer::lex(source, file, &sink);
+        let mut parser = VhdlParser::new(tokens, source, file, &interner, &sink);
+        let r = f(&mut parser);
+        (r, sink.take_all())
+    }
+
+    #[test]
+    fn ensure_progress_passes_when_tokens_consumed() {
+        let (ok, errors) = with_parser("a b", |p| {
+            let start = p.pos;
+            p.advance();
+            p.ensure_progress(start, "test")
+        });
+        assert!(ok);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn ensure_progress_skips_token_when_stuck() {
+        let ((ok, kind), errors) = with_parser("; b", |p| {
+            let start = p.pos;
+            let ok = p.ensure_progress(start, "test list");
+            (ok, p.current())
+        });
+        assert!(!ok);
+        assert_eq!(kind, VhdlToken::Identifier);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("test list"));
+    }
+
+    #[test]
+    fn ensure_progress_is_silent_at_eof() {
+        let (ok, errors) = with_parser("", |p| p.ensure_progress(p.pos, "test"));
+        assert!(ok);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn recover_to_semicolon_or_consumes_semicolon() {
+        let (kind, _) = with_parser("a b ; c", |p| {
+            p.recover_to_semicolon_or(&[VhdlToken::End]);
+            (p.current(), p.pos)
+        });
+        assert_eq!(kind, (VhdlToken::Identifier, 3));
+    }
+
+    #[test]
+    fn recover_to_semicolon_or_leaves_stop_token() {
+        let (kind, _) = with_parser("a b end ;", |p| {
+            p.recover_to_semicolon_or(&[VhdlToken::End]);
+            p.current()
+        });
+        assert_eq!(kind, VhdlToken::End);
+    }
+
+    #[test]
+    fn backstop_aborts_after_many_errors_at_one_token() {
+        let (kind, errors) = with_parser("a b c", |p| {
+            for _ in 0..MAX_ERRORS_WITHOUT_PROGRESS + 50 {
+                p.expected("something");
+            }
+            p.current()
+        });
+        assert_eq!(kind, VhdlToken::Eof, "backstop should force EOF");
+        let backstops = errors
+            .iter()
+            .filter(|e| e.message.contains("parser made no progress"))
+            .count();
+        assert_eq!(backstops, 1);
+    }
+
+    #[test]
+    fn backstop_suppresses_all_errors_after_abort() {
+        let (_, errors) = with_parser("a b c", |p| {
+            for _ in 0..MAX_ERRORS_WITHOUT_PROGRESS + 50 {
+                p.expected("something");
+                p.error("other");
+            }
+        });
+        // Exactly MAX errors at the stuck token, then the single abort note;
+        // nothing after it (no stale "found Eof" messages).
+        assert_eq!(errors.len(), MAX_ERRORS_WITHOUT_PROGRESS as usize + 1);
+        assert!(errors
+            .last()
+            .unwrap()
+            .message
+            .contains("parser made no progress"));
+    }
+
+    #[test]
+    fn backstop_does_not_fire_when_errors_spread_across_tokens() {
+        let source = "a ".repeat(2000);
+        let (kind, errors) = with_parser(&source, |p| {
+            for _ in 0..1999 {
+                p.error("e");
+                p.advance();
+            }
+            p.current()
+        });
+        assert_eq!(kind, VhdlToken::Identifier);
+        assert!(errors
+            .iter()
+            .all(|e| !e.message.contains("parser made no progress")));
     }
 }

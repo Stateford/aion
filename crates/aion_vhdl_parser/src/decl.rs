@@ -13,6 +13,7 @@ impl VhdlParser<'_> {
     pub fn parse_declarations(&mut self) -> Vec<Declaration> {
         let mut decls = Vec::new();
         loop {
+            let iter_start = self.pos;
             match self.current() {
                 VhdlToken::Begin | VhdlToken::End | VhdlToken::Eof => break,
                 _ => {
@@ -21,6 +22,7 @@ impl VhdlParser<'_> {
                     }
                 }
             }
+            self.ensure_progress(iter_start, "declarative part");
         }
         decls
     }
@@ -183,6 +185,7 @@ impl VhdlParser<'_> {
         self.expect(VhdlToken::LeftParen);
 
         let mut literals = Vec::new();
+        // Progress: the loop only continues after consuming a `,`.
         loop {
             if self.at(VhdlToken::CharLiteral) {
                 let span = self.current_span();
@@ -229,24 +232,49 @@ impl VhdlParser<'_> {
         }
     }
 
-    /// Parses a record type definition.
+    /// Parses a record type definition:
+    /// `record { identifier_list : subtype_indication ; } end record [name]`.
+    ///
+    /// Each element declaration is checked for forward progress. An element
+    /// that does not start with an identifier, or that is not terminated by
+    /// `;` (for example because it carries a `:=` default, which VHDL does
+    /// not allow on record elements), is reported and skipped up to the next
+    /// `;` or the closing `end`, so malformed bodies cannot loop forever.
     fn parse_record_type_def(&mut self) -> TypeDef {
         let start = self.current_span();
         self.expect(VhdlToken::Record);
 
         let mut fields = Vec::new();
         while !self.at(VhdlToken::End) && !self.at_eof() {
+            let iter_start = self.pos;
             let field_start = self.current_span();
+
+            if !self.at_identifier() {
+                self.expected("record element declaration (identifier)");
+                self.recover_to_semicolon_or(&[VhdlToken::End]);
+                self.ensure_progress(iter_start, "record element list");
+                continue;
+            }
+
             let names = self.parse_identifier_list();
             self.expect(VhdlToken::Colon);
             let ty = self.parse_type_indication();
-            self.expect(VhdlToken::Semicolon);
+            if !self.eat(VhdlToken::Semicolon) {
+                if self.at(VhdlToken::ColonEquals) {
+                    self.error("record elements cannot have a default value");
+                } else {
+                    self.expected("Semicolon");
+                }
+                self.recover_to_semicolon_or(&[VhdlToken::End]);
+            }
             let span = field_start.merge(self.prev_span());
             fields.push(RecordField { names, ty, span });
+            self.ensure_progress(iter_start, "record element list");
         }
 
         self.expect(VhdlToken::End);
         self.expect(VhdlToken::Record);
+        self.eat_ident(); // optional record type simple name (VHDL-2008)
         let span = start.merge(self.prev_span());
         TypeDef::Record { fields, span }
     }
