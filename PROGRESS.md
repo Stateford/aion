@@ -5,6 +5,16 @@
 
 ---
 
+## 2026-11-01 — Sim: Zero-Delay Loop Guard (Fixes #5, SIM-4)
+
+- **Bug:** `SimKernel::run()` / `run_to_completion()` / `run_until()` hung forever on a zero-delay loop such as `initial forever #0;`. The per-time `deltas_at_current_time` counter was only incremented when `step_delta()` ran (i.e. when signal events were queued). A `#0` resume re-queues the process at the same fs without producing events, so the loop spun at one timestamp and never reached `max_delta_per_step`.
+- **Fix (`crates/aion_sim/src/kernel.rs`):** Added private `SimKernel::charge_delta()`, called once per scheduler iteration in both `run_simulation()` and `run_until()`. Each iteration counts, whether it resumed suspended processes, ran `step_delta()`, or both. The counter still resets when time advances. Zero-delay loops now return the existing `SimError::DeltaCycleLimit { fs, max_deltas }`. Normal designs are unaffected: their delta counts per timestamp stay the same.
+- **Tests added (kernel.rs unit tests):** `forever_zero_delay_run_hits_delta_limit`, `forever_zero_delay_run_until_hits_delta_limit` (regression for the issue's repro), `zero_delay_loop_after_delay_reports_its_time` (error reports 10 ns), `nonzero_delay_forever_runs_under_tight_delta_limit`, `nonzero_delay_forever_run_until_under_tight_delta_limit` (a `forever #5` clock runs normally with `max_delta = 2`, including resumed `run_until` calls).
+- **Note:** The untracked `crates/aion_sim/tests/tmp_verify_zero_delay_hang.rs` in the main checkout was left untouched. These unit tests replace it, and it can now be deleted.
+- `cargo test -p aion_sim` (255 passed), `aion_cli` / `aion_tui` tests pass, and clippy is clean.
+
+---
+
 ## 2026-02-17 — Fix VHDL Elaboration False Positives
 
 - **Fixed 5 root causes** producing 3 errors + 13 warnings (all false positives) when linting valid VHDL-2008 code in `examples/blinky_vhdl`.

@@ -222,6 +222,11 @@ impl SimKernel {
     }
 
     /// Runs the simulation for the given duration in femtoseconds.
+    ///
+    /// Returns [`SimError::DeltaCycleLimit`] if more than the configured
+    /// maximum number of scheduler iterations (delta cycles or zero-delay
+    /// wakeups) occur at a single timestamp, e.g. a combinational loop or an
+    /// `initial forever #0;` process.
     pub fn run(&mut self, duration_fs: u64) -> Result<SimResult, SimError> {
         let end_time = self.current_time.fs + duration_fs;
         self.time_limit = Some(end_time);
@@ -229,6 +234,9 @@ impl SimKernel {
     }
 
     /// Runs the simulation to completion (until event queue empties or `$finish`).
+    ///
+    /// Like [`run`](Self::run), returns [`SimError::DeltaCycleLimit`] when a
+    /// single timestamp exceeds the per-step delta/zero-delay-wakeup budget.
     pub fn run_to_completion(&mut self) -> Result<SimResult, SimError> {
         self.run_simulation()
     }
@@ -643,24 +651,22 @@ impl SimKernel {
             self.process_wakeups(next_time_fs)?;
 
             // Process signal events at this time
-            if self
+            let step = if self
                 .event_queue
                 .peek()
                 .is_some_and(|e| e.0.time.fs <= next_time_fs)
             {
-                let result = self.step_delta()?;
-                deltas_at_current_time += 1;
+                Some(self.step_delta()?)
+            } else {
+                None
+            };
 
-                if deltas_at_current_time >= self.max_delta_per_step {
-                    return Err(SimError::DeltaCycleLimit {
-                        fs: self.current_time.fs,
-                        max_deltas: self.max_delta_per_step,
-                    });
-                }
+            // Every iteration at the same time counts — including pure
+            // wakeup iterations — so zero-delay loops trip the limit.
+            self.charge_delta(&mut deltas_at_current_time)?;
 
-                if result == StepResult::Done {
-                    break;
-                }
+            if step == Some(StepResult::Done) {
+                break;
             }
         }
 
@@ -676,6 +682,30 @@ impl SimKernel {
             display_output: self.display_output.clone(),
             assertion_failures: self.assertion_failures.clone(),
         })
+    }
+
+    /// Charges one scheduler iteration against the per-time-step delta budget.
+    ///
+    /// Called once per iteration of the `run_simulation()` / `run_until()`
+    /// loops, whether that iteration resumed suspended processes, ran a
+    /// `step_delta()`, or both. Counting pure wakeup iterations is what stops a
+    /// zero-delay loop (e.g. `initial forever #0;`) from spinning forever at
+    /// one timestamp: each `#0` resume re-queues the process at the same time
+    /// without producing signal events, so it would otherwise never reach the
+    /// limit. The caller resets `deltas_at_current_time` whenever simulation
+    /// time advances.
+    ///
+    /// Returns [`SimError::DeltaCycleLimit`] once `max_delta_per_step`
+    /// iterations have run at the current time.
+    fn charge_delta(&self, deltas_at_current_time: &mut u32) -> Result<(), SimError> {
+        *deltas_at_current_time += 1;
+        if *deltas_at_current_time >= self.max_delta_per_step {
+            return Err(SimError::DeltaCycleLimit {
+                fs: self.current_time.fs,
+                max_deltas: self.max_delta_per_step,
+            });
+        }
+        Ok(())
     }
 
     /// Returns the earliest wakeup time among suspended processes, if any.
@@ -970,6 +1000,11 @@ impl SimKernel {
     /// suspended process wakeups (delays), mirroring the main `run_simulation()`
     /// loop. Use this for advancing simulation time in the TUI or interactive
     /// mode where delay-based scheduling must be honored.
+    ///
+    /// Returns [`SimError::DeltaCycleLimit`] if more than the configured
+    /// maximum number of scheduler iterations (delta cycles or zero-delay
+    /// wakeups) occur at a single timestamp, so a zero-delay loop such as
+    /// `initial forever #0;` terminates instead of hanging.
     pub fn run_until(&mut self, target_fs: u64) -> Result<StepResult, SimError> {
         let mut deltas_at_current_time = 0u32;
 
@@ -1006,24 +1041,22 @@ impl SimKernel {
             self.process_wakeups(next_time_fs)?;
 
             // Process signal events at this time
-            if self
+            let step = if self
                 .event_queue
                 .peek()
                 .is_some_and(|e| e.0.time.fs <= next_time_fs)
             {
-                let result = self.step_delta()?;
-                deltas_at_current_time += 1;
+                Some(self.step_delta()?)
+            } else {
+                None
+            };
 
-                if deltas_at_current_time >= self.max_delta_per_step {
-                    return Err(SimError::DeltaCycleLimit {
-                        fs: self.current_time.fs,
-                        max_deltas: self.max_delta_per_step,
-                    });
-                }
+            // Every iteration at the same time counts — including pure
+            // wakeup iterations — so zero-delay loops trip the limit.
+            self.charge_delta(&mut deltas_at_current_time)?;
 
-                if result == StepResult::Done && !self.has_pending_events() {
-                    return Ok(StepResult::Done);
-                }
+            if step == Some(StepResult::Done) && !self.has_pending_events() {
+                return Ok(StepResult::Done);
             }
         }
 
@@ -1986,6 +2019,168 @@ mod tests {
         // Value alternates — exact value depends on timing
         let clk_val = kernel.signal_value(clk_id).to_u64();
         assert!(clk_val == Some(0) || clk_val == Some(1));
+    }
+
+    /// Builds `top` with one Initial process `body` and a 1-bit `clk` signal
+    /// initialised to 0.
+    fn make_initial_design(body: Statement) -> Design {
+        let types = make_type_db();
+        let bit_ty = aion_ir::TypeId::from_raw(0);
+        let mut top = empty_module(0, Ident::from_raw(1));
+        top.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: Ident::from_raw(2),
+            ty: bit_ty,
+            kind: SignalKind::Wire,
+            init: Some(ConstValue::Int(0)),
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        top.processes.alloc(aion_ir::Process {
+            id: aion_ir::ProcessId::from_raw(0),
+            name: None,
+            kind: ProcessKind::Initial,
+            body,
+            sensitivity: Sensitivity::All,
+            span: Span::DUMMY,
+        });
+        let mut modules = Arena::new();
+        modules.alloc(top);
+        Design {
+            modules,
+            top: ModuleId::from_raw(0),
+            types,
+            source_map: aion_ir::SourceMap::new(),
+        }
+    }
+
+    /// `forever #0;` — a zero-delay loop with an empty body.
+    fn forever_zero_delay() -> Statement {
+        Statement::Forever {
+            body: Box::new(Statement::Delay {
+                duration_fs: 0,
+                body: Box::new(Statement::Nop),
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `forever #5 clk = ~clk;` — a legitimate free-running clock.
+    fn forever_clock_5ns() -> Statement {
+        let bit_ty = aion_ir::TypeId::from_raw(0);
+        Statement::Forever {
+            body: Box::new(Statement::Delay {
+                duration_fs: 5_000_000,
+                body: Box::new(Statement::Assign {
+                    target: SignalRef::Signal(SignalId::from_raw(0)),
+                    value: Expr::Unary {
+                        op: aion_ir::UnaryOp::Not,
+                        operand: Box::new(Expr::Signal(SignalRef::Signal(SignalId::from_raw(0)))),
+                        ty: bit_ty,
+                        span: Span::DUMMY,
+                    },
+                    span: Span::DUMMY,
+                }),
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        }
+    }
+
+    // Regression for #5 (SIM-4): `initial forever #0;` used to hang run().
+    #[test]
+    fn forever_zero_delay_run_hits_delta_limit() {
+        let design = make_initial_design(forever_zero_delay());
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        let err = kernel.run(100 * crate::time::FS_PER_NS).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SimError::DeltaCycleLimit {
+                    fs: 0,
+                    max_deltas: 10_000
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    // Regression for #5 (SIM-4): `initial forever #0;` used to hang run_until().
+    #[test]
+    fn forever_zero_delay_run_until_hits_delta_limit() {
+        let design = make_initial_design(forever_zero_delay());
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        kernel.initialize().unwrap();
+        let err = kernel.run_until(100 * crate::time::FS_PER_NS).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SimError::DeltaCycleLimit {
+                    fs: 0,
+                    max_deltas: 10_000
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn zero_delay_loop_after_delay_reports_its_time() {
+        // initial begin #10; forever #0; end — the loop starts at 10 ns.
+        let design = make_initial_design(Statement::Delay {
+            duration_fs: 10 * crate::time::FS_PER_NS,
+            body: Box::new(forever_zero_delay()),
+            span: Span::DUMMY,
+        });
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        kernel.set_max_delta(50);
+        let err = kernel.run(100 * crate::time::FS_PER_NS).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SimError::DeltaCycleLimit {
+                    fs: 10_000_000,
+                    max_deltas: 50
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn nonzero_delay_forever_runs_under_tight_delta_limit() {
+        // A tight limit proves the per-time counter resets as time advances,
+        // so a legitimate `forever #5` loop never accumulates toward it.
+        let design = make_initial_design(forever_clock_5ns());
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        kernel.set_max_delta(2);
+        let result = kernel.run(52 * crate::time::FS_PER_NS).unwrap();
+        assert!(!result.finished_by_user);
+        assert_eq!(result.final_time.fs, 50 * crate::time::FS_PER_NS);
+        // 10 toggles (5..=50 ns) from 0 leaves clk at 0.
+        let clk = kernel.find_signal("top.clk").unwrap();
+        assert_eq!(kernel.signal_value(clk).to_u64(), Some(0));
+    }
+
+    #[test]
+    fn nonzero_delay_forever_run_until_under_tight_delta_limit() {
+        let design = make_initial_design(forever_clock_5ns());
+        let mut kernel = SimKernel::new(&design, &make_test_interner()).unwrap();
+        kernel.set_max_delta(2);
+        kernel.initialize().unwrap();
+        let clk = kernel.find_signal("top.clk").unwrap();
+
+        // 5 ns, 10 ns, 15 ns → three toggles → clk = 1.
+        let r = kernel.run_until(17 * crate::time::FS_PER_NS).unwrap();
+        assert_eq!(r, StepResult::Continued);
+        assert_eq!(kernel.current_time().fs, 17 * crate::time::FS_PER_NS);
+        assert_eq!(kernel.signal_value(clk).to_u64(), Some(1));
+
+        // Resuming continues normally: 20 ns, 25 ns, 30 ns → clk = 0.
+        let r = kernel.run_until(32 * crate::time::FS_PER_NS).unwrap();
+        assert_eq!(r, StepResult::Continued);
+        assert_eq!(kernel.signal_value(clk).to_u64(), Some(0));
     }
 
     #[test]
