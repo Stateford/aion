@@ -3,6 +3,7 @@
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
 use aion_ir::{Design, Expr, Module, SignalRef, Statement};
 
+use crate::helpers::{expr_width, signal_ref_width};
 use crate::LintRule;
 
 /// Detects assignments where the RHS is wider than the LHS, causing
@@ -10,6 +11,9 @@ use crate::LintRule;
 ///
 /// Unlike W103 (width-mismatch) which fires on any width difference,
 /// this rule specifically flags truncation where data loss occurs.
+/// Widths come from the same overflow-checked helpers as W103
+/// ([`signal_ref_width`] and [`expr_width`]), so both rules agree on what is
+/// known and neither trusts the elaborator's placeholder result types.
 pub struct Truncation;
 
 impl LintRule for Truncation {
@@ -47,43 +51,6 @@ impl LintRule for Truncation {
         for (_pid, process) in module.processes.iter() {
             check_stmt_truncation(&process.body, module, design, self.code(), sink);
         }
-    }
-}
-
-fn signal_ref_width(sref: &SignalRef, module: &Module, design: &Design) -> Option<u32> {
-    match sref {
-        SignalRef::Signal(id) => {
-            let signal = module.signals.get(*id);
-            design.types.bit_width(signal.ty)
-        }
-        SignalRef::Slice { high, low, .. } => Some(high - low + 1),
-        SignalRef::Concat(refs) => {
-            let mut total = 0u32;
-            for r in refs {
-                total += signal_ref_width(r, module, design)?;
-            }
-            Some(total)
-        }
-        SignalRef::Const(lv) => Some(lv.width()),
-    }
-}
-
-fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
-    match expr {
-        Expr::Literal(lv) => Some(lv.width()),
-        Expr::Unary { ty, .. }
-        | Expr::Binary { ty, .. }
-        | Expr::Ternary { ty, .. }
-        | Expr::FuncCall { ty, .. } => design.types.bit_width(*ty),
-        Expr::Concat(exprs) => {
-            let mut total = 0u32;
-            for e in exprs {
-                total += expr_width(e, design)?;
-            }
-            Some(total)
-        }
-        Expr::Repeat { expr, count, .. } => expr_width(expr, design).map(|w| w * count),
-        _ => None,
     }
 }
 
@@ -278,5 +245,203 @@ mod tests {
         let sink = DiagnosticSink::new();
         Truncation.check_module(design.modules.get(design.top), &design, &sink);
         assert!(sink.take_all().is_empty());
+    }
+
+    // ---- Issue #38 regressions: panic-proof widths ----
+
+    fn add_vec_signal(module: &mut Module, types: &mut TypeDb, width: u32) -> SignalId {
+        let ty = types.intern(Type::BitVec {
+            width,
+            signed: false,
+        });
+        let n = module.signals.len() as u32;
+        module.signals.alloc(Signal {
+            id: SignalId::from_raw(n),
+            name: Ident::from_raw(10 + n),
+            ty,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        })
+    }
+
+    fn literal_slice(sig: SignalId, high: u64, low: u64) -> Expr {
+        Expr::Slice {
+            expr: Box::new(Expr::Signal(SignalRef::Signal(sig))),
+            high: Box::new(Expr::Literal(LogicVec::from_u64(high, 32))),
+            low: Box::new(Expr::Literal(LogicVec::from_u64(low, 32))),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn run_rule(module: Module, types: TypeDb) -> Vec<aion_diagnostics::Diagnostic> {
+        let design = mk_design(module, types);
+        let sink = DiagnosticSink::new();
+        Truncation.check_module(design.modules.get(design.top), &design, &sink);
+        sink.take_all()
+    }
+
+    fn eq_expr(lhs: SignalId, rhs: SignalId, ty: aion_ir::ids::TypeId) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(Expr::Signal(SignalRef::Signal(lhs))),
+            rhs: Box::new(Expr::Signal(SignalRef::Signal(rhs))),
+            ty,
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn ascending_lhs_slice_truncation_reports_real_width() {
+        // `assign y[0:3] = 8'hFF;` on `output [0:7] y`.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Slice {
+                signal: y,
+                high: 0,
+                low: 3,
+            },
+            value: Expr::Literal(LogicVec::from_u64(0xFF, 8)),
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, types);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0]
+            .message
+            .contains("8-bit value assigned to 4-bit target"));
+    }
+
+    #[test]
+    fn ascending_lhs_slice_no_truncation() {
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Slice {
+                signal: y,
+                high: 0,
+                low: 3,
+            },
+            value: Expr::Literal(LogicVec::from_u64(0xF, 4)),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn ascending_and_part_select_rhs_no_panic() {
+        // VHDL `a(0 to 3)` and Verilog `a[0 +: 8]` both lower to slices with
+        // high < low; neither may panic.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let a = add_vec_signal(&mut module, &mut types, 16);
+        let y = add_vec_signal(&mut module, &mut types, 4);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: literal_slice(a, 0, 3),
+            span: Span::DUMMY,
+        });
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: literal_slice(a, 0, 8),
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, types);
+        // The 4-bit `0 to 3` slice into a 4-bit target is clean; only the
+        // part-select lowering (LINT-4) can produce a warning.
+        assert!(diags.len() <= 1, "{diags:#?}");
+    }
+
+    #[test]
+    fn huge_replication_no_panic_no_warning() {
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Repeat {
+                expr: Box::new(Expr::Literal(LogicVec::from_u64(0xFF, 8))),
+                count: 1_000_000_000,
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn overflowing_rhs_concat_no_panic_no_warning() {
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 8);
+        let big = Expr::Repeat {
+            expr: Box::new(Expr::Literal(LogicVec::from_u64(0xF, 4))),
+            count: u32::MAX / 4,
+            span: Span::DUMMY,
+        };
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Concat(vec![big.clone(), big]),
+            span: Span::DUMMY,
+        });
+        assert!(run_rule(module, types).is_empty());
+    }
+
+    #[test]
+    fn placeholder_type_ignored_regardless_of_port_order() {
+        // `assign y = a == b;` - the comparison carries the TypeId(0)
+        // placeholder. Whether TypeId(0) happens to be the 8-bit type (a
+        // declared first) or the 1-bit type (y declared first), W107 must
+        // give the same verdict: no truncation.
+        for wide_first in [true, false] {
+            let mut module = mk_module();
+            let mut types = TypeDb::new();
+            let (a, b, y) = if wide_first {
+                let a = add_vec_signal(&mut module, &mut types, 8);
+                let b = add_vec_signal(&mut module, &mut types, 8);
+                let y = add_vec_signal(&mut module, &mut types, 1);
+                (a, b, y)
+            } else {
+                let y = add_vec_signal(&mut module, &mut types, 1);
+                let a = add_vec_signal(&mut module, &mut types, 8);
+                let b = add_vec_signal(&mut module, &mut types, 8);
+                (a, b, y)
+            };
+            module.assignments.push(Assignment {
+                target: SignalRef::Signal(y),
+                value: eq_expr(a, b, aion_ir::ids::TypeId::from_raw(0)),
+                span: Span::DUMMY,
+            });
+            let diags = run_rule(module, types);
+            assert!(diags.is_empty(), "wide_first={wide_first}: {diags:#?}");
+        }
+    }
+
+    #[test]
+    fn resolved_binary_type_still_detects_truncation() {
+        // A non-placeholder result type is trusted: 8-bit sum into 4 bits.
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let y = add_vec_signal(&mut module, &mut types, 4);
+        let a = add_vec_signal(&mut module, &mut types, 8);
+        let ty8 = module.signals.get(a).ty;
+        assert_ne!(ty8, aion_ir::ids::TypeId::from_raw(0));
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(y),
+            value: Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(Expr::Signal(SignalRef::Signal(a))),
+                rhs: Box::new(Expr::Signal(SignalRef::Signal(a))),
+                ty: ty8,
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, types);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("losing 4 bits"));
     }
 }
