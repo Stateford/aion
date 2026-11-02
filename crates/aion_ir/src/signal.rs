@@ -23,6 +23,14 @@ pub enum SignalKind {
     Port,
     /// A compile-time constant.
     Const,
+    /// A VHDL process-local `variable`.
+    ///
+    /// It is storage private to one process and updated by immediate
+    /// (`:=`, blocking) assignments, keeping its value between activations
+    /// like a `reg`. It is not a signal: it never drives other processes
+    /// and is never part of an implicit sensitivity set (VHDL `process(all)`
+    /// covers signals only), so writing it cannot wake its own process.
+    Variable,
 }
 
 /// A signal (wire, register, or latch) within a module.
@@ -110,6 +118,7 @@ mod tests {
             SignalKind::Latch,
             SignalKind::Port,
             SignalKind::Const,
+            SignalKind::Variable,
         ];
         for (i, a) in kinds.iter().enumerate() {
             for (j, b) in kinds.iter().enumerate() {
@@ -119,6 +128,27 @@ mod tests {
                     assert_ne!(a, b);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn variable_kind_bincode_roundtrip() {
+        let sig = Signal {
+            id: SignalId::from_raw(2),
+            name: Ident::from_raw(3),
+            ty: TypeId::from_raw(0),
+            kind: SignalKind::Variable,
+            init: Some(ConstValue::Logic(aion_common::LogicVec::from_u64(6, 4))),
+            clock_domain: None,
+            span: Span::DUMMY,
+        };
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&sig, config).unwrap();
+        let (back, _): (Signal, usize) = bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(back.kind, SignalKind::Variable);
+        match back.init {
+            Some(ConstValue::Logic(lv)) => assert_eq!(lv.to_u64(), Some(6)),
+            other => panic!("unexpected init {other:?}"),
         }
     }
 

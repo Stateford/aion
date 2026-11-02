@@ -314,6 +314,7 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Literal(LogicVec::from_u64(0xDEAD, 16)),
+                kind: aion_ir::AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::All,

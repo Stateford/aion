@@ -41,5 +41,5 @@ pub use port::{Port, PortDirection};
 pub use process::{Edge, EdgeSensitivity, Process, ProcessKind, Sensitivity};
 pub use signal::{Signal, SignalKind, SignalRef};
 pub use source_map::SourceMap;
-pub use stmt::{AssertionKind, CaseArm, Statement};
+pub use stmt::{AssertionKind, AssignKind, CaseArm, Statement};
 pub use types::{Type, TypeDb};

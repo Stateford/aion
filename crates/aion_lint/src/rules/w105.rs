@@ -1,7 +1,7 @@
 //! W105: Incomplete sensitivity list — combinational process missing signals.
 
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
-use aion_ir::{Design, Module, ProcessKind, Sensitivity};
+use aion_ir::{Design, Module, ProcessKind, Sensitivity, SignalId, SignalKind};
 
 use crate::helpers::collect_read_signals;
 use crate::LintRule;
@@ -10,8 +10,20 @@ use crate::LintRule;
 /// that are missing signals read in the process body.
 ///
 /// Missing signals in the sensitivity list cause simulation-synthesis
-/// mismatches. Processes with `Sensitivity::All` are not checked.
+/// mismatches. Processes with `Sensitivity::All` are not checked. Reads of
+/// constants and VHDL process variables are ignored: they are not signals,
+/// so they can never appear in a sensitivity list.
 pub struct IncompleteSensitivity;
+
+/// Returns `true` if `id` is a constant or a VHDL process variable, i.e.
+/// storage that does not belong in a sensitivity list.
+fn is_non_signal(module: &Module, id: SignalId) -> bool {
+    (id.as_raw() as usize) < module.signals.len()
+        && matches!(
+            module.signals.get(id).kind,
+            SignalKind::Const | SignalKind::Variable
+        )
+}
 
 impl LintRule for IncompleteSensitivity {
     fn code(&self) -> DiagnosticCode {
@@ -45,7 +57,7 @@ impl LintRule for IncompleteSensitivity {
             let sens_set: std::collections::HashSet<_> = sens_signals.iter().copied().collect();
 
             for sig_id in &read_signals {
-                if !sens_set.contains(sig_id) {
+                if !sens_set.contains(sig_id) && !is_non_signal(module, *sig_id) {
                     sink.emit(
                         Diagnostic::warning(
                             self.code(),
@@ -139,6 +151,7 @@ mod tests {
                     ty: TypeId::from_raw(0),
                     span: Span::DUMMY,
                 },
+                kind: aion_ir::AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::SignalList(vec![a]), // Missing b
@@ -188,6 +201,7 @@ mod tests {
                     ty: TypeId::from_raw(0),
                     span: Span::DUMMY,
                 },
+                kind: aion_ir::AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::SignalList(vec![a, b]),
@@ -209,9 +223,58 @@ mod tests {
             body: Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Signal(SignalRef::Signal(SignalId::from_raw(1))),
+                kind: aion_ir::AssignKind::Blocking,
                 span: Span::DUMMY,
             },
             sensitivity: Sensitivity::All,
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module);
+        let sink = DiagnosticSink::new();
+        IncompleteSensitivity.check_module(design.modules.get(design.top), &design, &sink);
+        assert!(sink.take_all().is_empty());
+    }
+    #[test]
+    fn variables_and_constants_not_required_in_sensitivity() {
+        // VHDL: process (a) variable v; constant K; begin y <= a + v + K; end
+        let mut module = mk_module();
+        let a = SignalId::from_raw(0);
+        let v = SignalId::from_raw(1);
+        let k = SignalId::from_raw(2);
+        for (id, kind) in [
+            (a, SignalKind::Wire),
+            (v, SignalKind::Variable),
+            (k, SignalKind::Const),
+        ] {
+            module.signals.alloc(Signal {
+                id,
+                name: Ident::from_raw(10 + id.as_raw()),
+                ty: TypeId::from_raw(0),
+                kind,
+                init: None,
+                clock_domain: None,
+                span: Span::DUMMY,
+            });
+        }
+        let add = |l: Expr, r: Expr| Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+            ty: TypeId::from_raw(0),
+            span: Span::DUMMY,
+        };
+        let rd = |id| Expr::Signal(SignalRef::Signal(id));
+        module.processes.alloc(Process {
+            id: ProcessId::from_raw(0),
+            name: None,
+            kind: ProcessKind::Combinational,
+            body: Statement::Assign {
+                target: SignalRef::Signal(SignalId::from_raw(3)),
+                value: add(add(rd(a), rd(v)), rd(k)),
+                kind: aion_ir::AssignKind::NonBlocking,
+                span: Span::DUMMY,
+            },
+            sensitivity: Sensitivity::SignalList(vec![a]),
             span: Span::DUMMY,
         });
         let design = mk_design(module);
