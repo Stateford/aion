@@ -458,7 +458,7 @@ mod tests {
         let (ast, source_db, interner) = parse(&src);
         let arch = architecture(&ast);
         let mut const_env = ConstEnv::new();
-        const_env.insert(interner.get_or_intern("N"), aion_ir::ConstValue::Int(4));
+        const_env.insert(interner.get_or_intern("n"), aion_ir::ConstValue::Int(4));
         let mut env = RangeEnv::new();
         for decl in &arch.decls {
             env.declare(decl, &const_env, &source_db, &interner);
