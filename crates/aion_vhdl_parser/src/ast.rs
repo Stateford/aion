@@ -1396,6 +1396,21 @@ pub enum UnaryOp {
     Neg,
     /// `??` (condition operator)
     Condition,
+    /// VHDL-2008 unary reduction `and v`: ANDs every element of the
+    /// one-dimensional array operand together into a single scalar.
+    RedAnd,
+    /// VHDL-2008 unary reduction `or v`: ORs every element of the array
+    /// operand into a single scalar.
+    RedOr,
+    /// VHDL-2008 unary reduction `nand v`: the complement of `and v`.
+    RedNand,
+    /// VHDL-2008 unary reduction `nor v`: the complement of `or v`.
+    RedNor,
+    /// VHDL-2008 unary reduction `xor v`: the parity (XOR of all elements)
+    /// of the array operand.
+    RedXor,
+    /// VHDL-2008 unary reduction `xnor v`: the complement of `xor v`.
+    RedXnor,
 }
 
 #[cfg(test)]
