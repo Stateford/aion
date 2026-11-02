@@ -19,6 +19,33 @@ pub enum AssertionKind {
     Cover,
 }
 
+/// How a procedural [`Statement::Assign`] updates its target.
+///
+/// HDLs distinguish assignments whose effect is visible to the very next
+/// statement from assignments whose effect is deferred until the end of the
+/// current time step. Synthesis treats both the same way (the final value of
+/// the target at the end of the process is what gets implemented), but the
+/// simulator must honour the difference to schedule updates in the correct
+/// IEEE 1364/1800 region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AssignKind {
+    /// An immediate (blocking) assignment: Verilog/SV `=`, SV compound
+    /// assignments (`+=`, `++`, ...) and VHDL variable assignment `:=`.
+    ///
+    /// Later statements in the same process execution read the new value
+    /// right away; other processes see it once the update is committed as an
+    /// active-region event.
+    Blocking,
+    /// A deferred (non-blocking) assignment: Verilog/SV `<=` and VHDL signal
+    /// assignment `<=` inside a process.
+    ///
+    /// The right-hand side is evaluated when the statement executes, but the
+    /// target is only updated in the non-blocking assignment (NBA) region,
+    /// after every active process at the current time has run. Reads in the
+    /// same process keep seeing the old value.
+    NonBlocking,
+}
+
 /// A case arm in a case/switch statement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseArm {
@@ -37,12 +64,16 @@ pub struct CaseArm {
 /// these are lowered into combinational cells and flip-flops.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Statement {
-    /// A signal assignment (`target <= value` / `assign target = value`).
+    /// A procedural assignment (`target = value` / `target <= value` /
+    /// `target := value`).
     Assign {
         /// The target signal or signal slice.
         target: SignalRef,
         /// The value expression.
         value: Expr,
+        /// Whether the assignment is blocking or non-blocking, which decides
+        /// when the simulator makes the new value visible.
+        kind: AssignKind,
         /// Source location.
         span: Span,
     },
@@ -144,9 +175,16 @@ mod tests {
         let stmt = Statement::Assign {
             target: SignalRef::Signal(SignalId::from_raw(0)),
             value: Expr::Literal(LogicVec::all_zero(8)),
+            kind: AssignKind::Blocking,
             span: Span::DUMMY,
         };
-        assert!(matches!(stmt, Statement::Assign { .. }));
+        assert!(matches!(
+            stmt,
+            Statement::Assign {
+                kind: AssignKind::Blocking,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -212,6 +250,7 @@ mod tests {
             body: Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: Expr::Literal(LogicVec::all_one(1)),
+                kind: AssignKind::NonBlocking,
                 span: Span::DUMMY,
             }),
             span: Span::DUMMY,
@@ -257,5 +296,80 @@ mod tests {
         } else {
             panic!("expected Display");
         }
+    }
+
+    #[test]
+    fn assign_kinds_distinct() {
+        assert_ne!(AssignKind::Blocking, AssignKind::NonBlocking);
+    }
+
+    #[test]
+    fn assign_kind_serde_roundtrip() {
+        for kind in [AssignKind::Blocking, AssignKind::NonBlocking] {
+            let stmt = Statement::Assign {
+                target: SignalRef::Slice {
+                    signal: SignalId::from_raw(3),
+                    high: 7,
+                    low: 4,
+                },
+                value: Expr::Literal(LogicVec::from_u64(0xA, 4)),
+                kind,
+                span: Span::DUMMY,
+            };
+            let json = serde_json::to_string(&stmt).unwrap();
+            let back: Statement = serde_json::from_str(&json).unwrap();
+            match back {
+                Statement::Assign {
+                    kind: k, target, ..
+                } => {
+                    assert_eq!(k, kind);
+                    assert!(matches!(
+                        target,
+                        SignalRef::Slice {
+                            high: 7,
+                            low: 4,
+                            ..
+                        }
+                    ));
+                }
+                other => panic!("expected Assign, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn assign_kind_bincode_roundtrip() {
+        let stmt = Statement::Block {
+            stmts: vec![
+                Statement::Assign {
+                    target: SignalRef::Signal(SignalId::from_raw(0)),
+                    value: Expr::Literal(LogicVec::all_one(1)),
+                    kind: AssignKind::Blocking,
+                    span: Span::DUMMY,
+                },
+                Statement::Assign {
+                    target: SignalRef::Signal(SignalId::from_raw(1)),
+                    value: Expr::Literal(LogicVec::all_zero(1)),
+                    kind: AssignKind::NonBlocking,
+                    span: Span::DUMMY,
+                },
+            ],
+            span: Span::DUMMY,
+        };
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&stmt, config).unwrap();
+        let (back, _): (Statement, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        let Statement::Block { stmts, .. } = back else {
+            panic!("expected Block");
+        };
+        let kinds: Vec<AssignKind> = stmts
+            .iter()
+            .map(|s| match s {
+                Statement::Assign { kind, .. } => *kind,
+                other => panic!("expected Assign, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec![AssignKind::Blocking, AssignKind::NonBlocking]);
     }
 }

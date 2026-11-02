@@ -659,6 +659,7 @@ mod tests {
         let stmt = Statement::Assign {
             target: SignalRef::Signal(SignalId::from_raw(0)),
             value: mk_signal_expr(id),
+            kind: aion_ir::AssignKind::Blocking,
             span: dummy_span(),
         };
         let result = collect_read_signals(&stmt);
@@ -676,6 +677,7 @@ mod tests {
             then_body: Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: mk_signal_expr(body_id),
+                kind: aion_ir::AssignKind::Blocking,
                 span: dummy_span(),
             }),
             else_body: None,
@@ -692,6 +694,7 @@ mod tests {
         let stmt = Statement::Assign {
             target: SignalRef::Signal(target_id),
             value: mk_literal_expr(),
+            kind: aion_ir::AssignKind::Blocking,
             span: dummy_span(),
         };
         let result = collect_written_signals(&stmt);
@@ -707,11 +710,13 @@ mod tests {
                 Statement::Assign {
                     target: SignalRef::Signal(id1),
                     value: mk_literal_expr(),
+                    kind: aion_ir::AssignKind::Blocking,
                     span: dummy_span(),
                 },
                 Statement::Assign {
                     target: SignalRef::Signal(id2),
                     value: mk_literal_expr(),
+                    kind: aion_ir::AssignKind::Blocking,
                     span: dummy_span(),
                 },
             ],
@@ -808,11 +813,13 @@ mod tests {
             then_body: Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: mk_literal_expr(),
+                kind: aion_ir::AssignKind::Blocking,
                 span: dummy_span(),
             }),
             else_body: Some(Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: mk_literal_expr(),
+                kind: aion_ir::AssignKind::Blocking,
                 span: dummy_span(),
             })),
             span: dummy_span(),
@@ -827,6 +834,7 @@ mod tests {
             then_body: Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: mk_literal_expr(),
+                kind: aion_ir::AssignKind::Blocking,
                 span: dummy_span(),
             }),
             else_body: None,
@@ -844,6 +852,7 @@ mod tests {
                 body: Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: mk_literal_expr(),
+                    kind: aion_ir::AssignKind::Blocking,
                     span: dummy_span(),
                 },
                 span: dummy_span(),
@@ -851,6 +860,7 @@ mod tests {
             default: Some(Box::new(Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: mk_literal_expr(),
+                kind: aion_ir::AssignKind::Blocking,
                 span: dummy_span(),
             })),
             span: dummy_span(),
@@ -867,6 +877,7 @@ mod tests {
                 body: Statement::Assign {
                     target: SignalRef::Signal(SignalId::from_raw(0)),
                     value: mk_literal_expr(),
+                    kind: aion_ir::AssignKind::Blocking,
                     span: dummy_span(),
                 },
                 span: dummy_span(),
@@ -924,6 +935,7 @@ mod tests {
             stmts: vec![Statement::Assign {
                 target: SignalRef::Signal(SignalId::from_raw(0)),
                 value: mk_literal_expr(),
+                kind: aion_ir::AssignKind::Blocking,
                 span: dummy_span(),
             }],
             span: dummy_span(),

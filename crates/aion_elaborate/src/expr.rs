@@ -749,7 +749,7 @@ fn lower_vhdl_literal(span: Span, source_db: &SourceDb) -> IrExpr {
 }
 
 /// Parses a VHDL bit string literal (e.g., `X"FF"`, `B"1010"`) into a `LogicVec`.
-fn parse_vhdl_bit_string(text: &str) -> LogicVec {
+pub(crate) fn parse_vhdl_bit_string(text: &str) -> LogicVec {
     let text = text.replace('_', "");
     let upper = text.to_uppercase();
     if let Some(hex_part) = upper.strip_prefix("X\"").and_then(|s| s.strip_suffix('"')) {

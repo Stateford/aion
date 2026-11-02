@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use aion_common::{ContentHash, Ident};
+use aion_common::{ContentHash, Ident, Logic, LogicVec};
 use aion_ir::arena::Arena;
 use aion_ir::cell::{Cell, CellKind, Connection};
 use aion_ir::ids::{CellId, ModuleId, ProcessId, SignalId, TypeId};
@@ -57,7 +57,7 @@ pub fn elaborate_vhdl_entity(
 
     // Architecture declarations
     for decl in &arch.decls {
-        elaborate_vhdl_decl(decl, &const_env, &mut signals, &mut sig_env, ctx);
+        elaborate_vhdl_decl(decl, None, &const_env, &mut signals, &mut sig_env, ctx);
     }
 
     let mut cells: Arena<CellId, Cell> = Arena::new();
@@ -200,84 +200,252 @@ fn elaborate_vhdl_ports(
     }
 }
 
-/// Elaborates a VHDL architecture declaration (signal, constant, etc.).
+/// Elaborates a VHDL object declaration (signal, constant, variable).
+///
+/// `scope` is `None` for architecture-level declarations and the enclosing
+/// process's scope name for process-local ones. Process-local objects get a
+/// hierarchical IR name (`<scope>.<name>`, e.g. `p.t`), so same-named
+/// variables of different processes stay distinct in the simulator and the
+/// waveform, while `sig_env` still resolves them by their plain name inside
+/// the process. Process-local variables use [`SignalKind::Variable`].
+///
+/// Declared defaults (`:= expr`) become the signal's `init` value; a default
+/// that cannot be evaluated is reported with W204 instead of being dropped
+/// silently.
 fn elaborate_vhdl_decl(
     decl: &vhdl_ast::Declaration,
+    scope: Option<&str>,
     const_env: &ConstEnv,
     signals: &mut Arena<SignalId, Signal>,
     sig_env: &mut SignalEnv,
     ctx: &mut ElaborationContext<'_>,
 ) {
-    match decl {
+    let (names, ty, kind, default, span) = match decl {
         vhdl_ast::Declaration::Signal(sd) => {
-            let ty = types::resolve_vhdl_type(
-                &sd.ty,
-                &mut ctx.design.types,
-                const_env,
-                ctx.source_db,
-                ctx.interner,
-                ctx.sink,
-            );
-            for &name in &sd.names {
-                let sid = signals.alloc(Signal {
-                    id: SignalId::from_raw(0),
-                    name,
-                    ty,
-                    kind: SignalKind::Wire,
-                    init: None,
-                    clock_domain: None,
-                    span: sd.span,
-                });
-                sig_env.insert(name, sid);
-            }
+            (&sd.names, &sd.ty, SignalKind::Wire, &sd.default, sd.span)
         }
         vhdl_ast::Declaration::Constant(cd) => {
-            let ty = types::resolve_vhdl_type(
-                &cd.ty,
-                &mut ctx.design.types,
-                const_env,
-                ctx.source_db,
-                ctx.interner,
-                ctx.sink,
-            );
-            for &name in &cd.names {
-                let sid = signals.alloc(Signal {
-                    id: SignalId::from_raw(0),
-                    name,
-                    ty,
-                    kind: SignalKind::Const,
-                    init: None,
-                    clock_domain: None,
-                    span: cd.span,
-                });
-                sig_env.insert(name, sid);
-            }
+            (&cd.names, &cd.ty, SignalKind::Const, &cd.value, cd.span)
         }
         vhdl_ast::Declaration::Variable(vd) => {
-            let ty = types::resolve_vhdl_type(
-                &vd.ty,
-                &mut ctx.design.types,
-                const_env,
-                ctx.source_db,
-                ctx.interner,
-                ctx.sink,
-            );
-            for &name in &vd.names {
-                let sid = signals.alloc(Signal {
-                    id: SignalId::from_raw(0),
-                    name,
-                    ty,
-                    kind: SignalKind::Reg,
-                    init: None,
-                    clock_domain: None,
-                    span: vd.span,
-                });
-                sig_env.insert(name, sid);
-            }
+            // A shared (architecture-level) variable is visible to every
+            // process, like a signal; only process-local ones are private.
+            let kind = if scope.is_some() {
+                SignalKind::Variable
+            } else {
+                SignalKind::Reg
+            };
+            (&vd.names, &vd.ty, kind, &vd.default, vd.span)
         }
         _ => {
             // Other declarations (type, component, etc.) not handled in Phase 0
+            return;
         }
+    };
+
+    let ty = types::resolve_vhdl_type(
+        ty,
+        &mut ctx.design.types,
+        const_env,
+        ctx.source_db,
+        ctx.interner,
+        ctx.sink,
+    );
+    let width = ctx.design.types.bit_width(ty);
+    let init = default.as_ref().and_then(|expr| {
+        let value = eval_vhdl_default(expr, width, const_env, signals, sig_env, ctx);
+        if value.is_none() {
+            let shown = names
+                .first()
+                .map(|n| ctx.interner.resolve(*n).to_string())
+                .unwrap_or_default();
+            ctx.sink
+                .emit(errors::warn_default_not_constant(&shown, expr.span()));
+        }
+        value
+    });
+
+    for &name in names {
+        let ir_name = match scope {
+            Some(scope) => ctx
+                .interner
+                .get_or_intern(&format!("{scope}.{}", ctx.interner.resolve(name))),
+            None => name,
+        };
+        let sid = signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: ir_name,
+            ty,
+            kind,
+            init: init.clone(),
+            clock_domain: None,
+            span,
+        });
+        sig_env.insert(name, sid);
+    }
+}
+
+/// Evaluates the default value of a VHDL object declaration to a constant.
+///
+/// Handles character literals (`'1'`), string literals of `std_logic`
+/// characters (`"1010"`), bit-string literals (`x"5A"`), `(others => c)`
+/// and positional aggregates, references to previously declared objects
+/// that have a constant init (e.g. another constant), and integer constant
+/// expressions over generics. Logic values are fitted to `width` (the
+/// declared type's bit width, when known): zero-extended or truncated.
+///
+/// Returns `None` if the expression is not one of these forms; the caller
+/// reports that. No diagnostics are emitted here.
+fn eval_vhdl_default(
+    expr: &vhdl_ast::Expr,
+    width: Option<u32>,
+    const_env: &ConstEnv,
+    signals: &Arena<SignalId, Signal>,
+    sig_env: &SignalEnv,
+    ctx: &ElaborationContext<'_>,
+) -> Option<ConstValue> {
+    let fit = |lv: LogicVec| -> ConstValue {
+        match width {
+            Some(w) if w != lv.width() && w > 0 => {
+                let mut out = LogicVec::new(w);
+                for i in 0..w.min(lv.width()) {
+                    out.set(i, lv.get(i));
+                }
+                ConstValue::Logic(out)
+            }
+            _ => ConstValue::Logic(lv),
+        }
+    };
+    match expr {
+        vhdl_ast::Expr::Paren { inner, .. }
+        | vhdl_ast::Expr::Qualified { expr: inner, .. }
+        | vhdl_ast::Expr::TypeConversion { expr: inner, .. } => {
+            eval_vhdl_default(inner, width, const_env, signals, sig_env, ctx)
+        }
+        vhdl_ast::Expr::CharLiteral { span } => {
+            let text = ctx.source_db.snippet(*span).trim_matches('\'');
+            let mut chars = text.chars();
+            let bit = std_logic_char(chars.next()?)?;
+            if chars.next().is_some() {
+                return None;
+            }
+            let mut lv = LogicVec::new(1);
+            lv.set(0, bit);
+            Some(fit(lv))
+        }
+        vhdl_ast::Expr::StringLiteral { span } => {
+            let text = ctx.source_db.snippet(*span);
+            let body = text.strip_prefix('"')?.strip_suffix('"')?;
+            let bits: Vec<Logic> = body
+                .chars()
+                .map(std_logic_char)
+                .collect::<Option<Vec<_>>>()?;
+            if bits.is_empty() {
+                return None;
+            }
+            // Leftmost character is the most significant bit.
+            let mut lv = LogicVec::new(bits.len() as u32);
+            for (i, bit) in bits.iter().rev().enumerate() {
+                lv.set(i as u32, *bit);
+            }
+            Some(fit(lv))
+        }
+        vhdl_ast::Expr::BitStringLiteral { span } => {
+            let text = ctx.source_db.snippet(*span);
+            let upper = text.to_ascii_uppercase();
+            // Only the based forms the lowering understands.
+            if !(upper.starts_with("X\"") || upper.starts_with("B\"") || upper.starts_with("O\"")) {
+                return None;
+            }
+            Some(fit(crate::expr::parse_vhdl_bit_string(text)))
+        }
+        vhdl_ast::Expr::Aggregate { elements, .. } => {
+            // `(others => c)`: every bit takes the value of `c`.
+            if let [only] = elements.as_slice() {
+                if matches!(only.choices.as_slice(), [vhdl_ast::Choice::Others(_)]) {
+                    let w = width?;
+                    let ConstValue::Logic(elem) =
+                        eval_vhdl_default(&only.value, Some(1), const_env, signals, sig_env, ctx)?
+                    else {
+                        return None;
+                    };
+                    let mut lv = LogicVec::new(w);
+                    for i in 0..w {
+                        lv.set(i, elem.get(0));
+                    }
+                    return Some(ConstValue::Logic(lv));
+                }
+            }
+            // Positional aggregate of single bits, leftmost = MSB.
+            if elements.iter().any(|e| !e.choices.is_empty()) || elements.is_empty() {
+                return None;
+            }
+            let mut bits = Vec::with_capacity(elements.len());
+            for e in elements {
+                let ConstValue::Logic(b) =
+                    eval_vhdl_default(&e.value, Some(1), const_env, signals, sig_env, ctx)?
+                else {
+                    return None;
+                };
+                bits.push(b.get(0));
+            }
+            let mut lv = LogicVec::new(bits.len() as u32);
+            for (i, bit) in bits.iter().rev().enumerate() {
+                lv.set(i as u32, *bit);
+            }
+            Some(fit(lv))
+        }
+        vhdl_ast::Expr::Name(name)
+            if name.parts.is_empty() && !const_env.contains_key(&name.primary) =>
+        {
+            // Boolean literals.
+            match ctx
+                .interner
+                .resolve(name.primary)
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "true" => return Some(fit(LogicVec::from_bool(true))),
+                "false" => return Some(fit(LogicVec::from_bool(false))),
+                _ => {}
+            }
+            // A previously declared object with a constant init.
+            let sid = *sig_env.get(&name.primary)?;
+            match &signals.get(sid).init {
+                Some(ConstValue::Logic(lv)) => Some(fit(lv.clone())),
+                Some(other) => Some(other.clone()),
+                None => None,
+            }
+        }
+        _ => {
+            // Integer constant expressions (literals, generics, arithmetic).
+            // Evaluate against a scratch sink: failure is reported by the
+            // caller as W204, not as a constant-expression error.
+            let scratch = aion_diagnostics::DiagnosticSink::new();
+            let value =
+                const_eval::eval_vhdl_expr(expr, ctx.source_db, ctx.interner, const_env, &scratch)?;
+            match (value, width) {
+                (ConstValue::Int(v), Some(w)) => {
+                    Some(ConstValue::Logic(LogicVec::from_u64(v as u64, w)))
+                }
+                (other, _) => Some(other),
+            }
+        }
+    }
+}
+
+/// Maps a VHDL `std_logic` character literal to a 4-state [`Logic`] value.
+///
+/// `'0'`/`'L'` are 0, `'1'`/`'H'` are 1, `'Z'` is high-impedance, and
+/// `'U'`, `'X'`, `'W'`, `'-'` are unknown. Returns `None` for any other
+/// character.
+fn std_logic_char(c: char) -> Option<Logic> {
+    match c.to_ascii_uppercase() {
+        '0' | 'L' => Some(Logic::Zero),
+        '1' | 'H' => Some(Logic::One),
+        'Z' => Some(Logic::Z),
+        'U' | 'X' | 'W' | '-' => Some(Logic::X),
+        _ => None,
     }
 }
 
@@ -285,8 +453,8 @@ fn elaborate_vhdl_decl(
 #[allow(clippy::too_many_arguments)]
 fn elaborate_vhdl_concurrent(
     stmt: &vhdl_ast::ConcurrentStatement,
-    _const_env: &ConstEnv,
-    _signals: &mut Arena<SignalId, Signal>,
+    const_env: &ConstEnv,
+    signals: &mut Arena<SignalId, Signal>,
     sig_env: &mut SignalEnv,
     cells: &mut Arena<CellId, Cell>,
     processes: &mut Arena<ProcessId, Process>,
@@ -295,6 +463,21 @@ fn elaborate_vhdl_concurrent(
 ) {
     match stmt {
         vhdl_ast::ConcurrentStatement::Process(ps) => {
+            // Process-local declarations (variables, constants) become
+            // module signals visible only while lowering this process. A
+            // variable keeps its value between activations, like a `reg`;
+            // `:=` lowers to a blocking assignment to it.
+            // They are named `<label>.<name>` (unlabelled processes use
+            // `_process<N>`, which no VHDL identifier can clash with).
+            let outer_env = (!ps.decls.is_empty()).then(|| sig_env.clone());
+            let scope = match ps.label {
+                Some(label) => ctx.interner.resolve(label).to_string(),
+                None => format!("_process{}", processes.len()),
+            };
+            for decl in &ps.decls {
+                elaborate_vhdl_decl(decl, Some(&scope), const_env, signals, sig_env, ctx);
+            }
+
             // Detect sequential processes by scanning for rising_edge/falling_edge
             let (kind, sensitivity) =
                 detect_vhdl_process_kind(&ps.sensitivity, &ps.stmts, sig_env, ctx.interner);
@@ -319,6 +502,9 @@ fn elaborate_vhdl_concurrent(
                 sensitivity,
                 span: ps.span,
             });
+            if let Some(env) = outer_env {
+                *sig_env = env;
+            }
         }
         vhdl_ast::ConcurrentStatement::SignalAssignment(sa) => {
             let target = lower_vhdl_to_signal_ref(&sa.target, sig_env, ctx.interner, ctx.sink);

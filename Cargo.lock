@@ -115,6 +115,7 @@ dependencies = [
  "aion_elaborate",
  "aion_ir",
  "aion_lint",
+ "aion_sim",
  "aion_source",
  "aion_sv_parser",
  "aion_verilog_parser",
@@ -155,6 +156,7 @@ version = "0.1.0"
 dependencies = [
  "aion_common",
  "aion_source",
+ "bincode",
  "petgraph",
  "serde",
  "serde_json",

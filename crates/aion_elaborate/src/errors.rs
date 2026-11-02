@@ -1,9 +1,10 @@
 //! Diagnostic codes and helper functions for elaboration errors and warnings.
 //!
 //! Error codes `E200`--`E211` cover elaboration failures (unknown modules,
-//! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W203`
+//! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W204`
 //! cover non-fatal issues (width mismatches, unconnected ports, `forever`
-//! loops and `always` blocks with no timing control).
+//! loops and `always` blocks with no timing control, VHDL defaults that
+//! cannot be evaluated).
 
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode};
 use aion_source::Span;
@@ -103,6 +104,30 @@ pub const W203: DiagnosticCode = DiagnosticCode {
     category: Category::Warning,
     number: 203,
 };
+
+/// VHDL object default value that cannot be evaluated at elaboration time.
+pub const W204: DiagnosticCode = DiagnosticCode {
+    category: Category::Warning,
+    number: 204,
+};
+
+/// Creates a warning for a VHDL `signal`/`variable`/`constant` whose default
+/// value (`:= expr`) the elaborator cannot evaluate to a constant.
+///
+/// The default is then not applied, so the object starts uninitialized in
+/// simulation; reporting it avoids a silently wrong result.
+pub fn warn_default_not_constant(name: &str, span: Span) -> Diagnostic {
+    Diagnostic::warning(
+        W204,
+        format!("default value of `{name}` cannot be evaluated at elaboration time"),
+        span,
+    )
+    .with_note("the default is ignored, so the object starts uninitialized (X) in simulation")
+    .with_help(
+        "use a literal (e.g. '0', \"1010\", x\"FF\", (others => '0'), 42) or a previously \
+         declared constant",
+    )
+}
 
 /// Creates a diagnostic for an unknown module in an instantiation.
 pub fn error_unknown_module(name: &str, span: Span) -> Diagnostic {
@@ -308,6 +333,13 @@ mod tests {
         assert_eq!(d.code, W203);
         assert_eq!(format!("{W203}"), "W203");
         assert!(d.message.contains("`always`"));
+        assert!(!d.notes.is_empty());
+        assert!(!d.help.is_empty());
+
+        let d = warn_default_not_constant("t", Span::DUMMY);
+        assert_eq!(d.code, W204);
+        assert_eq!(format!("{W204}"), "W204");
+        assert!(d.message.contains("`t`"));
         assert!(!d.notes.is_empty());
         assert!(!d.help.is_empty());
     }

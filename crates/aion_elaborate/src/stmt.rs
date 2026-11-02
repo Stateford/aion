@@ -9,7 +9,7 @@ use aion_common::Interner;
 use aion_diagnostics::DiagnosticSink;
 use aion_ir::expr::{BinaryOp, Expr as IrExpr};
 use aion_ir::ids::TypeId;
-use aion_ir::stmt::{CaseArm as IrCaseArm, Statement as IrStmt};
+use aion_ir::stmt::{AssignKind, CaseArm as IrCaseArm, Statement as IrStmt};
 use aion_source::SourceDb;
 
 use crate::const_eval;
@@ -44,6 +44,7 @@ pub fn lower_verilog_stmt(
             IrStmt::Assign {
                 target: tgt,
                 value: val,
+                kind: AssignKind::Blocking,
                 span: *span,
             }
         }
@@ -57,6 +58,7 @@ pub fn lower_verilog_stmt(
             IrStmt::Assign {
                 target: tgt,
                 value: val,
+                kind: AssignKind::NonBlocking,
                 span: *span,
             }
         }
@@ -363,6 +365,7 @@ pub fn lower_sv_stmt(
             IrStmt::Assign {
                 target: tgt,
                 value: val,
+                kind: AssignKind::Blocking,
                 span: *span,
             }
         }
@@ -376,6 +379,7 @@ pub fn lower_sv_stmt(
             IrStmt::Assign {
                 target: tgt,
                 value: val,
+                kind: AssignKind::NonBlocking,
                 span: *span,
             }
         }
@@ -400,6 +404,7 @@ pub fn lower_sv_stmt(
             IrStmt::Assign {
                 target: tgt,
                 value: combined,
+                kind: AssignKind::Blocking,
                 span: *span,
             }
         }
@@ -428,6 +433,7 @@ pub fn lower_sv_stmt(
             IrStmt::Assign {
                 target: tgt,
                 value: combined,
+                kind: AssignKind::Blocking,
                 span: *span,
             }
         }
@@ -588,6 +594,7 @@ pub fn lower_vhdl_stmt(
             IrStmt::Assign {
                 target: tgt,
                 value: val,
+                kind: AssignKind::NonBlocking,
                 span: *span,
             }
         }
@@ -601,6 +608,7 @@ pub fn lower_vhdl_stmt(
             IrStmt::Assign {
                 target: tgt,
                 value: val,
+                kind: AssignKind::Blocking,
                 span: *span,
             }
         }
@@ -895,7 +903,13 @@ mod tests {
             span: Span::DUMMY,
         };
         let ir = lower_verilog_stmt(&stmt, &env, &sdb, &interner, &sink);
-        assert!(matches!(ir, IrStmt::Assign { .. }));
+        assert!(matches!(
+            ir,
+            IrStmt::Assign {
+                kind: AssignKind::Blocking,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -960,7 +974,8 @@ mod tests {
             span: Span::DUMMY,
         };
         let ir = lower_sv_stmt(&stmt, &env, &sdb, &interner, &sink);
-        if let IrStmt::Assign { value, .. } = &ir {
+        if let IrStmt::Assign { value, kind, .. } = &ir {
+            assert_eq!(*kind, AssignKind::Blocking);
             assert!(matches!(
                 value,
                 IrExpr::Binary {
@@ -989,7 +1004,8 @@ mod tests {
             span: Span::DUMMY,
         };
         let ir = lower_sv_stmt(&stmt, &env, &sdb, &interner, &sink);
-        if let IrStmt::Assign { value, .. } = &ir {
+        if let IrStmt::Assign { value, kind, .. } = &ir {
+            assert_eq!(*kind, AssignKind::Blocking);
             assert!(matches!(
                 value,
                 IrExpr::Binary {
@@ -1028,7 +1044,13 @@ mod tests {
             span: Span::DUMMY,
         };
         let ir = lower_vhdl_stmt(&stmt, &env, &sdb, &interner, &sink);
-        assert!(matches!(ir, IrStmt::Assign { .. }));
+        assert!(matches!(
+            ir,
+            IrStmt::Assign {
+                kind: AssignKind::NonBlocking,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1238,5 +1260,396 @@ mod tests {
         let diags = sink.diagnostics();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, crate::errors::W202);
+    }
+
+    // ---- blocking vs non-blocking assignment kinds ----
+
+    fn v_ident(name: aion_common::Ident) -> aion_verilog_parser::ast::Expr {
+        aion_verilog_parser::ast::Expr::Identifier {
+            name,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn sv_ident(name: aion_common::Ident) -> aion_sv_parser::ast::Expr {
+        aion_sv_parser::ast::Expr::Identifier {
+            name,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn vhdl_name(primary: aion_common::Ident) -> aion_vhdl_parser::ast::Expr {
+        aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
+            primary,
+            parts: vec![],
+            span: Span::DUMMY,
+        })
+    }
+
+    fn assign_kind(ir: &IrStmt) -> AssignKind {
+        match ir {
+            IrStmt::Assign { kind, .. } => *kind,
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verilog_nonblocking_assign_kind() {
+        let (sdb, interner, sink, mut env) = setup();
+        let a = interner.get_or_intern("a");
+        let b = interner.get_or_intern("b");
+        env.insert(a, SignalId::from_raw(0));
+        env.insert(b, SignalId::from_raw(1));
+        let stmt = aion_verilog_parser::ast::Statement::NonBlocking {
+            target: v_ident(a),
+            value: v_ident(b),
+            span: Span::DUMMY,
+        };
+        let ir = lower_verilog_stmt(&stmt, &env, &sdb, &interner, &sink);
+        assert_eq!(assign_kind(&ir), AssignKind::NonBlocking);
+    }
+
+    #[test]
+    fn sv_blocking_and_nonblocking_assign_kinds() {
+        let (sdb, interner, sink, mut env) = setup();
+        let a = interner.get_or_intern("a");
+        let b = interner.get_or_intern("b");
+        env.insert(a, SignalId::from_raw(0));
+        env.insert(b, SignalId::from_raw(1));
+        let blocking = aion_sv_parser::ast::Statement::Blocking {
+            target: sv_ident(a),
+            value: sv_ident(b),
+            span: Span::DUMMY,
+        };
+        let nonblocking = aion_sv_parser::ast::Statement::NonBlocking {
+            target: sv_ident(a),
+            value: sv_ident(b),
+            span: Span::DUMMY,
+        };
+        let ir_b = lower_sv_stmt(&blocking, &env, &sdb, &interner, &sink);
+        let ir_nb = lower_sv_stmt(&nonblocking, &env, &sdb, &interner, &sink);
+        assert_eq!(assign_kind(&ir_b), AssignKind::Blocking);
+        assert_eq!(assign_kind(&ir_nb), AssignKind::NonBlocking);
+    }
+
+    #[test]
+    fn vhdl_variable_assignment_is_blocking() {
+        let (sdb, interner, sink, mut env) = setup();
+        let v = interner.get_or_intern("v");
+        let d = interner.get_or_intern("d");
+        env.insert(v, SignalId::from_raw(0));
+        env.insert(d, SignalId::from_raw(1));
+        let stmt = aion_vhdl_parser::ast::SequentialStatement::VariableAssignment {
+            target: vhdl_name(v),
+            value: vhdl_name(d),
+            span: Span::DUMMY,
+        };
+        let ir = lower_vhdl_stmt(&stmt, &env, &sdb, &interner, &sink);
+        assert_eq!(assign_kind(&ir), AssignKind::Blocking);
+    }
+
+    /// Parses `src` (language picked from the extension of `file_name`),
+    /// elaborates it with top `top`, and returns the source text and kind of
+    /// every procedural assignment in the top module's processes, in order.
+    fn assign_kinds(file_name: &str, src: &str, top: &str) -> Vec<(String, AssignKind)> {
+        fn walk(stmt: &IrStmt, sdb: &SourceDb, out: &mut Vec<(String, AssignKind)>) {
+            match stmt {
+                IrStmt::Assign { kind, span, .. } => {
+                    out.push((sdb.snippet(*span).trim().to_string(), *kind));
+                }
+                IrStmt::Block { stmts, .. } => stmts.iter().for_each(|s| walk(s, sdb, out)),
+                IrStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, sdb, out);
+                    if let Some(e) = else_body {
+                        walk(e, sdb, out);
+                    }
+                }
+                IrStmt::Case { arms, default, .. } => {
+                    arms.iter().for_each(|a| walk(&a.body, sdb, out));
+                    if let Some(d) = default {
+                        walk(d, sdb, out);
+                    }
+                }
+                IrStmt::Delay { body, .. } | IrStmt::Forever { body, .. } => walk(body, sdb, out),
+                _ => {}
+            }
+        }
+
+        let (design, source_db, diags) = elaborate_src(file_name, src, top);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == aion_diagnostics::Severity::Error),
+            "errors: {diags:?}"
+        );
+        let mut out = Vec::new();
+        for (_, process) in design.modules[design.top].processes.iter() {
+            walk(&process.body, &source_db, &mut out);
+        }
+        out
+    }
+
+    /// Parses `src` (language picked from the extension of `file_name`) and
+    /// elaborates it with top `top`, returning the design, the source
+    /// database and every diagnostic emitted.
+    fn elaborate_src(
+        file_name: &str,
+        src: &str,
+        top: &str,
+    ) -> (aion_ir::Design, SourceDb, Vec<aion_diagnostics::Diagnostic>) {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source(file_name, src.to_string());
+        let mut parsed = crate::ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![],
+        };
+        if file_name.ends_with(".sv") {
+            parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else if file_name.ends_with(".vhd") {
+            parsed.vhdl_files.push(aion_vhdl_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else {
+            parsed.verilog_files.push(aion_verilog_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        }
+        let config: aion_config::ProjectConfig = toml::from_str(&format!(
+            "[project]\nname = \"t\"\nversion = \"0.1.0\"\ntop = \"{top}\"\n"
+        ))
+        .unwrap();
+        let design = crate::elaborate(&parsed, &config, &source_db, &interner, &sink).unwrap();
+        (design, source_db, sink.diagnostics())
+    }
+
+    #[test]
+    fn verilog_source_assign_kinds() {
+        let kinds = assign_kinds(
+            "t.v",
+            "module t(input clk, input [7:0] d);\n\
+             reg [7:0] tmp; reg [7:0] q;\n\
+             always @(posedge clk) begin tmp = d; q <= tmp; end\n\
+             endmodule",
+            "t",
+        );
+        assert_eq!(
+            kinds,
+            vec![
+                ("tmp = d;".to_string(), AssignKind::Blocking),
+                ("q <= tmp;".to_string(), AssignKind::NonBlocking),
+            ]
+        );
+    }
+
+    #[test]
+    fn sv_source_assign_kinds() {
+        let kinds = assign_kinds(
+            "t.sv",
+            "module t(input logic clk, input logic [7:0] d);\n\
+             logic [7:0] acc; logic [7:0] q; logic [7:0] n;\n\
+             always_ff @(posedge clk) q <= d;\n\
+             always_comb begin acc = d; acc += 8'd1; n = acc; end\n\
+             endmodule",
+            "t",
+        );
+        assert_eq!(kinds.len(), 4, "{kinds:?}");
+        assert_eq!(kinds[0].1, AssignKind::NonBlocking, "{kinds:?}");
+        // `=` and the compound `+=` are both blocking.
+        assert!(
+            kinds[1..].iter().all(|(_, k)| *k == AssignKind::Blocking),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn vhdl_source_signal_assignment_is_nonblocking() {
+        let kinds = assign_kinds(
+            "t.vhd",
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\
+             entity t is port (clk : in std_logic; d : in std_logic; q : out std_logic); end entity;\n\
+             architecture rtl of t is\n\
+             begin\n\
+               process (clk) begin\n\
+                 if rising_edge(clk) then q <= d; end if;\n\
+               end process;\n\
+             end architecture;",
+            "t",
+        );
+        assert_eq!(kinds.len(), 1, "{kinds:?}");
+        assert_eq!(kinds[0].1, AssignKind::NonBlocking, "{kinds:?}");
+    }
+
+    #[test]
+    fn vhdl_source_variable_assignment_is_blocking() {
+        let kinds = assign_kinds(
+            "t.vhd",
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\
+             entity t is port (clk : in std_logic; d : in std_logic; q : out std_logic); end entity;\n\
+             architecture rtl of t is\n\
+             begin\n\
+               process (clk)\n\
+                 variable v : std_logic;\n\
+               begin\n\
+                 if rising_edge(clk) then v := d; q <= v; end if;\n\
+               end process;\n\
+             end architecture;",
+            "t",
+        );
+        assert_eq!(
+            kinds.iter().map(|(_, k)| *k).collect::<Vec<_>>(),
+            vec![AssignKind::Blocking, AssignKind::NonBlocking],
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn vhdl_process_variable_not_visible_outside_its_process() {
+        // `v` belongs to the first process; the second one must not see it.
+        let (_, _, diags) = elaborate_src(
+            "t.vhd",
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\
+             entity t is port (d : in std_logic; q : out std_logic; r : out std_logic); end entity;\n\
+             architecture rtl of t is\n\
+             begin\n\
+               process (d)\n\
+                 variable v : std_logic;\n\
+               begin\n\
+                 v := d; q <= v;\n\
+               end process;\n\
+               process (d) begin r <= v; end process;\n\
+             end architecture;",
+            "t",
+        );
+        let unknown: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code.number == 204)
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(unknown, vec!["unknown signal `v`".to_string()], "{diags:?}");
+    }
+
+    /// A top-module IR signal as `(name, kind, init as u64)`.
+    type VhdlObject = (String, aion_ir::SignalKind, Option<u64>);
+
+    /// Elaborates a VHDL architecture body `arch_body` (declarations, then
+    /// `begin` and statements) of entity `t`, returning every top-module
+    /// signal as `(name, kind, init as u64)` plus the diagnostics.
+    fn vhdl_objects(arch_body: &str) -> (Vec<VhdlObject>, Vec<aion_diagnostics::Diagnostic>) {
+        let src = format!(
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\
+             entity t is port (a : in std_logic; y : out std_logic); end entity;\n\
+             architecture rtl of t is\n{arch_body}\nend architecture;"
+        );
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source("t.vhd", src);
+        let parsed = crate::ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![aion_vhdl_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            )],
+        };
+        let config: aion_config::ProjectConfig =
+            toml::from_str("[project]\nname = \"t\"\nversion = \"0.1.0\"\ntop = \"t\"\n").unwrap();
+        let design = crate::elaborate(&parsed, &config, &source_db, &interner, &sink).unwrap();
+        let objects = design.modules[design.top]
+            .signals
+            .iter()
+            .map(|(_, s)| {
+                let init = match &s.init {
+                    Some(aion_ir::ConstValue::Logic(lv)) => lv.to_u64(),
+                    Some(aion_ir::ConstValue::Int(v)) => Some(*v as u64),
+                    _ => None,
+                };
+                (interner.resolve(s.name).to_string(), s.kind, init)
+            })
+            .collect();
+        (objects, sink.diagnostics())
+    }
+
+    fn find<'a>(objects: &'a [VhdlObject], name: &str) -> &'a VhdlObject {
+        objects
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .unwrap_or_else(|| panic!("no object {name} in {objects:?}"))
+    }
+
+    #[test]
+    fn vhdl_process_locals_get_scoped_names_kinds_and_defaults() {
+        use aion_ir::SignalKind;
+        let (objects, diags) = vhdl_objects(
+            "begin\n\
+             p : process (a)\n\
+               constant K : std_logic_vector(3 downto 0) := \"1010\";\n\
+               variable t : std_logic_vector(3 downto 0) := \"0110\";\n\
+               variable n : integer := 3;\n\
+               variable u : std_logic;\n\
+             begin y <= a; end process;\n\
+             process (a) variable v : std_logic := '1'; begin y <= v; end process;",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(find(&objects, "p.K").1, SignalKind::Const);
+        assert_eq!(find(&objects, "p.K").2, Some(0b1010));
+        assert_eq!(find(&objects, "p.t").1, SignalKind::Variable);
+        assert_eq!(find(&objects, "p.t").2, Some(0b0110));
+        assert_eq!(find(&objects, "p.n").2, Some(3));
+        // No default: no init (the simulator starts it as X).
+        assert_eq!(find(&objects, "p.u").2, None);
+        // Unlabelled process: `_process<N>` scope (N = its index).
+        assert_eq!(find(&objects, "_process1.v").1, SignalKind::Variable);
+        assert_eq!(find(&objects, "_process1.v").2, Some(1));
+        assert!(objects.iter().all(|(n, _, _)| n != "t" && n != "v"));
+    }
+
+    #[test]
+    fn vhdl_architecture_defaults_and_shared_variable_kind() {
+        use aion_ir::SignalKind;
+        let (objects, diags) = vhdl_objects(
+            "constant K : std_logic_vector(7 downto 0) := x\"5A\";\n\
+             constant Z : std_logic_vector(7 downto 0) := (others => '1');\n\
+             constant P : std_logic_vector(1 downto 0) := ('1', '0');\n\
+             constant K2 : std_logic_vector(7 downto 0) := K;\n\
+             constant B : boolean := true;\n\
+             signal s : std_logic := '0';\n\
+             shared variable sv : std_logic;\n\
+             begin\n y <= a;",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(find(&objects, "K").2, Some(0x5A));
+        assert_eq!(find(&objects, "Z").2, Some(0xFF));
+        assert_eq!(find(&objects, "P").2, Some(0b10));
+        assert_eq!(find(&objects, "K2").2, Some(0x5A));
+        assert_eq!(find(&objects, "B").2, Some(1));
+        assert_eq!(
+            find(&objects, "s"),
+            &("s".to_string(), SignalKind::Wire, Some(0))
+        );
+        // Shared variables are visible to all processes: not process-local.
+        assert_eq!(find(&objects, "sv").1, SignalKind::Reg);
+    }
+
+    #[test]
+    fn vhdl_unevaluable_default_is_reported_not_dropped_silently() {
+        let (objects, diags) = vhdl_objects(
+            "begin\n\
+             p : process (a)\n\
+               variable t : std_logic := a;\n\
+             begin y <= t; end process;",
+        );
+        let w204: Vec<_> = diags.iter().filter(|d| d.code == errors::W204).collect();
+        assert_eq!(w204.len(), 1, "{diags:?}");
+        assert!(w204[0].message.contains("`t`"), "{}", w204[0].message);
+        assert_eq!(find(&objects, "p.t").2, None);
     }
 }
