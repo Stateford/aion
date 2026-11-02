@@ -45,6 +45,19 @@ pub fn const_to_i64(val: &ConstValue) -> Option<i64> {
     }
 }
 
+/// Applies unary plus (the identity) to an evaluated numeric constant.
+///
+/// A `Real` operand is returned unchanged so `+3.5` stays `3.5`; going through
+/// [`const_to_i64`] would truncate it. Every other value is coerced to an
+/// integer exactly as the unary-minus arms do, and `Logic`/`String` operands
+/// yield `None` because they have no numeric meaning.
+fn unary_plus_value(val: ConstValue) -> Option<ConstValue> {
+    match val {
+        ConstValue::Real(f) => Some(ConstValue::Real(f)),
+        other => Some(ConstValue::Int(const_to_i64(&other)?)),
+    }
+}
+
 /// Parses a Verilog/SystemVerilog numeric literal from its source text.
 ///
 /// Handles plain decimal (`42`), sized binary (`4'b1010`), sized hex (`8'hFF`),
@@ -275,8 +288,7 @@ pub fn eval_verilog_expr(
             ..
         } => {
             // Unary plus is the identity.
-            let val = eval_verilog_expr(operand, source_db, interner, env, sink)?;
-            Some(ConstValue::Int(const_to_i64(&val)?))
+            unary_plus_value(eval_verilog_expr(operand, source_db, interner, env, sink)?)
         }
         v_ast::Expr::SystemCall {
             name, args, span, ..
@@ -390,8 +402,7 @@ pub fn eval_sv_expr(
             ..
         } => {
             // Unary plus is the identity.
-            let val = eval_sv_expr(operand, source_db, interner, env, sink)?;
-            Some(ConstValue::Int(const_to_i64(&val)?))
+            unary_plus_value(eval_sv_expr(operand, source_db, interner, env, sink)?)
         }
         sv_ast::Expr::SystemCall {
             name, args, span, ..
@@ -502,8 +513,7 @@ pub fn eval_vhdl_expr(
             ..
         } => {
             // Unary plus is the identity.
-            let val = eval_vhdl_expr(operand, source_db, interner, env, sink)?;
-            Some(ConstValue::Int(const_to_i64(&val)?))
+            unary_plus_value(eval_vhdl_expr(operand, source_db, interner, env, sink)?)
         }
         vhdl_ast::Expr::Paren { inner, .. } => {
             eval_vhdl_expr(inner, source_db, interner, env, sink)
@@ -1200,5 +1210,62 @@ mod tests {
         );
         assert!(eval_vhdl_expr(&expr, &db, &interner, &env, &sink).is_none());
         assert!(sink.has_errors());
+    }
+
+    #[test]
+    fn unary_plus_value_preserves_real_and_coerces_others() {
+        assert_eq!(
+            unary_plus_value(ConstValue::Real(3.5)),
+            Some(ConstValue::Real(3.5))
+        );
+        assert_eq!(
+            unary_plus_value(ConstValue::Int(-7)),
+            Some(ConstValue::Int(-7))
+        );
+        assert_eq!(
+            unary_plus_value(ConstValue::Bool(true)),
+            Some(ConstValue::Int(1))
+        );
+        assert_eq!(unary_plus_value(ConstValue::String("s".into())), None);
+    }
+
+    #[test]
+    fn eval_unary_plus_preserves_real_binding_all_languages() {
+        let (db, _) = make_source("");
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let r = interner.get_or_intern("R");
+        let mut env = ConstEnv::new();
+        env.insert(r, ConstValue::Real(3.5));
+        let want = Some(ConstValue::Real(3.5));
+
+        let v = v_unary(
+            &[v_ast::UnaryOp::Plus],
+            v_ast::Expr::Identifier {
+                name: r,
+                span: Span::DUMMY,
+            },
+        );
+        assert_eq!(eval_verilog_expr(&v, &db, &interner, &env, &sink), want);
+
+        let s = sv_unary(
+            &[sv_ast::UnaryOp::Plus],
+            sv_ast::Expr::Identifier {
+                name: r,
+                span: Span::DUMMY,
+            },
+        );
+        assert_eq!(eval_sv_expr(&s, &db, &interner, &env, &sink), want);
+
+        let h = vhdl_unary(
+            &[vhdl_ast::UnaryOp::Pos],
+            vhdl_ast::Expr::Name(vhdl_ast::Name {
+                primary: r,
+                parts: Vec::new(),
+                span: Span::DUMMY,
+            }),
+        );
+        assert_eq!(eval_vhdl_expr(&h, &db, &interner, &env, &sink), want);
+        assert!(!sink.has_errors());
     }
 }
