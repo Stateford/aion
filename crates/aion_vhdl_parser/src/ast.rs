@@ -481,13 +481,63 @@ pub enum RangeDirection {
     Downto,
 }
 
-/// A discrete range — either an explicit range or a type-indication-based range.
+/// A discrete range: an explicit range, a range attribute name, or a
+/// type-indication-based range (LRM 5.3.2.1 / 5.2.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DiscreteRange {
     /// An explicit range (e.g., `7 downto 0`).
     Range(RangeConstraint),
-    /// A type indication used as a range (e.g., `integer range 0 to 255`).
+    /// A type indication used as a range (e.g., `integer range 0 to 255`,
+    /// or a bare type mark such as `state_t`).
     TypeIndication(TypeIndication),
+    /// A range attribute name (e.g., `v'range`, `T'reverse_range`,
+    /// `m'range(2)`), whose bounds and direction come from the prefix.
+    Attribute(RangeAttributeName),
+    /// An expression that is neither a range nor a type mark; a diagnostic
+    /// has already been emitted by the parser.
+    Error(Span),
+}
+
+impl DiscreteRange {
+    /// Returns the source span covered by this discrete range.
+    pub fn span(&self) -> Span {
+        match self {
+            DiscreteRange::Range(rc) => rc.span,
+            DiscreteRange::TypeIndication(ti) => ti.span,
+            DiscreteRange::Attribute(attr) => attr.span,
+            DiscreteRange::Error(span) => *span,
+        }
+    }
+}
+
+/// Which predefined range attribute a [`RangeAttributeName`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RangeAttributeKind {
+    /// `'range`: the prefix's index range, in its declared direction.
+    Range,
+    /// `'reverse_range`: the prefix's index range with bounds swapped and
+    /// the direction reversed (`7 downto 0` becomes `0 to 7`).
+    ReverseRange,
+}
+
+/// A range attribute name used as a discrete range, e.g. `v'range`,
+/// `word_t'reverse_range` or `mem'range(2)`.
+///
+/// The prefix may denote an array object (signal, constant, port, variable)
+/// or a type mark; the parser cannot tell them apart, so resolution is left
+/// to elaboration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeAttributeName {
+    /// The attribute prefix: the name up to (but excluding) the attribute,
+    /// including any selected or indexed suffixes (e.g. `rec.field`).
+    pub prefix: Name,
+    /// Whether this is `'range` or `'reverse_range`.
+    pub kind: RangeAttributeKind,
+    /// The optional dimension argument (`m'range(2)`); `None` means the
+    /// first dimension.
+    pub dimension: Option<Box<Expr>>,
+    /// Source span of the whole attribute name.
+    pub span: Span,
 }
 
 // ============================================================================

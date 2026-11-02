@@ -5,6 +5,17 @@
 
 ---
 
+## 2026-11-02 — VHDL Parser: Preserve Attribute Ranges in Discrete Ranges (Fixes #21)
+
+- **AST:** `DiscreteRange` gains `Attribute(RangeAttributeName)` (with `prefix: Name`, `kind: RangeAttributeKind::{Range, ReverseRange}`, an optional `dimension` expression for `m'range(2)`, and `span`) and `Error(Span)`. A new `DiscreteRange::span()` helper is added. `v'range`, `T'reverse_range` and `rec.f(1)'range` no longer collapse to a bare type mark (VHDL-4).
+- **Parser:** `parse_discrete_range` accepts only explicit ranges, range attribute names and plain type marks. Anything else, such as `a + 1`, `8`, `v(3)` or `v'length`, now gets an error at the expression's span and becomes `DiscreteRange::Error`. Before, these were silently dropped or turned into `<error>`. `expr_to_selected_name` is replaced by `expr_as_type_mark`, which returns `None` when dropping a suffix would lose information.
+- **Elaborator:** the new `aion_elaborate::ranges` module adds `ResolvedRange` (`indices()` honours direction, `reversed()` implements `'reverse_range`) and a `RangeEnv`. The env records the declared index ranges of generics, ports, signals, constants, variables, arrays/subtypes and scalar subtypes. Process-local entries stay scoped to their process, and loop parameters shadow outer names. `resolve_vhdl_discrete_range` uses this env:
+  - `std_logic_vector(a'range)` (and `signed`/`unsigned`) is sized from the prefix.
+  - Each `for` loop and `for … generate` range is resolved.
+  - A prefix that is unknown, not an array, has a non-constant range, has a bad dimension or is compound gets the new **E212** error. The range is never guessed.
+- **Tests:** 16 parser tests (`types.rs`); 13 `ranges.rs` tests (index order for `'range`/`'reverse_range` of for-loops and for-generates, types, dimensions, every E212 path); 5 VHDL elaboration tests; 1 errors test.
+- **Known gaps:** the VHDL elaborator still does not unroll `for` loops or expand `for … generate` bodies. Ranges are resolved and checked, but they do not yet drive iteration. Range attributes inside range constraints (`integer range v'range`) and slices (`x(v'range)`) are out of scope.
+
 ## 2026-11-01 — Sim: Unified Process Execution (Fixes #4)
 
 - **One execution path:** a single `SimKernel::run_process` handles Finish and Suspend for every path: delta step, initial blocks, the time-0 combinational pass and wakeups. Delays inside `always` blocks are no longer dropped (SIM-2).

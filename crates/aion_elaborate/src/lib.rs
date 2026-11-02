@@ -16,6 +16,7 @@ pub mod const_eval;
 pub mod context;
 pub mod errors;
 pub mod expr;
+pub mod ranges;
 pub mod registry;
 pub mod stmt;
 pub mod sv;
