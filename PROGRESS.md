@@ -5,6 +5,21 @@
 
 ---
 
+## 2026-11-02 — VHDL Parser: Case-Fold Basic Identifiers at Intern Time (Fixes #15)
+
+- **Folding:** a new `VhdlParser::intern_current_ident` backs `expect_ident`, `expect_ident_or_keyword` and `eat_ident`. These are the only places that intern source identifier text, and they cover names, labels, end names, selected names, attribute names and keywords used as names. Basic identifiers and keywords are interned as ASCII lowercase (LRM 15.4.2). Extended identifiers (`\Foo\`) are kept verbatim, backslashes included. A port declared `Clk` and used as `clk`/`CLK` now resolves, and `architecture a of TOP` binds to `entity Top`.
+- **Module binding:** VHDL entity names are now stored lowercase, so `ModuleRegistry` gained two methods:
+  - `canonical_name`, used for the `aion.toml` top and for Verilog/SV instantiations. An exact match wins; otherwise the name is matched case-insensitively against VHDL entities only, so Verilog stays case-sensitive.
+  - `canonical_vhdl_name`, used for VHDL instantiations. It also binds to a Verilog/SV module that differs only in case, as long as exactly one such module exists.
+- **Tests:**
+  - 6 parser tests: basic and keyword folding, use clauses, extended identifiers staying case-sensitive, `eat_ident`, and the missing-identifier error;
+  - 9 elaborator end-to-end tests: mixed-case declare/use, `of TOP`, `top = "TOP"`, unknown names still reported, Verilog↔VHDL instantiation, ambiguous and exact-preferred cases, Verilog top stays case-sensitive;
+  - 2 registry tests.
+  - Existing tests that looked up VHDL objects by mixed-case names (`K`, `p.K`) now use the folded names.
+- **Known gaps:**
+  - IR, VCD and simulator names of VHDL objects are now lowercase, and `SimKernel::find_signal` is case-sensitive.
+  - Port names in mixed-language port maps (`.Clk(x)` on a VHDL entity) are still compared exactly.
+
 ## 2026-11-01 — Sim: Unified Process Execution (Fixes #4)
 
 - **One execution path:** a single `SimKernel::run_process` handles Finish and Suspend for every path: delta step, initial blocks, the time-0 combinational pass and wakeups. Delays inside `always` blocks are no longer dropped (SIM-2).

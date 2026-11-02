@@ -427,8 +427,8 @@ fn elaborate_verilog_instantiation(
     cells: &mut Arena<CellId, Cell>,
     ctx: &mut ElaborationContext<'_>,
 ) {
-    // Resolve the instantiated module
-    let module_name = inst.module_name;
+    // Resolve the instantiated module (a VHDL entity matches case-insensitively)
+    let module_name = ctx.registry.canonical_name(inst.module_name, ctx.interner);
 
     // Build parameter overrides
     let param_overrides: Vec<(Ident, ConstValue)> = inst

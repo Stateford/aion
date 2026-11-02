@@ -702,6 +702,9 @@ fn elaborate_vhdl_component(
             }
         }
     };
+    // VHDL names are case-insensitive: bind to a Verilog/SV module that
+    // differs only in case when the folded name has no exact match.
+    let module_name = ctx.registry.canonical_vhdl_name(module_name, ctx.interner);
 
     // Build generic overrides
     let generic_overrides: Vec<(Ident, ConstValue)> = ci

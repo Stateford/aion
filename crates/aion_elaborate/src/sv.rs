@@ -490,7 +490,8 @@ fn elaborate_sv_instantiation(
     cells: &mut Arena<CellId, Cell>,
     ctx: &mut ElaborationContext<'_>,
 ) {
-    let module_name = inst.module_name;
+    // A VHDL entity matches case-insensitively.
+    let module_name = ctx.registry.canonical_name(inst.module_name, ctx.interner);
     let param_overrides: Vec<(Ident, ConstValue)> = inst
         .param_overrides
         .iter()
