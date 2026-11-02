@@ -193,6 +193,12 @@ pub fn error_port_mismatch(msg: &str, span: Span) -> Diagnostic {
     Diagnostic::error(E201, msg.to_string(), span)
 }
 
+/// Creates an E205 diagnostic for a value whose shape does not fit its
+/// assignment target (e.g. an assignment pattern with the wrong item count).
+pub fn error_type_mismatch(msg: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(E205, msg.to_string(), span)
+}
+
 /// Creates a diagnostic for an unknown port in an instantiation.
 pub fn error_unknown_port(port_name: &str, module_name: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -348,6 +354,14 @@ mod tests {
     fn port_mismatch_diagnostic() {
         let d = error_port_mismatch("expected 3 ports, found 2", Span::DUMMY);
         assert_eq!(d.code, E201);
+    }
+
+    #[test]
+    fn type_mismatch_diagnostic() {
+        let d = error_type_mismatch("pattern has 2 items but target has 4 bits", Span::DUMMY);
+        assert_eq!(d.code, E205);
+        assert!(d.message.contains("2 items"));
+        assert_eq!(d.severity, aion_diagnostics::Severity::Error);
     }
 
     #[test]

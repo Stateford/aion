@@ -394,7 +394,12 @@ impl VerilogParser<'_> {
         }
     }
 
-    /// Parses a dot suffix for hierarchical names.
+    /// Parses a dot suffix: a hierarchical name or a member selection.
+    ///
+    /// A plain identifier or hierarchical name base absorbs every following
+    /// `.ident` into one [`Expr::HierarchicalName`]. Any other base (index,
+    /// range select, call, ...) gets a single [`Expr::Member`] for one
+    /// `.ident`; callers loop, so chains such as `a[1].b[2].c` nest.
     pub(crate) fn parse_dot_suffix(&mut self, base: Expr) -> Expr {
         let start = base.span();
         // Collect all parts of the hierarchical name
@@ -402,10 +407,14 @@ impl VerilogParser<'_> {
             Expr::Identifier { name, .. } => vec![name],
             Expr::HierarchicalName { parts, .. } => parts,
             _ => {
-                // Can't dot-select on a non-name
                 self.advance(); // eat .
-                let _ = self.expect_ident();
-                return base;
+                let member = self.expect_ident();
+                let span = start.merge(self.prev_span());
+                return Expr::Member {
+                    base: Box::new(base),
+                    member,
+                    span,
+                };
             }
         };
 
@@ -759,6 +768,46 @@ mod tests {
     fn hierarchical_name() {
         let expr = parse_expr_str("u1.data");
         assert!(matches!(expr, Expr::HierarchicalName { .. }));
+    }
+
+    #[test]
+    fn member_on_index_keeps_member() {
+        // Issue #30: `gen_blk[0].sig` used to collapse to `gen_blk[0]`.
+        let expr = parse_expr_str("gen_blk[0].sig");
+        match expr {
+            Expr::Member { base, .. } => assert!(matches!(*base, Expr::Index { .. })),
+            other => panic!("expected member, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_chain_nests() {
+        // a[1].b[2].c == Member(Index(Member(Index(a, 1), b), 2), c)
+        match parse_expr_str("a[1].b[2].c") {
+            Expr::Member { base, .. } => match *base {
+                Expr::Index { base, .. } => assert!(matches!(*base, Expr::Member { .. })),
+                other => panic!("expected index, got {other:?}"),
+            },
+            other => panic!("expected member, got {other:?}"),
+        }
+        // A plain dotted name is still one hierarchical name.
+        assert!(matches!(
+            parse_expr_str("top.u1.sig"),
+            Expr::HierarchicalName { .. }
+        ));
+    }
+
+    #[test]
+    fn member_missing_name_reports_error() {
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let source = "inst[0].";
+        let tokens = lexer::lex(source, file, &sink);
+        let mut parser = VerilogParser::new(tokens, source, file, &interner, &sink);
+        let expr = parser.parse_expr();
+        assert!(sink.has_errors());
+        assert!(matches!(expr, Expr::Member { .. }));
     }
 
     #[test]

@@ -216,6 +216,325 @@ mod tests {
         (procs, spans)
     }
 
+    // --- Issue #30: member selects, fill literals, patterns, `++`/`--` ---
+
+    /// Parses and elaborates `src` (top `top`) and returns the top module and
+    /// every diagnostic as `(code, source text of its span)`.
+    fn elaborate_top(
+        file_name: &str,
+        src: &str,
+    ) -> (
+        aion_ir::Module,
+        Vec<(aion_diagnostics::DiagnosticCode, String)>,
+    ) {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source(file_name, src.to_string());
+        let mut parsed = ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![],
+        };
+        if file_name.ends_with(".sv") {
+            parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else {
+            parsed.verilog_files.push(aion_verilog_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        }
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        let design = elaborate(&parsed, &make_config("top"), &source_db, &interner, &sink).unwrap();
+        let diags = sink
+            .diagnostics()
+            .into_iter()
+            .map(|d| (d.code, source_db.snippet(d.primary_span).to_string()))
+            .collect();
+        (design.modules[design.top].clone(), diags)
+    }
+
+    /// Returns the values of every assignment in `stmt`, in order.
+    fn assigned_values(stmt: &aion_ir::Statement) -> Vec<aion_ir::Expr> {
+        let mut out = Vec::new();
+        fn walk(s: &aion_ir::Statement, out: &mut Vec<aion_ir::Expr>) {
+            match s {
+                aion_ir::Statement::Assign { value, .. } => out.push(value.clone()),
+                aion_ir::Statement::Block { stmts, .. } => stmts.iter().for_each(|s| walk(s, out)),
+                aion_ir::Statement::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, out);
+                    if let Some(e) = else_body {
+                        walk(e, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(stmt, &mut out);
+        out
+    }
+
+    /// Returns the single process body of `module`.
+    fn only_body(module: &aion_ir::Module) -> aion_ir::Statement {
+        assert_eq!(module.processes.len(), 1);
+        module.processes.iter().next().unwrap().1.body.clone()
+    }
+
+    /// Returns the bit string (MSB first) of a literal expression.
+    fn literal_bits(expr: &aion_ir::Expr) -> String {
+        match expr {
+            aion_ir::Expr::Literal(lv) => (0..lv.width())
+                .rev()
+                .map(|i| match lv.get(i) {
+                    aion_common::Logic::Zero => '0',
+                    aion_common::Logic::One => '1',
+                    aion_common::Logic::X => 'x',
+                    aion_common::Logic::Z => 'z',
+                })
+                .collect(),
+            other => panic!("expected literal, got {other:?}"),
+        }
+    }
+
+    fn codes_of(
+        diags: &[(aion_diagnostics::DiagnosticCode, String)],
+        code: aion_diagnostics::DiagnosticCode,
+    ) -> Vec<String> {
+        diags
+            .iter()
+            .filter(|(c, _)| *c == code)
+            .map(|(_, s)| s.clone())
+            .collect()
+    }
+
+    #[test]
+    fn sv_member_on_index_is_diagnosed_not_dropped() {
+        let (module, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic arr; logic y; assign y = arr[2].valid; endmodule",
+        );
+        assert_eq!(codes_of(&diags, errors::E210), vec!["arr[2].valid"]);
+        // The value is a poison literal, never the base select `arr[2]`.
+        let value = &module.assignments[0].value;
+        assert!(
+            !matches!(value, aion_ir::Expr::Index { .. }),
+            "member select must not fall back to its base: {value:?}"
+        );
+    }
+
+    #[test]
+    fn sv_member_lvalue_and_chain_are_diagnosed() {
+        let (_, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic d; logic clk; logic inst; logic a;\n\
+             always_ff @(posedge clk) inst[0].port <= d;\n\
+             always_comb a = inst[1].b[2].c; endmodule",
+        );
+        let e210 = codes_of(&diags, errors::E210);
+        assert!(e210.contains(&"inst[0].port".to_string()), "{e210:?}");
+        assert!(e210.contains(&"inst[1].b[2].c".to_string()), "{e210:?}");
+    }
+
+    #[test]
+    fn verilog_member_on_index_is_diagnosed() {
+        let (_, diags) = elaborate_top(
+            "top.v",
+            "module top; wire gen_blk; wire y; reg q; reg clk;\n\
+             assign y = gen_blk[0].sig;\n\
+             always @(posedge clk) gen_blk[1].r <= q; endmodule",
+        );
+        let e210 = codes_of(&diags, errors::E210);
+        assert_eq!(e210, vec!["gen_blk[0].sig", "gen_blk[1].r"]);
+    }
+
+    #[test]
+    fn sv_fill_literals_take_target_width() {
+        let (module, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic clk; logic rst; logic [7:0] q;\n\
+             always_ff @(posedge clk) if (rst) q <= '0; else q <= '1; endmodule",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let values = assigned_values(&only_body(&module));
+        assert_eq!(literal_bits(&values[0]), "00000000");
+        assert_eq!(literal_bits(&values[1]), "11111111");
+    }
+
+    #[test]
+    fn sv_fill_x_z_slices_concats_and_ternary() {
+        let (module, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic [7:0] q; logic [3:0] a; logic [1:0] b; logic s;\n\
+             logic [7:0] d; logic [7:0] t;\n\
+             always_comb begin q = 'x; q[3:0] = 'z; {a, b} = '1; end\n\
+             assign t = s ? '1 : d; endmodule",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let values = assigned_values(&only_body(&module));
+        assert_eq!(literal_bits(&values[0]), "xxxxxxxx");
+        assert_eq!(literal_bits(&values[1]), "zzzz");
+        assert_eq!(literal_bits(&values[2]), "111111");
+        match &module.assignments[0].value {
+            aion_ir::Expr::Ternary { true_val, .. } => {
+                assert_eq!(literal_bits(true_val), "11111111")
+            }
+            other => panic!("expected ternary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sv_fill_one_without_context_width_is_diagnosed() {
+        // `'1` in a comparison is sized by the other operand, which this
+        // lowering cannot see: it must be reported, not lowered to 1'b1.
+        let (_, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic [7:0] q; logic y; logic [7:0] mem [0:3];\n\
+             always_comb begin y = (q == '1); mem = '1; end endmodule",
+        );
+        let e210 = codes_of(&diags, errors::E210);
+        assert_eq!(e210, vec!["'1", "'1"], "{diags:?}");
+    }
+
+    #[test]
+    fn sv_fill_zero_without_context_is_one_bit_zero() {
+        let (module, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic [7:0] q; logic y; always_comb y = (q == '0); endmodule",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &assigned_values(&only_body(&module))[0] {
+            aion_ir::Expr::Binary { rhs, .. } => assert_eq!(literal_bits(rhs), "0"),
+            other => panic!("expected comparison, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sv_assignment_pattern_default_and_positional() {
+        let (module, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic [7:0] q; logic [3:0] n; logic [3:0] m;\n\
+             always_comb begin q = '{default: 1'b1}; n = '{1'b1, 1'b0, '1, 1}; \
+             m = '{default: '0}; end endmodule",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let values = assigned_values(&only_body(&module));
+        assert_eq!(literal_bits(&values[0]), "11111111");
+        assert_eq!(literal_bits(&values[1]), "1011");
+        assert_eq!(literal_bits(&values[2]), "0000");
+    }
+
+    #[test]
+    fn sv_assignment_pattern_unsupported_shapes_are_diagnosed() {
+        let (_, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic [3:0] n; logic [7:0] mem [0:3]; logic v;\n\
+             always_comb begin n = '{1, 0}; n = '{0: 1, default: 0}; \
+             mem = '{default: 0}; n = '{default: v}; end endmodule",
+        );
+        assert_eq!(
+            codes_of(&diags, errors::E205),
+            vec!["'{1, 0}"],
+            "item count mismatch: {diags:?}"
+        );
+        assert_eq!(
+            codes_of(&diags, errors::E210),
+            vec!["'{0: 1, default: 0}", "'{default: 0}", "'{default: v}"],
+            "{diags:?}"
+        );
+    }
+
+    /// Returns `true` if `expr` contains an IR negation.
+    fn contains_neg(expr: &aion_ir::Expr) -> bool {
+        match expr {
+            aion_ir::Expr::Unary { op, operand, .. } => {
+                *op == aion_ir::expr::UnaryOp::Neg || contains_neg(operand)
+            }
+            aion_ir::Expr::Binary { lhs, rhs, .. } => contains_neg(lhs) || contains_neg(rhs),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn sv_postfix_increment_assigns_old_value_then_increments() {
+        let (module, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic [7:0] a; logic [7:0] b; initial a = b++; endmodule",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let body = only_body(&module);
+        let aion_ir::Statement::Block { stmts, .. } = &body else {
+            panic!("expected hoisted block, got {body:?}")
+        };
+        assert_eq!(stmts.len(), 2);
+        let values = assigned_values(&body);
+        // a = b (old value), then b = b + 1
+        assert!(matches!(values[0], aion_ir::Expr::Signal(_)), "{values:?}");
+        assert!(matches!(
+            values[1],
+            aion_ir::Expr::Binary {
+                op: aion_ir::expr::BinaryOp::Add,
+                ..
+            }
+        ));
+        assert!(!values.iter().any(contains_neg), "{values:?}");
+    }
+
+    #[test]
+    fn sv_prefix_decrement_runs_before_the_assignment() {
+        let (module, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic [7:0] a; logic [7:0] b; initial a = --b + 1; endmodule",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let values = assigned_values(&only_body(&module));
+        assert_eq!(values.len(), 2);
+        // b = b - 1 first, then a = b + 1
+        assert!(matches!(
+            values[0],
+            aion_ir::Expr::Binary {
+                op: aion_ir::expr::BinaryOp::Sub,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &values[1],
+            aion_ir::Expr::Binary { op: aion_ir::expr::BinaryOp::Add, lhs, .. }
+                if matches!(**lhs, aion_ir::Expr::Signal(_))
+        ));
+        assert!(!values.iter().any(contains_neg), "{values:?}");
+    }
+
+    #[test]
+    fn sv_conditional_or_non_assignment_incr_is_diagnosed() {
+        let (_, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic [7:0] a; logic [7:0] b; logic c;\n\
+             initial begin a = c ? b++ : 0; if (b-- > 1) a = 0; end endmodule",
+        );
+        assert_eq!(
+            codes_of(&diags, errors::E210),
+            vec!["b++", "b--"],
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn sv_statement_incr_decr_still_works() {
+        let (module, diags) = elaborate_top(
+            "top.sv",
+            "module top; logic [7:0] i; initial begin i++; --i; end endmodule",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let values = assigned_values(&only_body(&module));
+        assert_eq!(values.len(), 2);
+        assert!(!values.iter().any(contains_neg), "{values:?}");
+    }
+
     fn assert_empty_sensitivity(p: &aion_ir::Process) {
         assert!(
             matches!(&p.sensitivity, aion_ir::Sensitivity::SignalList(s) if s.is_empty()),

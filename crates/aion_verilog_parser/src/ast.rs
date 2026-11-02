@@ -802,6 +802,21 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// A member or hierarchical selection on an arbitrary base expression
+    /// (e.g., `gen_blk[0].sig`, `inst[0].port`).
+    ///
+    /// Dotted names whose every prefix is a plain identifier (`a.b.c`) are
+    /// still parsed as [`Expr::HierarchicalName`]; `Member` is produced as soon
+    /// as the base is anything else, and chains nest (`a[1].b[2].c` is
+    /// `Member(Index(Member(Index(a, 1), b), 2), c)`).
+    Member {
+        /// The expression whose member is selected.
+        base: Box<Expr>,
+        /// The selected member or hierarchical scope name.
+        member: Ident,
+        /// Source span covering the base and the member name.
+        span: Span,
+    },
     /// An error node produced during error recovery.
     Error(Span),
 }
@@ -826,6 +841,7 @@ impl Expr {
             | Expr::FuncCall { span, .. }
             | Expr::SystemCall { span, .. }
             | Expr::Paren { span, .. }
+            | Expr::Member { span, .. }
             | Expr::Error(span) => *span,
         }
     }
@@ -924,6 +940,26 @@ mod tests {
         let json = serde_json::to_string(&expr).unwrap();
         let back: Expr = serde_json::from_str(&json).unwrap();
         assert_eq!(back.span(), dummy_span());
+    }
+
+    #[test]
+    fn serde_roundtrip_member_expr() {
+        let expr = Expr::Member {
+            base: Box::new(Expr::Index {
+                base: Box::new(Expr::Identifier {
+                    name: Ident::from_raw(1),
+                    span: dummy_span(),
+                }),
+                index: Box::new(Expr::Literal { span: dummy_span() }),
+                span: dummy_span(),
+            }),
+            member: Ident::from_raw(2),
+            span: dummy_span(),
+        };
+        let json = serde_json::to_string(&expr).unwrap();
+        let back: Expr = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.span(), dummy_span());
+        assert!(matches!(back, Expr::Member { member, .. } if member == Ident::from_raw(2)));
     }
 
     #[test]
