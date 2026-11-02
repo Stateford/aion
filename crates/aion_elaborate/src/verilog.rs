@@ -475,11 +475,11 @@ fn elaborate_verilog_instantiation(
     cells: &mut Arena<CellId, Cell>,
     ctx: &mut ElaborationContext<'_>,
 ) {
-    // Resolve the instantiated module
-    let module_name = inst.module_name;
+    // Resolve the instantiated module (a VHDL entity matches case-insensitively)
+    let module_name = ctx.registry.canonical_name(inst.module_name, ctx.interner);
 
     // Build parameter overrides
-    let param_overrides: Vec<(Ident, ConstValue)> = inst
+    let mut param_overrides: Vec<(Ident, ConstValue)> = inst
         .param_overrides
         .iter()
         .filter_map(|conn| {
@@ -495,12 +495,21 @@ fn elaborate_verilog_instantiation(
             Some((formal, val))
         })
         .collect();
+    // A VHDL child's generics are case-insensitive (stored folded).
+    let target_is_vhdl = ctx.registry.is_vhdl_entity(module_name);
+    crate::binding::canonicalize_overrides(
+        &mut param_overrides,
+        ctx.registry.lookup(module_name).as_ref(),
+        false,
+        ctx.interner,
+    );
 
     // Check cache first
     if let Some(mid) = ctx.check_cache(module_name, &param_overrides) {
         // Create instance cells for each instance
         for instance in &inst.instances {
-            let connections = build_verilog_connections(&instance.connections, sig_env, mid, ctx);
+            let connections =
+                build_verilog_connections(&instance.connections, sig_env, mid, target_is_vhdl, ctx);
             cells.alloc(Cell {
                 id: CellId::from_raw(0),
                 name: instance.name,
@@ -576,7 +585,8 @@ fn elaborate_verilog_instantiation(
     ctx.pop_elab_stack();
 
     for instance in &inst.instances {
-        let connections = build_verilog_connections(&instance.connections, sig_env, mid, ctx);
+        let connections =
+            build_verilog_connections(&instance.connections, sig_env, mid, target_is_vhdl, ctx);
         cells.alloc(Cell {
             id: CellId::from_raw(0),
             name: instance.name,
@@ -596,14 +606,22 @@ fn build_verilog_connections(
     connections: &[v_ast::Connection],
     sig_env: &SignalEnv,
     target_module: ModuleId,
+    target_is_vhdl: bool,
     ctx: &ElaborationContext<'_>,
 ) -> Vec<Connection> {
     connections
         .iter()
         .filter_map(|conn| {
-            let formal = conn.formal?;
             // Unconnected ports (`.p()`) produce no connection.
             let actual = conn.actual.as_ref()?;
+            // A VHDL child's (folded) port names match case-insensitively.
+            let formal = crate::binding::bind_port(
+                target_module,
+                conn.formal?,
+                target_is_vhdl,
+                conn.span,
+                ctx,
+            )?;
             let signal =
                 lower_to_signal_ref(actual, sig_env, ctx.source_db, ctx.interner, ctx.sink);
             let direction = lookup_port_direction(target_module, formal, ctx);

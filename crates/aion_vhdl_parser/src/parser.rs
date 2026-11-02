@@ -140,11 +140,30 @@ impl<'src> VhdlParser<'src> {
         }
     }
 
+    /// Interns the current token's text as an identifier, applying VHDL case rules.
+    ///
+    /// Basic identifiers and keywords are case-insensitive (IEEE 1076-2008
+    /// §15.4.2, §15.10), so their text is folded to ASCII lowercase before
+    /// interning; `Clk`, `CLK` and `clk` therefore share one [`Ident`].
+    /// Extended identifiers (`\Foo\`) are case-sensitive and are interned
+    /// verbatim, backslashes included, so they never collide with a basic
+    /// identifier of the same spelling.
+    pub(crate) fn intern_current_ident(&self) -> Ident {
+        let text = self.current_text();
+        if self.at(VhdlToken::ExtendedIdentifier) || !text.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.interner.get_or_intern(text)
+        } else {
+            self.interner.get_or_intern(&text.to_ascii_lowercase())
+        }
+    }
+
     /// Expects and returns an identifier. Emits an error and returns a dummy if not.
+    ///
+    /// Basic identifiers are case-folded to lowercase; extended identifiers are
+    /// kept verbatim (see [`Self::intern_current_ident`]).
     pub(crate) fn expect_ident(&mut self) -> Ident {
         if self.at(VhdlToken::Identifier) || self.at(VhdlToken::ExtendedIdentifier) {
-            let text = self.current_text();
-            let ident = self.interner.get_or_intern(text);
+            let ident = self.intern_current_ident();
             self.advance();
             ident
         } else {
@@ -154,14 +173,16 @@ impl<'src> VhdlParser<'src> {
     }
 
     /// Expects an identifier or keyword (for attribute names, entity classes, etc.).
+    ///
+    /// Keywords are case-insensitive, so they are folded to lowercase just like
+    /// basic identifiers (`'RANGE` and `'range` intern to the same [`Ident`]).
     pub(crate) fn expect_ident_or_keyword(&mut self) -> Ident {
         if self.at(VhdlToken::Identifier) || self.at(VhdlToken::ExtendedIdentifier) {
             return self.expect_ident();
         }
         // Allow keywords to be used as identifiers in certain contexts
         if self.current().is_keyword() {
-            let text = self.current_text();
-            let ident = self.interner.get_or_intern(text);
+            let ident = self.intern_current_ident();
             self.advance();
             return ident;
         }
@@ -1940,5 +1961,160 @@ mod tests {
         assert!(errors
             .iter()
             .all(|e| !e.message.contains("parser made no progress")));
+    }
+
+    // ========================================================================
+    // Identifier case folding (IEEE 1076-2008 §15.4)
+    // ========================================================================
+
+    /// Parses `source` and returns the AST together with the interner used,
+    /// so tests can inspect the interned spelling of identifiers.
+    fn parse_with_interner(source: &str) -> (VhdlDesignFile, Interner) {
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let tokens = lexer::lex(source, file, &sink);
+        let ast = VhdlParser::new(tokens, source, file, &interner, &sink).parse_design_file();
+        let errors = sink.take_all();
+        assert!(
+            errors.is_empty(),
+            "unexpected errors: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        (ast, interner)
+    }
+
+    /// Returns the entity and architecture declarations of a parsed file.
+    fn entity_and_arch(ast: &VhdlDesignFile) -> (&EntityDecl, &ArchitectureDecl) {
+        let mut entity = None;
+        let mut arch = None;
+        for unit in &ast.units {
+            if let DesignUnit::ContextUnit { unit, .. } = unit {
+                match unit {
+                    DesignUnitKind::Entity(e) => entity = Some(e),
+                    DesignUnitKind::Architecture(a) => arch = Some(a),
+                    _ => {}
+                }
+            }
+        }
+        (entity.expect("entity"), arch.expect("architecture"))
+    }
+
+    #[test]
+    fn basic_identifiers_fold_to_lowercase() {
+        let (ast, interner) = parse_with_interner(
+            "LIBRARY IEEE; USE IEEE.Std_Logic_1164.ALL;
+             ENTITY Top IS PORT (Clk : IN STD_LOGIC); END ENTITY TOP;
+             ARCHITECTURE Rtl OF TOP IS BEGIN END ARCHITECTURE rtl;",
+        );
+        let (entity, arch) = entity_and_arch(&ast);
+        assert_eq!(interner.resolve(entity.name), "top");
+        assert_eq!(interner.resolve(arch.name), "rtl");
+        // `architecture ... of TOP` binds to `entity Top` by Ident equality.
+        assert_eq!(arch.entity_name, entity.name);
+
+        let port = &entity.ports.as_ref().expect("ports").decls[0];
+        assert_eq!(interner.resolve(port.names[0]), "clk");
+        assert_eq!(port.names[0], interner.get_or_intern("clk"));
+        let ty: Vec<_> = port
+            .ty
+            .type_mark
+            .parts
+            .iter()
+            .map(|p| interner.resolve(*p))
+            .collect();
+        assert_eq!(ty, vec!["std_logic"]);
+
+        let DesignUnit::ContextUnit { context, .. } = &ast.units[0] else {
+            panic!("expected context unit");
+        };
+        let ContextItem::Use { name, .. } = &context[1] else {
+            panic!("expected use clause");
+        };
+        let parts: Vec<_> = name.parts.iter().map(|p| interner.resolve(*p)).collect();
+        assert_eq!(parts, vec!["ieee", "std_logic_1164", "all"]);
+    }
+
+    #[test]
+    fn extended_identifiers_keep_case() {
+        let (ast, interner) = parse_with_interner(
+            "entity \\Top\\ is end entity;
+             architecture a of \\Top\\ is begin end architecture;",
+        );
+        let (entity, arch) = entity_and_arch(&ast);
+        assert_eq!(interner.resolve(entity.name), "\\Top\\");
+        assert_eq!(arch.entity_name, entity.name);
+        // Extended identifiers are distinct from the basic identifier `top`
+        // and from extended identifiers differing only in case.
+        assert_ne!(entity.name, interner.get_or_intern("top"));
+        assert_ne!(entity.name, interner.get_or_intern("\\top\\"));
+    }
+
+    #[test]
+    fn extended_identifier_does_not_bind_to_case_variant() {
+        // `\TOP\` is not the same entity as `\Top\`.
+        let (ast, _) = parse_with_interner(
+            "entity \\Top\\ is end entity;
+             architecture a of \\TOP\\ is begin end architecture;",
+        );
+        let (entity, arch) = entity_and_arch(&ast);
+        assert_ne!(arch.entity_name, entity.name);
+    }
+
+    #[test]
+    fn attribute_keyword_and_prefix_fold_to_lowercase() {
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let source = "Clk'EVENT";
+        let tokens = lexer::lex(source, file, &sink);
+        let expr = VhdlParser::new(tokens, source, file, &interner, &sink).parse_expr();
+        assert!(sink.take_all().is_empty());
+        let Expr::Name(name) = expr else {
+            panic!("expected name expression, got {expr:?}");
+        };
+        assert_eq!(interner.resolve(name.primary), "clk");
+        let NameSuffix::Attribute(attr, None, _) = &name.parts[0] else {
+            panic!("expected attribute suffix, got {:?}", name.parts);
+        };
+        assert_eq!(interner.resolve(*attr), "event");
+    }
+
+    #[test]
+    fn keyword_used_as_identifier_folds_to_lowercase() {
+        // `RANGE` is a reserved word reached via `expect_ident_or_keyword`
+        // (e.g. `x'RANGE`); every spelling must intern to `range`.
+        let (names, errors) = with_parser("RANGE Range range", |p| {
+            let ids = [
+                p.expect_ident_or_keyword(),
+                p.expect_ident_or_keyword(),
+                p.expect_ident_or_keyword(),
+            ];
+            ids.map(|id| p.interner.resolve(id).to_string())
+        });
+        assert!(errors.is_empty());
+        assert_eq!(names, ["range", "range", "range"]);
+    }
+
+    #[test]
+    fn eat_ident_folds_and_rejects_non_identifiers() {
+        let (res, errors) = with_parser("MyLabel ;", |p| {
+            let first = p.eat_ident().map(|id| p.interner.resolve(id).to_string());
+            let second = p.eat_ident();
+            (first, second)
+        });
+        assert!(errors.is_empty());
+        assert_eq!(res.0.as_deref(), Some("mylabel"));
+        assert!(res.1.is_none());
+    }
+
+    #[test]
+    fn expect_ident_on_non_identifier_reports_error() {
+        let (name, errors) = with_parser(";", |p| {
+            let id = p.expect_ident();
+            p.interner.resolve(id).to_string()
+        });
+        assert_eq!(errors.len(), 1);
+        assert_eq!(name, "<missing>");
     }
 }

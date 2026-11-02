@@ -1693,8 +1693,8 @@ mod tests {
              process (a) variable v : std_logic := '1'; begin y <= v; end process;",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        assert_eq!(find(&objects, "p.K").1, SignalKind::Const);
-        assert_eq!(find(&objects, "p.K").2, Some(0b1010));
+        assert_eq!(find(&objects, "p.k").1, SignalKind::Const);
+        assert_eq!(find(&objects, "p.k").2, Some(0b1010));
         assert_eq!(find(&objects, "p.t").1, SignalKind::Variable);
         assert_eq!(find(&objects, "p.t").2, Some(0b0110));
         assert_eq!(find(&objects, "p.n").2, Some(3));
@@ -1720,11 +1720,11 @@ mod tests {
              begin\n y <= a;",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        assert_eq!(find(&objects, "K").2, Some(0x5A));
-        assert_eq!(find(&objects, "Z").2, Some(0xFF));
-        assert_eq!(find(&objects, "P").2, Some(0b10));
-        assert_eq!(find(&objects, "K2").2, Some(0x5A));
-        assert_eq!(find(&objects, "B").2, Some(1));
+        assert_eq!(find(&objects, "k").2, Some(0x5A));
+        assert_eq!(find(&objects, "z").2, Some(0xFF));
+        assert_eq!(find(&objects, "p").2, Some(0b10));
+        assert_eq!(find(&objects, "k2").2, Some(0x5A));
+        assert_eq!(find(&objects, "b").2, Some(1));
         assert_eq!(
             find(&objects, "s"),
             &("s".to_string(), SignalKind::Wire, Some(0))
