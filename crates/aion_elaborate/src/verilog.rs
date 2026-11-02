@@ -17,7 +17,7 @@ use aion_ir::process::{Edge, EdgeSensitivity, Process, ProcessKind, Sensitivity}
 use aion_ir::signal::{Signal, SignalKind};
 use aion_ir::stmt::Statement as IrStmt;
 use aion_ir::ConstValue;
-use aion_source::SourceDb;
+use aion_source::{SourceDb, Span};
 use aion_verilog_parser::ast::{self as v_ast, Direction};
 
 use crate::const_eval::{self, ConstEnv};
@@ -25,7 +25,7 @@ use crate::context::ElaborationContext;
 use crate::errors;
 use crate::expr::{lower_to_signal_ref, lower_verilog_expr, SignalEnv};
 use crate::registry::ModuleEntry;
-use crate::stmt::lower_verilog_stmt;
+use crate::stmt::{lower_verilog_looping_always, lower_verilog_stmt};
 use crate::types;
 
 /// Elaborates a Verilog module declaration into an IR module.
@@ -298,8 +298,14 @@ fn elaborate_verilog_item(
             });
         }
         v_ast::ModuleItem::AlwaysBlock(ab) => {
-            let (kind, sensitivity, body_stmt) =
-                analyze_verilog_always(&ab.body, sig_env, ctx.source_db, ctx.interner, ctx.sink);
+            let (kind, sensitivity, body_stmt) = analyze_verilog_always(
+                &ab.body,
+                ab.span,
+                sig_env,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
             let _pid = processes.alloc(Process {
                 id: ProcessId::from_raw(0),
                 name: None,
@@ -316,7 +322,9 @@ fn elaborate_verilog_item(
                 name: None,
                 kind: ProcessKind::Initial,
                 body,
-                sensitivity: Sensitivity::All,
+                // An initial block runs once at time 0 and then resumes only
+                // from its own delays: it is sensitive to nothing.
+                sensitivity: Sensitivity::SignalList(Vec::new()),
                 span: ib.span,
             });
         }
@@ -338,8 +346,14 @@ fn elaborate_verilog_item(
 }
 
 /// Analyzes a Verilog always block to determine ProcessKind and sensitivity.
+///
+/// `always @(...) body` maps its event control to the process sensitivity.
+/// An `always` block without a top-level event control (e.g.
+/// `always #5 clk = ~clk;`) is a looping process: its body is wrapped in a
+/// `forever` loop (see [`lower_verilog_looping_always`]).
 fn analyze_verilog_always(
     body: &v_ast::Statement,
+    always_span: Span,
     sig_env: &SignalEnv,
     source_db: &SourceDb,
     interner: &Interner,
@@ -354,7 +368,8 @@ fn analyze_verilog_always(
         let ir_body = lower_verilog_stmt(body, sig_env, source_db, interner, sink);
         (kind, sens, ir_body)
     } else {
-        let ir_body = lower_verilog_stmt(body, sig_env, source_db, interner, sink);
+        let ir_body =
+            lower_verilog_looping_always(body, always_span, sig_env, source_db, interner, sink);
         (ProcessKind::Combinational, Sensitivity::All, ir_body)
     }
 }
