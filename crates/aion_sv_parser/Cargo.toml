@@ -9,6 +9,8 @@ aion_common = { workspace = true }
 aion_source = { workspace = true }
 aion_diagnostics = { workspace = true }
 serde = { workspace = true }
+aion_vpp.workspace = true
 
 [dev-dependencies]
 serde_json = "1"
+tempfile = "3"
