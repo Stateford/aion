@@ -249,7 +249,8 @@ begin
 end architecture;
 "#;
     let (kernel, _) = simulate("tb.vhd", src, "tb");
-    assert_eq!(value_of(&kernel, "top.p.K"), Some(0b1010));
+    // VHDL basic identifiers are case-folded, so `K` is the signal `k`.
+    assert_eq!(value_of(&kernel, "top.p.k"), Some(0b1010));
     assert_eq!(value_of(&kernel, "top.p.t"), Some(0b0110));
     assert_eq!(value(&kernel, "y"), Some(0b1100));
 }
@@ -276,8 +277,9 @@ begin
 end architecture;
 "#;
     let (kernel, _) = simulate("tb.vhd", src, "tb");
-    assert_eq!(value(&kernel, "K"), Some(0x5A));
-    assert_eq!(value(&kernel, "Z"), Some(0));
+    // VHDL basic identifiers are case-folded, so `K`/`Z` are `k`/`z`.
+    assert_eq!(value(&kernel, "k"), Some(0x5A));
+    assert_eq!(value(&kernel, "z"), Some(0));
     assert_eq!(value(&kernel, "s"), Some(1));
     assert_eq!(value(&kernel, "y"), Some(0x5A));
 }
