@@ -1,0 +1,13 @@
+[package]
+name = "aion_vpp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Shared Verilog/SystemVerilog preprocessor: text macros, conditional compilation, includes and compiler directives"
+
+[dependencies]
+aion_diagnostics.workspace = true
+aion_source.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
