@@ -12,6 +12,7 @@
 
 #![warn(missing_docs)]
 
+mod binding;
 pub mod const_eval;
 pub mod context;
 pub mod errors;
@@ -69,7 +70,9 @@ pub fn elaborate(
         sink,
     );
 
-    let top_name = interner.get_or_intern(&config.project.top);
+    // VHDL entity names are stored case-folded, so `top = "Top"` must still
+    // find `entity top` (exact matches, e.g. Verilog modules, win first).
+    let top_name = registry.canonical_name(interner.get_or_intern(&config.project.top), interner);
 
     let entry = registry.lookup(top_name);
     if entry.is_none() {
@@ -987,5 +990,424 @@ mod tests {
         let top = &design.modules[design.top];
         let proc = top.processes.iter().next().unwrap().1;
         assert!(matches!(proc.kind, ProcessKind::Combinational));
+    }
+
+    // ========================================================================
+    // VHDL identifier case-insensitivity (issue #15)
+    // ========================================================================
+
+    /// Parses every `(file_name, source)` pair (language chosen by extension)
+    /// and elaborates them with top `top`. Returns the design, the interner,
+    /// and all diagnostics (parse + elaboration).
+    fn elaborate_sources(
+        files: &[(&str, &str)],
+        top: &str,
+    ) -> (Design, Interner, Vec<aion_diagnostics::Diagnostic>) {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let mut parsed = ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![],
+        };
+        for (file_name, src) in files {
+            let file_id = source_db.add_source(file_name, src.to_string());
+            if file_name.ends_with(".vhd") {
+                parsed.vhdl_files.push(aion_vhdl_parser::parse_file(
+                    file_id, &source_db, &interner, &sink,
+                ));
+            } else if file_name.ends_with(".sv") {
+                parsed.sv_files.push(aion_sv_parser::parse_file(
+                    file_id, &source_db, &interner, &sink,
+                ));
+            } else {
+                parsed.verilog_files.push(aion_verilog_parser::parse_file(
+                    file_id, &source_db, &interner, &sink,
+                ));
+            }
+        }
+        let design = elaborate(&parsed, &make_config(top), &source_db, &interner, &sink).unwrap();
+        let diags = sink.diagnostics();
+        (design, interner, diags)
+    }
+
+    /// Returns the messages of all error diagnostics.
+    fn error_messages(diags: &[aion_diagnostics::Diagnostic]) -> Vec<String> {
+        diags
+            .iter()
+            .filter(|d| d.severity == aion_diagnostics::Severity::Error)
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    const MIXED_CASE_VHDL: &str = r#"
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+entity Top is
+  port (
+    Clk : in  STD_LOGIC;
+    Rst : in  std_logic;
+    Q   : out Std_Logic
+  );
+end entity TOP;
+
+architecture Rtl of TOP is
+  signal Reg_Q : STD_LOGIC;
+begin
+  Main : process (clk)
+  begin
+    if RISING_EDGE(CLK) then
+      if rst = '1' then
+        reg_q <= '0';
+      else
+        REG_Q <= not Reg_q;
+      end if;
+    end if;
+  end process MAIN;
+
+  q <= reg_q;
+end architecture rtl;
+"#;
+
+    #[test]
+    fn vhdl_mixed_case_declaration_and_use_resolve() {
+        // `Clk` declared, `clk`/`CLK` used; `architecture ... of TOP` binds to
+        // `entity Top`. Previously every use was an unknown-signal error.
+        let (design, interner, diags) = elaborate_sources(&[("top.vhd", MIXED_CASE_VHDL)], "top");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+
+        let top = &design.modules[design.top];
+        assert_eq!(interner.resolve(top.name), "top");
+        let ports: Vec<_> = top.ports.iter().map(|p| interner.resolve(p.name)).collect();
+        assert_eq!(ports, vec!["clk", "rst", "q"]);
+        // One clocked process sensitive to the (single) clk signal.
+        assert_eq!(top.processes.len(), 1);
+        let (_, proc) = top.processes.iter().next().unwrap();
+        assert!(matches!(proc.kind, ProcessKind::Sequential));
+    }
+
+    #[test]
+    fn vhdl_case_variant_top_name_finds_entity() {
+        // `top = "TOP"` in aion.toml must find the (case-folded) VHDL entity.
+        let (design, interner, diags) = elaborate_sources(&[("top.vhd", MIXED_CASE_VHDL)], "TOP");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(interner.resolve(design.modules[design.top].name), "top");
+    }
+
+    #[test]
+    fn vhdl_undeclared_name_still_reports_unknown_signal() {
+        // Case folding must not make genuinely unknown names resolve.
+        let src = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity Top is
+  port (Clk : in std_logic; Q : out std_logic);
+end entity;
+architecture rtl of top is
+begin
+  Q <= Clock;
+end architecture;
+"#;
+        let (_, _, diags) = elaborate_sources(&[("top.vhd", src)], "top");
+        let errors = error_messages(&diags);
+        assert!(
+            errors.iter().any(|m| m.contains("unknown signal `clock`")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn verilog_instantiates_vhdl_entity_case_insensitively() {
+        let vhdl = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity My_Child is
+  port (A : in std_logic);
+end entity;
+architecture rtl of MY_CHILD is
+begin
+end architecture;
+"#;
+        let verilog = "module tb; reg a; My_Child u0(.a(a)); endmodule\n";
+        let (design, _, diags) = elaborate_sources(&[("child.vhd", vhdl), ("tb.v", verilog)], "tb");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(design.modules.len(), 2);
+    }
+
+    #[test]
+    fn vhdl_instantiates_verilog_module_case_insensitively() {
+        let verilog = "module Sub_Mod(input a); endmodule\n";
+        let vhdl = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity top is
+end entity;
+architecture rtl of top is
+  signal s : std_logic;
+begin
+  u0 : entity work.Sub_Mod port map (a => s);
+end architecture;
+"#;
+        let (design, _, diags) = elaborate_sources(&[("sub.v", verilog), ("top.vhd", vhdl)], "top");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(design.modules.len(), 2);
+    }
+
+    #[test]
+    fn vhdl_instantiation_of_ambiguous_verilog_case_variants_is_unknown() {
+        // `Foo_X` and `FOO_X` are distinct Verilog modules; the case-insensitive
+        // VHDL reference `foo_x` cannot pick one, so it stays unresolved (E200).
+        let verilog = "module Foo_X; endmodule\nmodule FOO_X; endmodule\n";
+        let vhdl = r#"
+entity top is
+end entity;
+architecture rtl of top is
+begin
+  u0 : entity work.foo_x;
+end architecture;
+"#;
+        let (_, _, diags) = elaborate_sources(&[("m.v", verilog), ("top.vhd", vhdl)], "top");
+        let errors = error_messages(&diags);
+        assert!(
+            errors.iter().any(|m| m.contains("unknown module `foo_x`")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn vhdl_instantiation_prefers_exact_folded_verilog_match() {
+        // When a Verilog module is spelled exactly like the folded VHDL name,
+        // that exact match wins over other case variants.
+        let verilog = "module sub; endmodule\nmodule SUB; endmodule\n";
+        let vhdl = r#"
+entity top is
+end entity;
+architecture rtl of top is
+begin
+  u0 : entity work.Sub;
+end architecture;
+"#;
+        let (design, interner, diags) =
+            elaborate_sources(&[("m.v", verilog), ("top.vhd", vhdl)], "top");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let names: Vec<_> = design
+            .modules
+            .iter()
+            .map(|(_, m)| interner.resolve(m.name).to_string())
+            .collect();
+        assert!(names.contains(&"sub".to_string()), "{names:?}");
+        assert!(!names.contains(&"SUB".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn verilog_module_names_stay_case_sensitive() {
+        // Verilog is case-sensitive: `top = "TB"` must not find `module tb`.
+        let (_, _, diags) = elaborate_sources(&[("tb.v", "module tb; endmodule\n")], "TB");
+        let errors = error_messages(&diags);
+        assert!(
+            errors.iter().any(|m| m.contains("`TB` not found")),
+            "errors: {errors:?}"
+        );
+    }
+
+    const EXTENDED_TOP_VHDL: &str = r#"
+entity \Top\ is
+end entity;
+architecture rtl of \Top\ is
+begin
+end architecture;
+"#;
+
+    #[test]
+    fn extended_entity_name_binds_only_exactly() {
+        // `\Top\` is case-sensitive: the exact spelling is found...
+        let (design, interner, diags) =
+            elaborate_sources(&[("top.vhd", EXTENDED_TOP_VHDL)], "\\\\Top\\\\");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(interner.resolve(design.modules[design.top].name), "\\Top\\");
+        // ...but `\TOP\` is a different name.
+        let (_, _, diags) = elaborate_sources(&[("top.vhd", EXTENDED_TOP_VHDL)], "\\\\TOP\\\\");
+        let errors = error_messages(&diags);
+        assert!(
+            errors.iter().any(|m| m.contains("not found")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn vhdl_instantiation_of_extended_case_variant_is_unknown() {
+        let tb = r#"
+entity tb is
+end entity;
+architecture sim of tb is
+begin
+  u0 : entity work.\TOP\;
+end architecture;
+"#;
+        let (_, _, diags) =
+            elaborate_sources(&[("top.vhd", EXTENDED_TOP_VHDL), ("tb.vhd", tb)], "tb");
+        let errors = error_messages(&diags);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("unknown module `\\TOP\\`")),
+            "errors: {errors:?}"
+        );
+    }
+
+    /// Returns `(port name, direction)` of every connection on the single
+    /// instance cell of the top module.
+    fn instance_connections(
+        design: &Design,
+        interner: &Interner,
+    ) -> Vec<(String, aion_ir::PortDirection)> {
+        let top = &design.modules[design.top];
+        let (_, cell) = top
+            .cells
+            .iter()
+            .find(|(_, c)| matches!(c.kind, aion_ir::CellKind::Instance { .. }))
+            .expect("instance cell");
+        cell.connections
+            .iter()
+            .map(|c| (interner.resolve(c.port_name).to_string(), c.direction))
+            .collect()
+    }
+
+    const VHDL_CHILD: &str = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity child is
+  generic (Width : integer := 1);
+  port (Clk : in std_logic; Q : out std_logic);
+end entity;
+architecture rtl of child is
+begin
+end architecture;
+"#;
+
+    #[test]
+    fn verilog_named_ports_bind_to_folded_vhdl_ports() {
+        let tb = "module tb; reg c; wire q; child #(.Width(4)) u0(.Clk(c), .Q(q)); endmodule\n";
+        for file in ["tb.v", "tb.sv"] {
+            let (design, interner, diags) =
+                elaborate_sources(&[("child.vhd", VHDL_CHILD), (file, tb)], "tb");
+            let errors = error_messages(&diags);
+            assert!(errors.is_empty(), "{file}: errors: {errors:?}");
+            assert_eq!(
+                instance_connections(&design, &interner),
+                vec![
+                    ("clk".to_string(), aion_ir::PortDirection::Input),
+                    ("q".to_string(), aion_ir::PortDirection::Output),
+                ],
+                "{file}"
+            );
+            // The `Width` override reached the VHDL generic `width`.
+            let child = design
+                .modules
+                .iter()
+                .map(|(_, m)| m)
+                .find(|m| interner.resolve(m.name) == "child")
+                .expect("child module");
+            assert_eq!(interner.resolve(child.params[0].name), "width");
+            assert_eq!(child.params[0].value, aion_ir::ConstValue::Int(4), "{file}");
+        }
+    }
+
+    #[test]
+    fn verilog_unknown_port_on_vhdl_child_is_reported() {
+        let tb = "module tb; reg c; child u0(.Clock(c)); endmodule\n";
+        let (design, interner, diags) =
+            elaborate_sources(&[("child.vhd", VHDL_CHILD), ("tb.v", tb)], "tb");
+        let errors = error_messages(&diags);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("unknown port `Clock` on module `child`")),
+            "errors: {errors:?}"
+        );
+        assert!(instance_connections(&design, &interner).is_empty());
+    }
+
+    const VERILOG_CHILD: &str =
+        "module Child #(parameter Width = 1) (input Clk, output Q); endmodule\n";
+
+    #[test]
+    fn vhdl_port_map_binds_to_case_sensitive_verilog_ports() {
+        // The VHDL formals `Clk`/`Q` are folded to `clk`/`q`, yet must bind to
+        // the Verilog ports `Clk`/`Q`.
+        let tb = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity tb is
+end entity;
+architecture sim of tb is
+  signal c, q : std_logic;
+begin
+  u0 : entity work.Child generic map (Width => 4) port map (Clk => c, Q => q);
+end architecture;
+"#;
+        let (design, interner, diags) =
+            elaborate_sources(&[("child.v", VERILOG_CHILD), ("tb.vhd", tb)], "tb");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(
+            instance_connections(&design, &interner),
+            vec![
+                ("Clk".to_string(), aion_ir::PortDirection::Input),
+                ("Q".to_string(), aion_ir::PortDirection::Output),
+            ]
+        );
+        let child = design
+            .modules
+            .iter()
+            .map(|(_, m)| m)
+            .find(|m| interner.resolve(m.name) == "Child")
+            .expect("child module");
+        assert_eq!(child.params[0].value, aion_ir::ConstValue::Int(4));
+    }
+
+    #[test]
+    fn vhdl_port_map_to_ambiguous_verilog_ports_is_reported() {
+        let child = "module amb(input Ab, input AB); endmodule\n";
+        let tb = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity tb is
+end entity;
+architecture sim of tb is
+  signal c : std_logic;
+begin
+  u0 : entity work.amb port map (ab => c);
+end architecture;
+"#;
+        let (design, interner, diags) =
+            elaborate_sources(&[("amb.v", child), ("tb.vhd", tb)], "tb");
+        let errors = error_messages(&diags);
+        assert!(
+            errors.iter().any(|m| m.contains("port `ab` is ambiguous")),
+            "errors: {errors:?}"
+        );
+        assert!(instance_connections(&design, &interner).is_empty());
+    }
+
+    #[test]
+    fn verilog_to_verilog_ports_stay_case_sensitive() {
+        // `.clk(x)` must not bind to `Clk`: the formal is kept as written and
+        // its direction falls back as before (no case-insensitive match).
+        let src = "module Child(output Clk); endmodule\n\
+                   module tb; wire x; Child u0(.clk(x)); endmodule\n";
+        let (design, interner, _) = elaborate_sources(&[("tb.v", src)], "tb");
+        assert_eq!(
+            instance_connections(&design, &interner),
+            vec![("clk".to_string(), aion_ir::PortDirection::Input)]
+        );
     }
 }
