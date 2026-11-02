@@ -79,6 +79,20 @@ pub enum Expr {
     Signal(SignalRef),
     /// A literal constant value.
     Literal(LogicVec),
+    /// A reference to a named compile-time constant (a Verilog/SV
+    /// `parameter` or `localparam`, or a VHDL generic), already resolved to
+    /// its value during elaboration.
+    ///
+    /// It evaluates exactly like [`Expr::Literal`] with the same `value`. The
+    /// name is kept so that consumers such as lint rules can tell a named
+    /// constant from a magic number or a constant condition.
+    NamedConst {
+        /// The constant's name.
+        name: Ident,
+        /// The constant's value, at the parameter's declared width (32 bits
+        /// for an untyped integer parameter).
+        value: LogicVec,
+    },
     /// A unary operation.
     Unary {
         /// The operator.
@@ -173,6 +187,45 @@ mod tests {
         } else {
             panic!("expected Literal");
         }
+    }
+
+    /// Asserts that `e` is a `NamedConst` named `name` with value `value`.
+    fn assert_named(e: &Expr, name: Ident, value: &LogicVec) {
+        match e {
+            Expr::NamedConst { name: n, value: v } => {
+                assert_eq!(*n, name);
+                assert_eq!(v, value);
+            }
+            other => panic!("expected NamedConst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_const_bincode_roundtrip() {
+        let value = LogicVec::from_u64(0xA5, 32);
+        let e = Expr::NamedConst {
+            name: Ident::from_raw(3),
+            value: value.clone(),
+        };
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&e, config).unwrap();
+        let (back, _): (Expr, usize) = bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_named(&back, Ident::from_raw(3), &value);
+    }
+
+    #[test]
+    fn named_const_json_roundtrip_is_distinct_from_literal() {
+        let value = LogicVec::from_u64(1, 2);
+        let e = Expr::NamedConst {
+            name: Ident::from_raw(9),
+            value: value.clone(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Expr = serde_json::from_str(&json).unwrap();
+        assert_named(&back, Ident::from_raw(9), &value);
+        // A literal of the same value does not deserialize as a NamedConst.
+        let lit_json = serde_json::to_string(&Expr::Literal(value)).unwrap();
+        assert_ne!(json, lit_json);
     }
 
     #[test]

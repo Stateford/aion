@@ -119,7 +119,7 @@ fn eval_expr_ov(
     expr: &Expr,
 ) -> Result<LogicVec, SimError> {
     match expr {
-        Expr::Literal(lv) => Ok(lv.clone()),
+        Expr::Literal(lv) | Expr::NamedConst { value: lv, .. } => Ok(lv.clone()),
 
         Expr::Signal(signal_ref) => eval_signal_ref_ov(ctx, ov, signal_ref),
 
@@ -1017,6 +1017,27 @@ mod tests {
         let expr = Expr::Literal(LogicVec::from_u64(42, 8));
         let result = eval_expr(&ctx, &expr).unwrap();
         assert_eq!(result.to_u64(), Some(42));
+    }
+
+    #[test]
+    fn eval_named_const_is_its_value() {
+        let (mut signals, map, types) = setup_one_signal(LogicVec::from_u64(1, 2));
+        let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+        let run = Expr::NamedConst {
+            name: aion_common::Ident::from_raw(7),
+            value: LogicVec::from_u64(1, 32),
+        };
+        let result = eval_expr(&ctx, &run).unwrap();
+        assert_eq!((result.width(), result.to_u64()), (32, Some(1)));
+        // `state == RUN` with a 2-bit state and a 32-bit parameter.
+        let eq = Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(Expr::Signal(SignalRef::Signal(SignalId::from_raw(0)))),
+            rhs: Box::new(run),
+            ty: aion_ir::TypeId::from_raw(0),
+            span: Span::DUMMY,
+        };
+        assert_eq!(eval_expr(&ctx, &eq).unwrap().to_u64(), Some(1));
     }
 
     #[test]

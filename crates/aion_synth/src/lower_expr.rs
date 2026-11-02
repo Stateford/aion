@@ -14,7 +14,7 @@ use aion_ir::{BinaryOp, CellKind, Expr, SignalKind, SignalRef, Type, UnaryOp};
 /// and wiring them together with temporary signals.
 pub(crate) fn lower_expr(expr: &Expr, netlist: &mut Netlist) -> SignalRef {
     match expr {
-        Expr::Literal(lv) => {
+        Expr::Literal(lv) | Expr::NamedConst { value: lv, .. } => {
             let width = lv.width();
             let ty = if width == 1 {
                 netlist.types.intern(Type::Bit)
@@ -411,7 +411,7 @@ pub(crate) fn lower_expr(expr: &Expr, netlist: &mut Netlist) -> SignalRef {
 /// Tries to evaluate an expression as a constant integer.
 fn const_eval_expr(expr: &Expr) -> Option<i64> {
     match expr {
-        Expr::Literal(lv) => lv.to_u64().map(|v| v as i64),
+        Expr::Literal(lv) | Expr::NamedConst { value: lv, .. } => lv.to_u64().map(|v| v as i64),
         _ => None,
     }
 }
@@ -419,7 +419,7 @@ fn const_eval_expr(expr: &Expr) -> Option<i64> {
 /// Estimates the bit width of an expression from the netlist context.
 fn expr_width(expr: &Expr, netlist: &Netlist) -> Option<u32> {
     match expr {
-        Expr::Literal(lv) => Some(lv.width()),
+        Expr::Literal(lv) | Expr::NamedConst { value: lv, .. } => Some(lv.width()),
         Expr::Signal(SignalRef::Signal(id)) => Some(netlist.signal_width(*id)),
         Expr::Signal(SignalRef::Slice { high, low, .. }) => Some(high - low + 1),
         Expr::Signal(SignalRef::Const(lv)) => Some(lv.width()),
@@ -531,6 +531,47 @@ mod tests {
             .iter()
             .any(|(_, c)| matches!(&c.kind, CellKind::Const { .. }));
         assert!(has_const);
+    }
+
+    #[test]
+    fn lower_named_const_like_literal() {
+        let interner = Interner::new();
+        let mut netlist = make_netlist(&interner);
+        let value = LogicVec::from_u64(5, 32);
+        let expr = Expr::NamedConst {
+            name: interner.get_or_intern("W"),
+            value: value.clone(),
+        };
+        let out = lower_expr(&expr, &mut netlist);
+        assert!(matches!(out, SignalRef::Signal(_)));
+        let consts: Vec<_> = netlist
+            .cells
+            .iter()
+            .filter_map(|(_, c)| match &c.kind {
+                CellKind::Const { value } => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(consts, vec![value]);
+        assert_eq!(expr_width(&expr, &netlist), Some(32));
+        assert_eq!(const_eval_expr(&expr), Some(5));
+    }
+
+    #[test]
+    fn named_const_slice_bound_is_constant() {
+        // `a[MSB:0]` with a parameter bound has a known width.
+        let interner = Interner::new();
+        let netlist = make_netlist(&interner);
+        let slice = Expr::Slice {
+            expr: Box::new(Expr::Literal(LogicVec::from_u64(0, 8))),
+            high: Box::new(Expr::NamedConst {
+                name: interner.get_or_intern("MSB"),
+                value: LogicVec::from_u64(3, 32),
+            }),
+            low: Box::new(Expr::Literal(LogicVec::from_u64(0, 1))),
+            span: aion_source::Span::DUMMY,
+        };
+        assert_eq!(expr_width(&slice, &netlist), Some(4));
     }
 
     #[test]

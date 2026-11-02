@@ -173,7 +173,7 @@ pub fn lower_verilog_stmt(
         } => {
             let ir_body = lower_verilog_stmt(body, sig_env, source_db, interner, sink);
             // Try to evaluate the delay expression as a compile-time constant
-            let duration_fs = eval_delay_expr_verilog(delay, source_db, interner, sink);
+            let duration_fs = eval_delay_expr_verilog(delay, sig_env, source_db, interner, sink);
             IrStmt::Delay {
                 duration_fs,
                 body: Box::new(ir_body),
@@ -560,7 +560,7 @@ pub fn lower_sv_stmt(
             delay, body, span, ..
         } => {
             let ir_body = lower_sv_stmt(body, sig_env, source_db, interner, sink);
-            let duration_fs = eval_delay_expr_sv(delay, source_db, interner, sink);
+            let duration_fs = eval_delay_expr_sv(delay, sig_env, source_db, interner, sink);
             IrStmt::Delay {
                 duration_fs,
                 body: Box::new(ir_body),
@@ -866,17 +866,19 @@ fn lower_vhdl_stmt_list(
 
 /// Evaluates a Verilog delay expression to femtoseconds.
 ///
-/// Tries to const-evaluate the expression; if it resolves to an integer,
+/// Tries to const-evaluate the expression, with the parameters in
+/// `sig_env` in scope (`#(PERIOD/2)`); if it resolves to an integer,
 /// multiplies by `DEFAULT_TIMESCALE_FS` (1 ns). Falls back to 0 fs if
 /// the expression cannot be evaluated.
 fn eval_delay_expr_verilog(
     expr: &aion_verilog_parser::ast::Expr,
+    sig_env: &SignalEnv,
     source_db: &SourceDb,
     interner: &Interner,
     sink: &DiagnosticSink,
 ) -> u64 {
-    let env = crate::const_eval::ConstEnv::default();
-    if let Some(val) = const_eval::eval_verilog_expr(expr, source_db, interner, &env, sink) {
+    let env = sig_env.consts();
+    if let Some(val) = const_eval::eval_verilog_expr(expr, source_db, interner, env, sink) {
         if let Some(v) = const_eval::const_to_i64(&val) {
             return (v.unsigned_abs()) * DEFAULT_TIMESCALE_FS;
         }
@@ -889,6 +891,7 @@ fn eval_delay_expr_verilog(
 /// Same approach as [`eval_delay_expr_verilog`] but uses the SV const evaluator.
 fn eval_delay_expr_sv(
     expr: &aion_sv_parser::ast::Expr,
+    sig_env: &SignalEnv,
     source_db: &SourceDb,
     interner: &Interner,
     sink: &DiagnosticSink,
@@ -901,8 +904,8 @@ fn eval_delay_expr_sv(
     if let aion_sv_parser::ast::Expr::TimeLiteral { span } = inner {
         return time_literal_delay_fs(*span, source_db, sink);
     }
-    let env = crate::const_eval::ConstEnv::default();
-    if let Some(val) = const_eval::eval_sv_expr(expr, source_db, interner, &env, sink) {
+    let env = sig_env.consts();
+    if let Some(val) = const_eval::eval_sv_expr(expr, source_db, interner, env, sink) {
         if let Some(v) = const_eval::const_to_i64(&val) {
             return (v.unsigned_abs()) * DEFAULT_TIMESCALE_FS;
         }

@@ -136,6 +136,10 @@ mod tests {
             parsed.sv_files.push(aion_sv_parser::parse_file(
                 file_id, &source_db, &interner, &sink,
             ));
+        } else if file_name.ends_with(".vhd") {
+            parsed.vhdl_files.push(aion_vhdl_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
         } else {
             parsed.verilog_files.push(aion_verilog_parser::parse_file(
                 file_id, &source_db, &interner, &sink,
@@ -193,6 +197,10 @@ mod tests {
         };
         if file_name.ends_with(".sv") {
             parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else if file_name.ends_with(".vhd") {
+            parsed.vhdl_files.push(aion_vhdl_parser::parse_file(
                 file_id, &source_db, &interner, &sink,
             ));
         } else {
@@ -383,6 +391,10 @@ mod tests {
         };
         if file_name.ends_with(".sv") {
             parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else if file_name.ends_with(".vhd") {
+            parsed.vhdl_files.push(aion_vhdl_parser::parse_file(
                 file_id, &source_db, &interner, &sink,
             ));
         } else {
@@ -1017,6 +1029,10 @@ mod tests {
             parsed.sv_files.push(aion_sv_parser::parse_file(
                 file_id, &source_db, &interner, &sink,
             ));
+        } else if file_name.ends_with(".vhd") {
+            parsed.vhdl_files.push(aion_vhdl_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
         } else {
             parsed.verilog_files.push(aion_verilog_parser::parse_file(
                 file_id, &source_db, &interner, &sink,
@@ -1274,5 +1290,323 @@ mod tests {
             })
             .collect();
         assert_eq!(values, vec![5, 0]);
+    }
+
+    // ---- Parameter / generic names used in expressions ----
+
+    /// Returns `(width, value)` of an IR literal or named constant, panicking
+    /// on anything else.
+    fn lit(e: &aion_ir::Expr) -> (u32, u64) {
+        match e {
+            aion_ir::Expr::Literal(lv) | aion_ir::Expr::NamedConst { value: lv, .. } => {
+                (lv.width(), lv.to_u64().expect("2-state literal"))
+            }
+            other => panic!("expected literal, got {other:?}"),
+        }
+    }
+
+    /// Returns the value of the module's only continuous assignment.
+    fn only_assign_value(m: &aion_ir::Module) -> &aion_ir::Expr {
+        assert_eq!(m.assignments.len(), 1, "{:?}", m.assignments);
+        &m.assignments[0].value
+    }
+
+    /// Returns the name of the signal an IR expression reads.
+    fn signal_name<'a>(m: &aion_ir::Module, interner: &'a Interner, e: &aion_ir::Expr) -> &'a str {
+        match e {
+            aion_ir::Expr::Signal(aion_ir::SignalRef::Signal(sid)) => {
+                interner.resolve(m.signals.get(*sid).name)
+            }
+            other => panic!("expected signal, got {other:?}"),
+        }
+    }
+
+    /// Finds the first `Case` statement in `stmt`.
+    fn find_case(stmt: &aion_ir::Statement) -> Option<&aion_ir::Statement> {
+        match stmt {
+            aion_ir::Statement::Case { .. } => Some(stmt),
+            aion_ir::Statement::Block { stmts, .. } => stmts.iter().find_map(find_case),
+            aion_ir::Statement::If {
+                then_body,
+                else_body,
+                ..
+            } => find_case(then_body).or_else(|| else_body.as_deref().and_then(find_case)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn body_localparam_in_comparison_lowers_to_literal() {
+        let src = "module m(input [1:0] s, output y); localparam IDLE = 0, RUN = 1; \
+                   assign y = (s == RUN); endmodule";
+        for file in ["m.v", "m.sv"] {
+            let (design, interner, diags) = elaborate_src(file, src, "m");
+            assert!(errors_of(&diags).is_empty(), "{file}: {diags:?}");
+            let top = design.top_module();
+            let aion_ir::Expr::Binary { op, lhs, rhs, .. } = only_assign_value(top) else {
+                panic!("{file}: expected binary");
+            };
+            assert_eq!(*op, aion_ir::BinaryOp::Eq, "{file}");
+            assert_eq!(signal_name(top, &interner, lhs), "s", "{file}");
+            // The reference keeps its name, so lint can tell it from a
+            // magic number.
+            assert!(
+                matches!(rhs.as_ref(), aion_ir::Expr::NamedConst { name, .. }
+                    if interner.resolve(*name) == "RUN"),
+                "{file}: {rhs:?}"
+            );
+            // An untyped parameter with an unsized integer value is 32 bits.
+            assert_eq!(lit(rhs), (32, 1), "{file}");
+        }
+    }
+
+    #[test]
+    fn header_parameter_in_expression_lowers_to_literal() {
+        let src = "module m #(parameter W = 8) (output [7:0] y); assign y = W; endmodule";
+        for file in ["m.v", "m.sv"] {
+            let (design, _, diags) = elaborate_src(file, src, "m");
+            assert!(errors_of(&diags).is_empty(), "{file}: {diags:?}");
+            assert_eq!(
+                lit(only_assign_value(design.top_module())),
+                (32, 8),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn localparam_fsm_case_labels_and_next_state_lower_to_literals() {
+        for (file, decl, always) in [
+            ("m.v", "input clk", "always @(posedge clk)"),
+            ("m.sv", "input logic clk", "always_ff @(posedge clk)"),
+        ] {
+            let src = format!(
+                "module m({decl}); localparam [1:0] IDLE = 2'd0, RUN = 2'd1, DONE = 2'd2; \
+                 reg [1:0] state; {always} case (state) IDLE: state <= RUN; \
+                 RUN: state <= DONE; default: state <= IDLE; endcase endmodule"
+            );
+            let (design, interner, diags) = elaborate_src(file, &src, "m");
+            assert!(errors_of(&diags).is_empty(), "{file}: {diags:?}");
+            let top = design.top_module();
+            let (_, proc) = top.processes.iter().next().expect("one process");
+            let Some(aion_ir::Statement::Case {
+                subject,
+                arms,
+                default,
+                ..
+            }) = find_case(&proc.body)
+            else {
+                panic!("{file}: no case in {:?}", proc.body);
+            };
+            assert_eq!(signal_name(top, &interner, subject), "state", "{file}");
+            // Ranged parameters use their declared 2-bit width.
+            let labels: Vec<_> = arms.iter().map(|a| lit(&a.patterns[0])).collect();
+            assert_eq!(labels, vec![(2, 0), (2, 1)], "{file}");
+            let next: Vec<_> = arms
+                .iter()
+                .map(|a| match &a.body {
+                    aion_ir::Statement::Assign { value, .. } => lit(value),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(next, vec![(2, 1), (2, 2)], "{file}");
+            assert!(default.is_some(), "{file}");
+        }
+    }
+
+    #[test]
+    fn parameter_override_at_instantiation_is_used_in_expressions() {
+        // A literal override and an override naming the parent's parameter.
+        let src = "module child #(parameter W = 8) (output [7:0] y); assign y = W + 1; endmodule
+            module top #(parameter P = 6) (output [7:0] a, output [7:0] b);
+              child #(.W(4)) u1(.y(a)); child #(.W(P)) u2(.y(b)); endmodule";
+        for file in ["top.v", "top.sv"] {
+            let (design, _, diags) = elaborate_src(file, src, "top");
+            assert!(errors_of(&diags).is_empty(), "{file}: {diags:?}");
+            let mut sums: Vec<u64> = design
+                .modules
+                .iter()
+                .filter(|(_, m)| !m.assignments.is_empty())
+                .map(|(_, m)| match only_assign_value(m) {
+                    aion_ir::Expr::Binary { lhs, .. } => lit(lhs).1,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            sums.sort_unstable();
+            assert_eq!(sums, vec![4, 6], "{file}");
+        }
+    }
+
+    #[test]
+    fn parameter_in_range_and_expression() {
+        let src =
+            "module m #(parameter W = 4) (input [W-1:0] a, output [W-1:0] y, output [W-1:0] z);
+              assign y = a + W; assign z = a[W-1:0]; endmodule";
+        for file in ["m.v", "m.sv"] {
+            let (design, interner, diags) = elaborate_src(file, src, "m");
+            assert!(errors_of(&diags).is_empty(), "{file}: {diags:?}");
+            let top = design.top_module();
+            assert_eq!(signal_width(&design, top, &interner, "a"), 4, "{file}");
+            let aion_ir::Expr::Binary { rhs, .. } = &top.assignments[0].value else {
+                panic!("{file}");
+            };
+            assert_eq!(lit(rhs), (32, 4), "{file}");
+            let aion_ir::Expr::Slice { high, low, .. } = &top.assignments[1].value else {
+                panic!("{file}: {:?}", top.assignments[1].value);
+            };
+            let aion_ir::Expr::Binary { lhs, .. } = high.as_ref() else {
+                panic!("{file}: {high:?}");
+            };
+            assert_eq!(lit(lhs).1, 4, "{file}");
+            assert_eq!(lit(low).1, 0, "{file}");
+        }
+    }
+
+    #[test]
+    fn parameter_index_on_assignment_target_selects_that_bit() {
+        // One-hot style `state[RUN] <= 1` must write bit RUN, not the whole
+        // vector, and `q[W-1:0]` must write the constant range.
+        let src = "module m(input clk); localparam RUN = 2, W = 3; reg [3:0] state, q;
+              always @(posedge clk) begin state[RUN] <= 1'b1; q[W-1:0] <= 3'b101; end endmodule";
+        let (design, _, diags) = elaborate_src("m.v", src, "m");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let (_, proc) = design.top_module().processes.iter().next().unwrap();
+        let mut targets = Vec::new();
+        fn collect(s: &aion_ir::Statement, out: &mut Vec<aion_ir::SignalRef>) {
+            match s {
+                aion_ir::Statement::Assign { target, .. } => out.push(target.clone()),
+                aion_ir::Statement::Block { stmts, .. } => {
+                    stmts.iter().for_each(|s| collect(s, out))
+                }
+                _ => {}
+            }
+        }
+        collect(&proc.body, &mut targets);
+        let bounds: Vec<_> = targets
+            .iter()
+            .map(|t| match t {
+                aion_ir::SignalRef::Slice { high, low, .. } => (*high, *low),
+                other => panic!("expected slice, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(bounds, vec![(2, 2), (2, 0)]);
+    }
+
+    #[test]
+    fn parameter_widths_follow_declared_type_or_value() {
+        let cases = [
+            ("m.v", "localparam [3:0] P = 1;", (4, 1)),
+            ("m.v", "localparam P = 2'b10;", (2, 2)),
+            ("m.v", "localparam P = 3'd1 + 2'd1;", (3, 2)),
+            ("m.v", "localparam P = -1;", (32, 0xFFFF_FFFF)),
+            ("m.sv", "localparam logic [5:0] P = 1;", (6, 1)),
+            ("m.sv", "localparam int P = 7;", (32, 7)),
+            ("m.sv", "localparam bit P = 1;", (1, 1)),
+            ("m.sv", "localparam byte P = 3;", (8, 3)),
+            ("m.sv", "localparam P = 4'hA;", (4, 10)),
+        ];
+        for (file, decl, expected) in cases {
+            let src = format!("module m(output [63:0] y); {decl} assign y = P; endmodule");
+            let (design, _, diags) = elaborate_src(file, &src, "m");
+            assert!(errors_of(&diags).is_empty(), "{decl}: {diags:?}");
+            assert_eq!(
+                lit(only_assign_value(design.top_module())),
+                expected,
+                "{file}: {decl}"
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_in_replication_and_delay() {
+        let src = "module m(output [3:0] y); localparam W = 4, D = 3; reg r;
+              assign y = {W{1'b1}}; initial begin #D r = 1; #(D*2) r = 0; end endmodule";
+        for file in ["m.v", "m.sv"] {
+            let (design, _, diags) = elaborate_src(file, src, "m");
+            assert!(errors_of(&diags).is_empty(), "{file}: {diags:?}");
+            let top = design.top_module();
+            let aion_ir::Expr::Repeat { count, .. } = only_assign_value(top) else {
+                panic!("{file}");
+            };
+            assert_eq!(*count, 4, "{file}");
+            let (_, proc) = top.processes.iter().next().unwrap();
+            let mut fs = Vec::new();
+            delays_fs(&proc.body, &mut fs);
+            assert_eq!(fs, vec![3_000_000, 6_000_000], "{file}");
+        }
+    }
+
+    #[test]
+    fn signal_shadows_parameter_of_same_name() {
+        let src = "module m(input A, output y); localparam A = 5; assign y = A; endmodule";
+        for file in ["m.v", "m.sv"] {
+            let (design, interner, diags) = elaborate_src(file, src, "m");
+            assert!(errors_of(&diags).is_empty(), "{file}: {diags:?}");
+            let top = design.top_module();
+            assert_eq!(signal_name(top, &interner, only_assign_value(top)), "A");
+        }
+    }
+
+    #[test]
+    fn unknown_name_in_expression_still_reports_e204() {
+        let src = "module m(input [1:0] s, output y); localparam RUN = 1; \
+                   assign y = (s == NOPE) | (s == RUN); endmodule";
+        for file in ["m.v", "m.sv"] {
+            let (_, _, diags) = elaborate_src(file, src, "m");
+            assert_eq!(spans_with(&diags, errors::E204), vec!["NOPE"], "{file}");
+        }
+    }
+
+    #[test]
+    fn vhdl_generic_in_expression_lowers_to_literal() {
+        let src = "library ieee; use ieee.std_logic_1164.all;
+            entity m is generic (W : integer := 3; V : std_logic_vector(3 downto 0));
+              port (s : in integer; y : out std_logic); end entity;
+            architecture rtl of m is begin
+              process (s) begin if s = W then y <= '1'; elsif s = V then y <= '0'; end if; end process;
+            end architecture;";
+        let (design, _, diags) = elaborate_src("m.vhd", src, "m");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let (_, proc) = design.top_module().processes.iter().next().unwrap();
+        let aion_ir::Statement::If {
+            condition,
+            else_body,
+            ..
+        } = &proc.body
+        else {
+            panic!("{:?}", proc.body);
+        };
+        let aion_ir::Expr::Binary { rhs, .. } = condition else {
+            panic!("{condition:?}");
+        };
+        assert_eq!(lit(rhs), (32, 3));
+        let Some(aion_ir::Statement::If {
+            condition: aion_ir::Expr::Binary { rhs, .. },
+            ..
+        }) = else_body.as_deref()
+        else {
+            panic!("{else_body:?}");
+        };
+        // A vector generic lowers with its declared width. (Its default would
+        // need string-literal const evaluation, which is not supported yet.)
+        assert_eq!(lit(rhs), (4, 0));
+    }
+
+    #[test]
+    fn vhdl_generic_map_can_name_parent_generic() {
+        let src = "library ieee; use ieee.std_logic_1164.all;
+            entity child is generic (N : integer := 1); port (y : out integer); end entity;
+            architecture rtl of child is begin
+              process (y) begin if y = N then end if; end process; end architecture;
+            entity m is generic (P : integer := 7); port (y : out integer); end entity;
+            architecture rtl of m is begin
+              u : entity work.child generic map (N => P) port map (y => y); end architecture;";
+        let (design, interner, diags) = elaborate_src("m.vhd", src, "m");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let child = module_named(&design, &interner, "child");
+        assert_eq!(
+            params_of(child, &interner),
+            vec![("N".to_string(), ConstValue::Int(7))]
+        );
     }
 }

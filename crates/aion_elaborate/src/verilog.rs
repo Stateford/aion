@@ -23,7 +23,7 @@ use aion_verilog_parser::ast::{self as v_ast, Direction};
 use crate::const_eval::{self, ConstEnv};
 use crate::context::ElaborationContext;
 use crate::errors;
-use crate::expr::{lower_to_signal_ref, lower_verilog_expr, SignalEnv};
+use crate::expr::{self, lower_to_signal_ref, lower_verilog_expr, SignalEnv};
 use crate::registry::ModuleEntry;
 use crate::stmt::{lower_verilog_looping_always, lower_verilog_stmt};
 use crate::types;
@@ -40,11 +40,18 @@ pub fn elaborate_verilog_module(
     // 1. Build const env from parameter declarations and overrides
     let mut const_env = ConstEnv::new();
     let mut ir_params = Vec::new();
-    apply_verilog_params(decl, param_overrides, &mut const_env, &mut ir_params, ctx);
+    let mut sig_env = SignalEnv::new();
+    apply_verilog_params(
+        decl,
+        param_overrides,
+        &mut const_env,
+        &mut ir_params,
+        &mut sig_env,
+        ctx,
+    );
 
     // 2. Allocate module in the design
     let mut signals: Arena<SignalId, Signal> = Arena::new();
-    let mut sig_env = SignalEnv::new();
     let mut ports = Vec::new();
 
     // 3. Elaborate ports
@@ -109,11 +116,16 @@ pub fn elaborate_verilog_module(
 }
 
 /// Applies parameter declarations and overrides to build the const env.
+///
+/// Each parameter is also bound as a constant in `sig_env`, with its
+/// declared range width or, when untyped, the width of its final value, so
+/// that expressions can use its name.
 fn apply_verilog_params(
     decl: &v_ast::ModuleDecl,
     overrides: &[(Ident, ConstValue)],
     const_env: &mut ConstEnv,
     ir_params: &mut Vec<Parameter>,
+    sig_env: &mut SignalEnv,
     ctx: &mut ElaborationContext<'_>,
 ) {
     let override_map: HashMap<_, _> = overrides.iter().cloned().collect();
@@ -133,14 +145,22 @@ fn apply_verilog_params(
 
     for (param, overridable) in header.chain(body) {
         let name = param.name;
+        let mut value_width = None;
         let value = if let Some(ov) = override_map.get(&name).filter(|_| overridable) {
             ov.clone()
         } else if let Some(ref value) = param.value {
+            value_width = Some(expr::verilog_value_width(value, sig_env, ctx.source_db));
             const_eval::eval_verilog_expr(value, ctx.source_db, ctx.interner, const_env, ctx.sink)
                 .unwrap_or(ConstValue::Int(0))
         } else {
             ConstValue::Int(0)
         };
+        let declared = param.range.as_ref().and_then(|r| {
+            const_eval::eval_verilog_range(r, ctx.source_db, ctx.interner, const_env, ctx.sink)
+                .map(|(msb, lsb)| (msb - lsb).unsigned_abs() as u32 + 1)
+        });
+        let width = expr::param_value_width(declared, &value, value_width);
+        sig_env.insert_const(name, value.clone(), width);
         const_env.insert(name, value.clone());
         ir_params.push(Parameter {
             name,
@@ -469,7 +489,7 @@ fn elaborate_verilog_instantiation(
                 actual,
                 ctx.source_db,
                 ctx.interner,
-                &Default::default(),
+                sig_env.consts(),
                 ctx.sink,
             )?;
             Some((formal, val))

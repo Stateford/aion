@@ -34,16 +34,17 @@ pub fn elaborate_vhdl_entity(
 ) -> ModuleId {
     let mut const_env = ConstEnv::new();
     let mut ir_params = Vec::new();
+    let mut sig_env = SignalEnv::new();
     apply_vhdl_generics(
         entity,
         generic_overrides,
         &mut const_env,
         &mut ir_params,
+        &mut sig_env,
         ctx,
     );
 
     let mut signals: Arena<SignalId, Signal> = Arena::new();
-    let mut sig_env = SignalEnv::new();
     let mut ports = Vec::new();
 
     elaborate_vhdl_ports(
@@ -111,17 +112,33 @@ pub fn elaborate_vhdl_entity(
 }
 
 /// Applies entity generics and overrides.
+///
+/// Each generic is also bound as a constant in `sig_env`, so that
+/// expressions can use its name. It lowers with its declared type's width
+/// (`std_logic_vector(7 downto 0)` is 8 bits, `boolean` 1); `integer`,
+/// `natural` and `positive` generics, and types without a known width, are
+/// 32 bits.
 fn apply_vhdl_generics(
     entity: &vhdl_ast::EntityDecl,
     overrides: &[(Ident, ConstValue)],
     const_env: &mut ConstEnv,
     ir_params: &mut Vec<Parameter>,
+    sig_env: &mut SignalEnv,
     ctx: &mut ElaborationContext<'_>,
 ) {
     let override_map: HashMap<_, _> = overrides.iter().cloned().collect();
 
     if let Some(ref generics) = entity.generics {
         for gen in &generics.decls {
+            let ty = types::resolve_vhdl_type(
+                &gen.ty,
+                &mut ctx.design.types,
+                const_env,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
+            let width = ctx.design.types.bit_width(ty).unwrap_or(32);
             for &name in &gen.names {
                 let value = if let Some(ov) = override_map.get(&name) {
                     ov.clone()
@@ -137,6 +154,7 @@ fn apply_vhdl_generics(
                 } else {
                     ConstValue::Int(0)
                 };
+                sig_env.insert_const(name, value.clone(), width);
                 const_env.insert(name, value.clone());
                 ir_params.push(Parameter {
                     name,
@@ -716,7 +734,7 @@ fn elaborate_vhdl_component(
                         &elem.actual,
                         ctx.source_db,
                         ctx.interner,
-                        &Default::default(),
+                        sig_env.consts(),
                         ctx.sink,
                     )?;
                     Some((formal_name, val))
