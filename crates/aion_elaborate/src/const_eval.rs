@@ -1013,6 +1013,60 @@ mod tests {
         assert!(sink.has_errors());
     }
 
+    // ---- operator precedence through the real parsers (issue #31) ----
+
+    /// Parses `text` with the Verilog parser and evaluates it as a constant.
+    fn eval_verilog_text(text: &str) -> Option<i64> {
+        let mut db = SourceDb::new();
+        let file = db.add_source("t.v", text.to_string());
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let tokens = aion_verilog_parser::lexer::lex(text, file, &sink);
+        let mut parser =
+            aion_verilog_parser::parser::VerilogParser::new(tokens, text, file, &interner, &sink);
+        let expr = parser.parse_expr();
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        let val = eval_verilog_expr(&expr, &db, &interner, &ConstEnv::new(), &sink)?;
+        const_to_i64(&val)
+    }
+
+    /// Parses `text` with the SystemVerilog parser and evaluates it as a constant.
+    fn eval_sv_text(text: &str) -> Option<i64> {
+        let mut db = SourceDb::new();
+        let file = db.add_source("t.sv", text.to_string());
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let tokens = aion_sv_parser::lexer::lex(text, file, &sink);
+        let mut parser =
+            aion_sv_parser::parser::SvParser::new(tokens, text, file, &interner, &sink);
+        let expr = parser.parse_expr();
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        let val = eval_sv_expr(&expr, &db, &interner, &ConstEnv::new(), &sink)?;
+        const_to_i64(&val)
+    }
+
+    #[test]
+    fn power_is_left_associative_in_parameters() {
+        // IEEE 1364-2005 §5.1.2 / IEEE 1800-2017 Table 11-2: `**` is
+        // left-associative, so 2 ** 3 ** 2 == (2 ** 3) ** 2 == 64 (not 512).
+        assert_eq!(eval_verilog_text("2 ** 3 ** 2"), Some(64));
+        assert_eq!(eval_sv_text("2 ** 3 ** 2"), Some(64));
+        // Parentheses still force right grouping.
+        assert_eq!(eval_verilog_text("2 ** (3 ** 2)"), Some(512));
+        assert_eq!(eval_sv_text("2 ** (3 ** 2)"), Some(512));
+    }
+
+    #[test]
+    fn unary_minus_binds_tighter_than_power_in_parameters() {
+        // Unary operators bind tighter than `**`: -2 ** 2 == (-2) ** 2 == 4.
+        assert_eq!(eval_verilog_text("-2 ** 2"), Some(4));
+        assert_eq!(eval_sv_text("-2 ** 2"), Some(4));
+        assert_eq!(eval_verilog_text("-(2 ** 2)"), Some(-4));
+        // `**` binds tighter than `*`: 3 * 2 ** 2 == 12.
+        assert_eq!(eval_verilog_text("3 * 2 ** 2"), Some(12));
+        assert_eq!(eval_sv_text("2 ** 2 * 3"), Some(12));
+    }
+
     #[test]
     fn non_constant_vhdl_expr_returns_none() {
         let (db, _) = make_source("");
