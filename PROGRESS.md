@@ -15,6 +15,28 @@
   - A prefix that is unknown, not an array, has a non-constant range, has a bad dimension or is compound gets the new **E212** error. The range is never guessed.
 - **Tests:** 16 parser tests (`types.rs`); 13 `ranges.rs` tests (index order for `'range`/`'reverse_range` of for-loops and for-generates, types, dimensions, every E212 path); 5 VHDL elaboration tests; 1 errors test.
 - **Known gaps:** the VHDL elaborator still does not unroll `for` loops or expand `for … generate` bodies. Ranges are resolved and checked, but they do not yet drive iteration. Range attributes inside range constraints (`integer range v'range`) and slices (`x(v'range)`) are out of scope.
+## 2026-11-02 — VHDL Parser: Case-Fold Basic Identifiers at Intern Time (Fixes #15)
+
+- **Folding:** a new `VhdlParser::intern_current_ident` backs `expect_ident`, `expect_ident_or_keyword` and `eat_ident`. These are the only places that intern source identifier text, and they cover names, labels, end names, selected names, attribute names and keywords used as names. Basic identifiers and keywords are interned as ASCII lowercase (LRM 15.4.2). Extended identifiers (`\Foo\`) are kept verbatim, backslashes included. A port declared `Clk` and used as `clk`/`CLK` now resolves, and `architecture a of TOP` binds to `entity Top`.
+- **Module binding:** VHDL entity names are now stored lowercase, so `ModuleRegistry` gained two methods:
+  - `canonical_name`, used for the `aion.toml` top and for Verilog/SV instantiations. An exact match wins; otherwise the name is matched case-insensitively against VHDL entities only, so Verilog stays case-sensitive.
+  - `canonical_vhdl_name`, used for VHDL instantiations. It also binds to a Verilog/SV module that differs only in case, as long as exactly one such module exists.
+  - Extended/escaped names (`\Top\`) are never folded or indexed for case-insensitive lookup; they only match exactly.
+- **Port/generic binding (new `binding.rs`):** when either side of an instantiation is VHDL, named port and parameter/generic associations are matched exactly first, then against the child's basic names ignoring case, and rewritten to the child's canonical `Ident`. Examples: `.Clk(x)` on a VHDL entity binds to `clk`, and `port map (Clk => x)` on a Verilog module binds to `Clk`.
+  - An unknown formal reports **E208**; a formal that matches several ports differing only in case reports **E201**. Neither creates a connection.
+  - Verilog/SV-to-Verilog/SV binding is unchanged and case-sensitive.
+- **Tests:**
+  - 7 parser tests: basic and keyword folding, attribute names, use clauses, extended identifiers staying case-sensitive, `eat_ident`, and the missing-identifier error;
+  - 8 elaborator end-to-end tests: mixed-case declare/use, `of TOP`, `top = "TOP"`, unknown names still reported, Verilog↔VHDL instantiation, ambiguous and exact-preferred cases, Verilog top stays case-sensitive;
+  - 3 registry tests, including that `\TOP\` does not bind to `\Top\`;
+  - 5 `binding.rs` unit tests;
+  - 7 more elaborator tests: extended entity names bind only exactly, both port directions with generics/params, unknown and ambiguous ports, and Verilog-to-Verilog staying case-sensitive;
+  - `aion_conformance/tests/mixed_language_binding.rs`: 2 simulator tests where values flow through mixed-case ports in both directions.
+  - Existing tests that looked up VHDL objects by mixed-case names (`K`, `p.K`) now use the folded names.
+- **Known gaps:**
+  - IR, VCD and simulator names of VHDL objects are now lowercase, and `SimKernel::find_signal` is case-sensitive.
+  - Unknown or ambiguous parameter/generic override names are still ignored silently, as before.
+  - Verilog-to-Verilog unknown ports are still not diagnosed.
 
 ## 2026-11-01 — Sim: Unified Process Execution (Fixes #4)
 

@@ -820,9 +820,12 @@ fn elaborate_vhdl_component(
             }
         }
     };
+    // VHDL names are case-insensitive: bind to a Verilog/SV module that
+    // differs only in case when the folded name has no exact match.
+    let module_name = ctx.registry.canonical_vhdl_name(module_name, ctx.interner);
 
     // Build generic overrides
-    let generic_overrides: Vec<(Ident, ConstValue)> = ci
+    let mut generic_overrides: Vec<(Ident, ConstValue)> = ci
         .generic_map
         .as_ref()
         .map(|gm| {
@@ -842,6 +845,13 @@ fn elaborate_vhdl_component(
                 .collect()
         })
         .unwrap_or_default();
+    // The folded generic names must bind to a case-sensitive Verilog/SV child.
+    crate::binding::canonicalize_overrides(
+        &mut generic_overrides,
+        ctx.registry.lookup(module_name).as_ref(),
+        true,
+        ctx.interner,
+    );
 
     if let Some(mid) = ctx.check_cache(module_name, &generic_overrides) {
         let connections = build_vhdl_port_connections(ci, sig_env, mid, ctx);
@@ -941,7 +951,15 @@ fn build_vhdl_port_connections(
             pm.elements
                 .iter()
                 .filter_map(|elem| {
-                    let formal_name = extract_vhdl_formal(&elem.formal)?;
+                    // Folded VHDL formals bind case-insensitively to a
+                    // Verilog/SV child's ports (exact match first).
+                    let formal_name = crate::binding::bind_port(
+                        target_module,
+                        extract_vhdl_formal(&elem.formal)?,
+                        true,
+                        elem.span,
+                        ctx,
+                    )?;
                     let signal =
                         lower_vhdl_to_signal_ref(&elem.actual, sig_env, ctx.interner, ctx.sink);
                     let direction = lookup_port_direction(target_module, formal_name, ctx);
