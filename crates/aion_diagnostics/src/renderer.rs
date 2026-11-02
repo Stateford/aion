@@ -96,20 +96,31 @@ impl DiagnosticRenderer for TerminalRenderer {
 
             // Source line with underline
             let file = source_db.get_file(diag.primary_span.file);
-            let (line, col) = file.line_col(diag.primary_span.start);
+            let (line, _) = file.line_col(diag.primary_span.start);
             let line_num = format!("{line}");
             let padding = " ".repeat(line_num.len());
 
             // Find the line content
-            let line_content = get_source_line(&file.content, diag.primary_span.start);
+            let content = file.content.as_str();
+            let line_content = get_source_line(content, diag.primary_span.start);
 
             out.push_str(&format!("{blue_on}{padding} |{blue_off}\n"));
             out.push_str(&format!("{blue_on}{line_num} |{blue_off} {line_content}\n"));
 
-            // Underline
-            let span_len = (diag.primary_span.end - diag.primary_span.start).max(1) as usize;
+            // Underline. Columns are measured in characters (not bytes) so that
+            // carets line up under multi-byte UTF-8 text; offsets that fall
+            // inside a character are clamped to its start.
+            let start = floor_char_boundary(content, diag.primary_span.start as usize);
+            let line_end = content[start..]
+                .find('\n')
+                .map_or(content.len(), |pos| start + pos);
+            let end =
+                floor_char_boundary(content, diag.primary_span.end as usize).clamp(start, line_end);
+            let line_start = content[..start].rfind('\n').map_or(0, |pos| pos + 1);
+            let char_col = content[line_start..start].chars().count();
+            let span_len = content[start..end].chars().count().max(1);
             let carets = "^".repeat(span_len);
-            let col_padding = " ".repeat((col as usize).saturating_sub(1));
+            let col_padding = " ".repeat(char_col);
 
             // Find primary label message
             let primary_msg = diag
@@ -138,9 +149,26 @@ impl DiagnosticRenderer for TerminalRenderer {
     }
 }
 
+/// Returns the largest char boundary of `s` that is `<= index`, clamping
+/// `index` to `s.len()` first.
+///
+/// Equivalent to `str::floor_char_boundary`, implemented here so that the
+/// renderer never slices a string in the middle of a UTF-8 sequence, whatever
+/// byte offsets a diagnostic carries.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Extracts the line of source code containing the given byte offset.
+///
+/// Never panics: an offset past the end of `content` or inside a multi-byte
+/// character is clamped to the nearest preceding character boundary.
 fn get_source_line(content: &str, byte_offset: u32) -> &str {
-    let offset = byte_offset as usize;
+    let offset = floor_char_boundary(content, byte_offset as usize);
     let start = content[..offset].rfind('\n').map_or(0, |pos| pos + 1);
     let end = content[offset..]
         .find('\n')
@@ -263,5 +291,68 @@ mod tests {
             !output.contains("\x1b["),
             "color: false must not emit ANSI escape codes"
         );
+    }
+
+    #[test]
+    fn floor_char_boundary_clamps() {
+        let s = "a\u{2018}b"; // 'a', 3-byte quote, 'b'
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 1);
+        assert_eq!(floor_char_boundary(s, 2), 1);
+        assert_eq!(floor_char_boundary(s, 3), 1);
+        assert_eq!(floor_char_boundary(s, 4), 4);
+        assert_eq!(floor_char_boundary(s, 99), s.len());
+        assert_eq!(floor_char_boundary("", 3), 0);
+    }
+
+    #[test]
+    fn get_source_line_mid_char_and_out_of_range() {
+        let content = "first\nx <= \u{2018}1\u{2019};\nlast";
+        // Offset 12 is inside the 3-byte U+2018 (bytes 11..14).
+        assert_eq!(get_source_line(content, 12), "x <= \u{2018}1\u{2019};");
+        assert_eq!(get_source_line(content, 13), "x <= \u{2018}1\u{2019};");
+        // Past the end clamps to the last line.
+        assert_eq!(get_source_line(content, 1000), "last");
+    }
+
+    #[test]
+    fn render_mid_char_span_does_not_panic() {
+        let mut source_db = SourceDb::new();
+        let src = "x <= \u{2018}1\u{2019};\n";
+        let file_id = source_db.add_source("smart.vhd", src.to_string());
+        let code = DiagnosticCode::new(Category::Error, 100);
+        // Spans starting and ending inside multi-byte characters.
+        for (start, end) in [(6, 7), (7, 10), (5, 13), (13, 13)] {
+            let span = aion_source::Span::new(file_id, start, end);
+            let diag = Diagnostic::error(code, "unrecognized character", span);
+            let output = TerminalRenderer::new(false, 80).render(&diag, &source_db);
+            assert!(output.contains("x <= \u{2018}1\u{2019};"), "{output}");
+            assert!(output.contains('^'));
+        }
+    }
+
+    #[test]
+    fn render_carets_align_under_multibyte_text() {
+        let mut source_db = SourceDb::new();
+        let src = "\u{e9}\u{e9} <= \u{2018}1;\n";
+        let file_id = source_db.add_source("t.vhd", src.to_string());
+        // U+2018 is bytes 8..11; it is the 6th character (char column 6).
+        let span = aion_source::Span::new(file_id, 8, 11);
+        let diag = Diagnostic::error(DiagnosticCode::new(Category::Error, 100), "bad", span);
+        let output = TerminalRenderer::new(false, 80).render(&diag, &source_db);
+        let caret_line = output.lines().find(|l| l.contains('^')).unwrap();
+        // "  | " prefix, then 6 spaces of padding, then exactly one caret.
+        assert!(caret_line.ends_with("|       ^"), "{caret_line:?}");
+    }
+
+    #[test]
+    fn render_multiline_span_underlines_first_line_only() {
+        let mut source_db = SourceDb::new();
+        let file_id = source_db.add_source("t.vhd", "ab\ncd\n".to_string());
+        let span = aion_source::Span::new(file_id, 1, 5);
+        let diag = Diagnostic::error(DiagnosticCode::new(Category::Error, 100), "bad", span);
+        let output = TerminalRenderer::new(false, 80).render(&diag, &source_db);
+        let caret_line = output.lines().find(|l| l.contains('^')).unwrap();
+        assert_eq!(caret_line.matches('^').count(), 1);
     }
 }

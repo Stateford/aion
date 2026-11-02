@@ -406,8 +406,13 @@ pub fn lower_vhdl_expr(
         Expr::StringLiteral { .. } => IrExpr::Literal(LogicVec::all_zero(1)),
         Expr::BitStringLiteral { span } => {
             let text = source_db.snippet(*span);
-            let lv = parse_vhdl_bit_string(text);
-            IrExpr::Literal(lv)
+            match parse_vhdl_bit_string(text) {
+                Ok(lv) => IrExpr::Literal(lv),
+                Err(msg) => {
+                    sink.emit(errors::error_invalid_bit_string(&msg, *span));
+                    IrExpr::Literal(LogicVec::all_zero(1))
+                }
+            }
         }
         Expr::Binary {
             left,
@@ -748,25 +753,34 @@ fn lower_vhdl_literal(span: Span, source_db: &SourceDb) -> IrExpr {
     }
 }
 
-/// Parses a VHDL bit string literal (e.g., `X"FF"`, `B"1010"`) into a `LogicVec`.
-pub(crate) fn parse_vhdl_bit_string(text: &str) -> LogicVec {
-    let text = text.replace('_', "");
-    let upper = text.to_uppercase();
-    if let Some(hex_part) = upper.strip_prefix("X\"").and_then(|s| s.strip_suffix('"')) {
-        let val = u64::from_str_radix(hex_part, 16).unwrap_or(0);
-        let width = (hex_part.len() as u32) * 4;
-        logic_vec_from_u64(width.max(1), val)
-    } else if let Some(bin_part) = upper.strip_prefix("B\"").and_then(|s| s.strip_suffix('"')) {
-        let val = u64::from_str_radix(bin_part, 2).unwrap_or(0);
-        let width = bin_part.len() as u32;
-        logic_vec_from_u64(width.max(1), val)
-    } else if let Some(oct_part) = upper.strip_prefix("O\"").and_then(|s| s.strip_suffix('"')) {
-        let val = u64::from_str_radix(oct_part, 8).unwrap_or(0);
-        let width = (oct_part.len() as u32) * 3;
-        logic_vec_from_u64(width.max(1), val)
-    } else {
-        LogicVec::all_zero(1)
+/// Parses a VHDL bit string literal into a `LogicVec`.
+///
+/// Handles every VHDL-2008 form: unsized `X"FF"`, `B"1010"`, `O"17"`,
+/// `UX`/`SX`/`UB`/`SB`/`UO`/`SO` prefixes, decimal `D"255"`, and sized
+/// literals such as `8UX"F"` (zero-extended to `00001111`), `8SX"F"`
+/// (sign-extended to `11111111`), and `16D"255"`. Expansion, padding, and
+/// truncation follow IEEE 1076-2008 §15.8 via
+/// [`aion_vhdl_parser::bit_string::expand_bit_string`]. Elements map to
+/// 4-state values: `0`/`L` → 0, `1`/`H` → 1, `Z` → Z, and `U`/`X`/`W`/`-`
+/// → X. The leftmost element is the most significant bit.
+///
+/// Returns an error message for a malformed literal (including a truncation
+/// that would drop significant bits), a null literal (`X""`), or an element
+/// with no 4-state equivalent.
+pub(crate) fn parse_vhdl_bit_string(text: &str) -> Result<LogicVec, String> {
+    let expanded = aion_vhdl_parser::bit_string::expand_bit_string(text).map_err(|e| e.message)?;
+    let bits: Vec<char> = expanded.chars().collect();
+    if bits.is_empty() {
+        return Err("null (zero-width) bit string literals are not supported".to_string());
     }
+    let width = bits.len() as u32;
+    let mut lv = LogicVec::new(width);
+    for (i, &c) in bits.iter().enumerate() {
+        let bit = crate::vhdl::std_logic_char(c)
+            .ok_or_else(|| format!("element '{c}' has no 4-state logic equivalent"))?;
+        lv.set(width - 1 - i as u32, bit);
+    }
+    Ok(lv)
 }
 
 /// Known VHDL built-in functions and type conversion names.
@@ -1446,14 +1460,108 @@ mod tests {
 
     #[test]
     fn vhdl_bit_string_hex() {
-        let lv = parse_vhdl_bit_string("X\"FF\"");
+        let lv = parse_vhdl_bit_string("X\"FF\"").unwrap();
         assert_eq!(lv.width(), 8);
+        assert_eq!(lv.to_u64(), Some(0xFF));
     }
 
     #[test]
     fn vhdl_bit_string_bin() {
-        let lv = parse_vhdl_bit_string("B\"1010\"");
+        let lv = parse_vhdl_bit_string("B\"1010\"").unwrap();
         assert_eq!(lv.width(), 4);
+        assert_eq!(lv.to_u64(), Some(0b1010));
+    }
+
+    #[test]
+    fn vhdl_bit_string_sized_unsigned_zero_extends() {
+        let lv = parse_vhdl_bit_string("8UX\"F\"").unwrap();
+        assert_eq!(lv.width(), 8);
+        assert_eq!(lv.to_u64(), Some(0x0F));
+        let lv = parse_vhdl_bit_string("8X\"F\"").unwrap();
+        assert_eq!(lv.to_u64(), Some(0x0F));
+        let lv = parse_vhdl_bit_string("3UX\"5\"").unwrap();
+        assert_eq!((lv.width(), lv.to_u64()), (3, Some(0b101)));
+    }
+
+    #[test]
+    fn vhdl_bit_string_sized_signed_sign_extends() {
+        let lv = parse_vhdl_bit_string("8SX\"F\"").unwrap();
+        assert_eq!((lv.width(), lv.to_u64()), (8, Some(0xFF)));
+        let lv = parse_vhdl_bit_string("8SX\"7\"").unwrap();
+        assert_eq!(lv.to_u64(), Some(0x07));
+        let lv = parse_vhdl_bit_string("12SB\"101\"").unwrap();
+        assert_eq!((lv.width(), lv.to_u64()), (12, Some(0xFFD)));
+        let lv = parse_vhdl_bit_string("3SX\"F\"").unwrap();
+        assert_eq!((lv.width(), lv.to_u64()), (3, Some(0b111)));
+    }
+
+    #[test]
+    fn vhdl_bit_string_decimal_and_octal() {
+        let lv = parse_vhdl_bit_string("16D\"255\"").unwrap();
+        assert_eq!((lv.width(), lv.to_u64()), (16, Some(255)));
+        let lv = parse_vhdl_bit_string("D\"5\"").unwrap();
+        assert_eq!((lv.width(), lv.to_u64()), (3, Some(5)));
+        let lv = parse_vhdl_bit_string("O\"17\"").unwrap();
+        assert_eq!((lv.width(), lv.to_u64()), (6, Some(0o17)));
+    }
+
+    #[test]
+    fn vhdl_bit_string_wider_than_64_bits() {
+        let lv = parse_vhdl_bit_string("X\"1_0000_0000_0000_0001\"").unwrap();
+        assert_eq!(lv.width(), 68);
+        assert_eq!(lv.get(0), aion_common::Logic::One);
+        assert_eq!(lv.get(64), aion_common::Logic::One);
+        assert_eq!(lv.get(63), aion_common::Logic::Zero);
+    }
+
+    #[test]
+    fn vhdl_bit_string_metavalues() {
+        use aion_common::Logic;
+        let lv = parse_vhdl_bit_string("X\"Z\"").unwrap();
+        assert!((0..4).all(|i| lv.get(i) == Logic::Z));
+        let lv = parse_vhdl_bit_string("B\"1-0U\"").unwrap();
+        assert_eq!(lv.get(3), Logic::One);
+        assert_eq!(lv.get(2), Logic::X);
+        assert_eq!(lv.get(1), Logic::Zero);
+        assert_eq!(lv.get(0), Logic::X);
+    }
+
+    #[test]
+    fn vhdl_bit_string_errors() {
+        // Truncation that drops a '1' is an error (LRM 15.8).
+        assert!(parse_vhdl_bit_string("3UX\"F\"")
+            .unwrap_err()
+            .contains("cannot be truncated"));
+        assert!(parse_vhdl_bit_string("2SX\"5\"").is_err());
+        assert!(parse_vhdl_bit_string("8D\"256\"").is_err());
+        // Null literal and characters with no 4-state equivalent.
+        assert!(parse_vhdl_bit_string("X\"\"").is_err());
+        assert!(parse_vhdl_bit_string("B\"Q\"")
+            .unwrap_err()
+            .contains("no 4-state"));
+    }
+
+    #[test]
+    fn vhdl_bit_string_lowering_reports_invalid_literal() {
+        let (mut sdb, interner, sink, env) = setup();
+        let fid = sdb.add_source("test.vhd", "3UX\"F\" 8SX\"F\"".to_string());
+        let bad = aion_vhdl_parser::ast::Expr::BitStringLiteral {
+            span: aion_source::Span::new(fid, 0, 6),
+        };
+        let _ = lower_vhdl_expr(&bad, &env, &sdb, &interner, &sink);
+        let diags = sink.diagnostics();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, errors::E212);
+
+        let good = aion_vhdl_parser::ast::Expr::BitStringLiteral {
+            span: aion_source::Span::new(fid, 7, 13),
+        };
+        let ir = lower_vhdl_expr(&good, &env, &sdb, &interner, &sink);
+        match ir {
+            IrExpr::Literal(lv) => assert_eq!((lv.width(), lv.to_u64()), (8, Some(0xFF))),
+            other => panic!("expected literal, got {other:?}"),
+        }
+        assert_eq!(sink.diagnostics().len(), 1);
     }
 
     #[test]

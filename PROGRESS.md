@@ -5,6 +5,34 @@
 
 ---
 
+## 2026-11-02 — VHDL Parser: Lexer Correctness for Comments, Literals, Ticks and UTF-8 (Fixes #22)
+
+- **UTF-8 (VHDL-5):** a non-ASCII character outside literals and comments now gives one `Error` token whose span covers the whole character. The message names it (`'‘' (U+2018)`). Smart quotes, primes and typographic dashes get a help line pointing to `'`, `"` or `-`. NBSP and vertical tab count as separators. `TerminalRenderer` clamps offsets to char boundaries (with a manual `floor_char_boundary`), so a mid-character span can no longer panic. Carets are now placed by character column and limited to the first line of a span.
+- **Delimited comments (VHDL-7):** a `/* … */` comment ends at the first `*/` (LRM §15.9), so it no longer nests. `/* see src/*.vhd */` now lexes cleanly.
+- **Bit strings (VHDL-15):** sized literals (`8UX"FF"`, `12SB"101"`, `16D"255"`) are now a single `BitStringLiteral` token. An unterminated bit string reports an error at a newline or at EOF. The new `aion_vhdl_parser::bit_string::expand_bit_string` implements LRM §15.8:
+  - base digits are checked, and metavalues such as `Z`, `X` and `-` are replicated;
+  - `D` literals accept only decimal digits;
+  - unsigned literals are zero-padded, and signed ones are padded with their leftmost element;
+  - a truncation that would drop significant elements is an error;
+  - underlines must sit between characters.
+  
+  The lexer reports these errors with precise spans. The elaborator now uses the same expansion for every form, so `8UX"F"` gives `00001111`, `8SX"F"` gives `11111111` and literals wider than 64 bits are correct. A literal it cannot convert gets the new **E212** error.
+- **Tick vs. char literal (VHDL-16):** the lexer tracks the last token. After an identifier, extended identifier, `)`, `all`, `subtype` or a string literal, `'` is a `Tick`. Otherwise `'c'` (including multi-byte `c`) is a char literal. `character'(' ')` and `t'('a')` now lex correctly.
+- **Based literals (VHDL-21):**
+  - the base must be 2..=16;
+  - at least one digit is required (also after a `.`), and at most one `.` is allowed;
+  - each digit must be less than the base;
+  - exponents need digits, and an integer literal cannot have a negative exponent.
+  
+  Each error has a precise span. Underline placement is also checked in decimal literals.
+- **Optional (LRM §15.10):** `!` is accepted for `|`, and `:` for both `#` delimiters (`16:FF:`). The `:` form is only used when a closing `:` follows.
+- **Tests:**
+  - `bit_string` ×11 and lexer ×31 new, plus `nested_block_comment` updated to assert LRM behaviour;
+  - parser integration ×2 (one renders smart-quote diagnostics);
+  - renderer ×5 (mid-char span, out-of-range offset, multibyte caret alignment, multi-line span);
+  - elaborator ×9 (sized, signed, `D` and >64-bit values, metavalues, E212, default-value end-to-end).
+- **Known gaps:** `%` as a replacement for `"` is not supported. `aion_source::SourceFile::snippet` still slices bytes directly; the lexer no longer produces non-boundary spans, so this is safe today. Based literals are validated but the elaborator still evaluates only decimal integers.
+
 ## 2026-11-01 — Sim: Unified Process Execution (Fixes #4)
 
 - **One execution path:** a single `SimKernel::run_process` handles Finish and Suspend for every path: delta step, initial blocks, the time-0 combinational pass and wakeups. Delays inside `always` blocks are no longer dropped (SIM-2).

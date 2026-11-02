@@ -1,6 +1,6 @@
 //! Diagnostic codes and helper functions for elaboration errors and warnings.
 //!
-//! Error codes `E200`--`E211` cover elaboration failures (unknown modules,
+//! Error codes `E200`--`E212` cover elaboration failures (unknown modules,
 //! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W204`
 //! cover non-fatal issues (width mismatches, unconnected ports, `forever`
 //! loops and `always` blocks with no timing control, VHDL defaults that
@@ -79,6 +79,12 @@ pub const E210: DiagnosticCode = DiagnosticCode {
 pub const E211: DiagnosticCode = DiagnosticCode {
     category: Category::Error,
     number: 211,
+};
+
+/// VHDL bit-string literal that cannot be converted to a logic vector.
+pub const E212: DiagnosticCode = DiagnosticCode {
+    category: Category::Error,
+    number: 212,
 };
 
 /// Width mismatch in assignment or connection.
@@ -186,6 +192,13 @@ pub fn error_no_architecture(entity_name: &str, span: Span) -> Diagnostic {
         format!("no architecture found for entity `{entity_name}`"),
         span,
     )
+}
+
+/// Creates a diagnostic for a VHDL bit-string literal (e.g. `3UX"F"`, or one
+/// containing a character with no 4-state logic equivalent) that cannot be
+/// lowered to a logic vector. `msg` explains why.
+pub fn error_invalid_bit_string(msg: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(E212, format!("invalid bit string literal: {msg}"), span)
 }
 
 /// Creates a diagnostic for a port mismatch in instantiation.
