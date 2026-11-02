@@ -1665,11 +1665,11 @@ mod tests {
              begin\n y <= a;",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        assert_eq!(find(&objects, "U8").2, Some(0x0F));
-        assert_eq!(find(&objects, "S8").2, Some(0xFF));
-        assert_eq!(find(&objects, "D16").2, Some(255));
-        assert_eq!(find(&objects, "S12").2, Some(0xFFD));
-        assert_eq!(find(&objects, "UX4").2, Some(0xA));
+        assert_eq!(find(&objects, "u8").2, Some(0x0F));
+        assert_eq!(find(&objects, "s8").2, Some(0xFF));
+        assert_eq!(find(&objects, "d16").2, Some(255));
+        assert_eq!(find(&objects, "s12").2, Some(0xFFD));
+        assert_eq!(find(&objects, "ux4").2, Some(0xA));
     }
 
     #[test]
