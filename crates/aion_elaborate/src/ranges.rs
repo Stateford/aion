@@ -10,9 +10,10 @@
 //! fills as it walks port, signal, constant, variable, type and subtype
 //! declarations (see [`RangeEnv::declare`]).
 //!
-//! A range attribute whose prefix cannot be resolved is always reported
-//! (`E212`) and yields `None`: picking a guessed range would silently build
-//! the wrong hardware.
+//! A range attribute that cannot be resolved is always reported (`E212`, or
+//! `E209` when the constant evaluator rejects a dimension expression) and
+//! yields `None`: picking a guessed range would silently build the wrong
+//! hardware.
 
 use std::collections::HashMap;
 
@@ -313,9 +314,11 @@ pub fn eval_range_constraint(
 ///   enumeration type, which has no integer range).
 /// - `x'range` / `x'reverse_range` (optionally `x'range(N)`): the `N`th
 ///   (default first) index range of the array object or type `x`, reversed
-///   for `'reverse_range`. Every failure — unknown prefix, non-array prefix,
-///   unknown range, bad dimension, unsupported prefix form — is reported as
-///   `E212`.
+///   for `'reverse_range`. Every failure is reported: structural failures
+///   (unknown prefix, non-array prefix, unknown range, bad dimension,
+///   unsupported prefix form) as `E212`. A dimension expression the constant
+///   evaluator rejects keeps the evaluator's `E209`; if the evaluator fails
+///   without a diagnostic, `E212` is reported instead.
 /// - An [`DiscreteRange::Error`] node returns `None` silently; the parser
 ///   already reported it.
 pub fn resolve_vhdl_discrete_range(
@@ -345,8 +348,9 @@ pub fn resolve_vhdl_discrete_range(
     }
 }
 
-/// Resolves `prefix'range[(N)]` / `prefix'reverse_range[(N)]`, reporting
-/// every failure as `E212`.
+/// Resolves `prefix'range[(N)]` / `prefix'reverse_range[(N)]`. Every failure
+/// is reported: structural failures as `E212`, and a rejected dimension
+/// expression as the evaluator's `E209` (or `E212` if it emitted nothing).
 fn resolve_range_attribute(
     attr: &vhdl_ast::RangeAttributeName,
     ranges: &RangeEnv,
