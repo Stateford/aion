@@ -22,7 +22,10 @@ use crate::context::ElaborationContext;
 use crate::errors;
 use crate::expr::{lower_vhdl_expr, lower_vhdl_to_signal_ref, SignalEnv};
 use crate::registry::ModuleEntry;
-use crate::stmt::lower_vhdl_stmt;
+use crate::stmt::{
+    first_waveform_value, lower_vhdl_conditional_signal_assignment, lower_vhdl_conditional_value,
+    lower_vhdl_selected_signal_assignment, lower_vhdl_stmt,
+};
 use crate::types;
 
 /// Elaborates a VHDL entity+architecture pair into an IR module.
@@ -519,6 +522,28 @@ fn elaborate_vhdl_concurrent(
                 span: sa.span,
             });
         }
+        vhdl_ast::ConcurrentStatement::ConditionalSignalAssignment(ca) => {
+            elaborate_vhdl_conditional_assignment(ca, sig_env, processes, assignments, ctx);
+        }
+        vhdl_ast::ConcurrentStatement::SelectedSignalAssignment(sa) => {
+            // Equivalent to `process (all) begin case sel is ... end case;
+            // end process;` (IEEE 1076-2008 11.6).
+            let body = lower_vhdl_selected_signal_assignment(
+                sa,
+                sig_env,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
+            processes.alloc(Process {
+                id: ProcessId::from_raw(0),
+                name: sa.label,
+                kind: ProcessKind::Combinational,
+                body,
+                sensitivity: Sensitivity::All,
+                span: sa.span,
+            });
+        }
         vhdl_ast::ConcurrentStatement::ComponentInstantiation(ci) => {
             elaborate_vhdl_component(ci, sig_env, cells, ctx);
         }
@@ -528,6 +553,164 @@ fn elaborate_vhdl_concurrent(
         }
         vhdl_ast::ConcurrentStatement::Assert(_) => {}
         vhdl_ast::ConcurrentStatement::Error(_) => {}
+    }
+}
+
+/// Elaborates a concurrent conditional signal assignment
+/// (`t <= a when c1 else b;`), choosing the cheapest faithful IR form:
+///
+/// - **Clocked** (`q <= d when rising_edge(clk);`, optionally preceded by
+///   asynchronous branches such as `'0' when rst = '1' else`): a sequential
+///   process whose `If` chain is edge-sensitive to the clock, plus
+///   both-edge sensitivity to every signal read by the conditions *before*
+///   the clock edge (the asynchronous-priority branches).
+/// - **Complete mux** (final unconditional `else`, no `unaffected`): a
+///   continuous assignment of a nested ternary.
+/// - **Otherwise** (no final `else`, or `unaffected` branches): a
+///   combinational `process (all)` whose `If` chain leaves the target
+///   unchanged on the uncovered paths — the latch the VHDL code describes.
+/// - **All `unaffected`**: nothing at all.
+fn elaborate_vhdl_conditional_assignment(
+    ca: &vhdl_ast::ConditionalSignalAssignment,
+    sig_env: &SignalEnv,
+    processes: &mut Arena<ProcessId, Process>,
+    assignments: &mut Vec<Assignment>,
+    ctx: &mut ElaborationContext<'_>,
+) {
+    if ca
+        .alternatives
+        .iter()
+        .all(|a| first_waveform_value(&a.waveform).is_none())
+    {
+        return;
+    }
+
+    // Edge detection over the conditions, in priority order.
+    let mut edges = Vec::new();
+    let mut async_reads = Vec::new();
+    for alt in &ca.alternatives {
+        let Some(cond) = &alt.condition else { break };
+        collect_edge_calls_expr(cond, sig_env, ctx.interner, &mut edges);
+        if !edges.is_empty() {
+            // First clocked alternative; everything before it is async.
+            break;
+        }
+        collect_vhdl_expr_signals(cond, sig_env, &mut async_reads);
+    }
+
+    if !edges.is_empty() {
+        for sid in async_reads {
+            if !edges.iter().any(|e| e.signal == sid) {
+                edges.push(EdgeSensitivity {
+                    signal: sid,
+                    edge: Edge::Both,
+                });
+            }
+        }
+        let body = lower_vhdl_conditional_signal_assignment(
+            ca,
+            sig_env,
+            ctx.source_db,
+            ctx.interner,
+            ctx.sink,
+        );
+        processes.alloc(Process {
+            id: ProcessId::from_raw(0),
+            name: ca.label,
+            kind: ProcessKind::Sequential,
+            body,
+            sensitivity: Sensitivity::EdgeList(edges),
+            span: ca.span,
+        });
+        return;
+    }
+
+    if let Some(value) = lower_vhdl_conditional_value(
+        &ca.alternatives,
+        sig_env,
+        ctx.source_db,
+        ctx.interner,
+        ctx.sink,
+    ) {
+        let target = lower_vhdl_to_signal_ref(&ca.target, sig_env, ctx.interner, ctx.sink);
+        assignments.push(Assignment {
+            target,
+            value,
+            span: ca.span,
+        });
+        return;
+    }
+
+    let body = lower_vhdl_conditional_signal_assignment(
+        ca,
+        sig_env,
+        ctx.source_db,
+        ctx.interner,
+        ctx.sink,
+    );
+    processes.alloc(Process {
+        id: ProcessId::from_raw(0),
+        name: ca.label,
+        kind: ProcessKind::Combinational,
+        body,
+        sensitivity: Sensitivity::All,
+        span: ca.span,
+    });
+}
+
+/// Collects (without duplicates) every signal of `sig_env` that a VHDL
+/// expression reads, including signals passed as function-call or index
+/// arguments.
+fn collect_vhdl_expr_signals(expr: &vhdl_ast::Expr, sig_env: &SignalEnv, out: &mut Vec<SignalId>) {
+    match expr {
+        vhdl_ast::Expr::Name(name) => {
+            if let Some(&sid) = sig_env.get(&name.primary) {
+                if !out.contains(&sid) {
+                    out.push(sid);
+                }
+            }
+            for part in &name.parts {
+                match part {
+                    vhdl_ast::NameSuffix::Index(args, _) => {
+                        for a in args {
+                            collect_vhdl_expr_signals(a, sig_env, out);
+                        }
+                    }
+                    vhdl_ast::NameSuffix::Attribute(_, Some(arg), _) => {
+                        collect_vhdl_expr_signals(arg, sig_env, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        vhdl_ast::Expr::Binary { left, right, .. } => {
+            collect_vhdl_expr_signals(left, sig_env, out);
+            collect_vhdl_expr_signals(right, sig_env, out);
+        }
+        vhdl_ast::Expr::Unary { operand: inner, .. }
+        | vhdl_ast::Expr::Paren { inner, .. }
+        | vhdl_ast::Expr::Qualified { expr: inner, .. }
+        | vhdl_ast::Expr::TypeConversion { expr: inner, .. } => {
+            collect_vhdl_expr_signals(inner, sig_env, out);
+        }
+        vhdl_ast::Expr::FunctionCall { name, args, .. } => {
+            collect_vhdl_expr_signals(name, sig_env, out);
+            for a in &args.elements {
+                collect_vhdl_expr_signals(&a.actual, sig_env, out);
+            }
+        }
+        vhdl_ast::Expr::Attribute { prefix, arg, .. } => {
+            collect_vhdl_expr_signals(prefix, sig_env, out);
+            if let Some(a) = arg {
+                collect_vhdl_expr_signals(a, sig_env, out);
+            }
+        }
+        vhdl_ast::Expr::Aggregate { elements, .. } => {
+            for e in elements {
+                collect_vhdl_expr_signals(&e.value, sig_env, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -625,6 +808,17 @@ fn collect_edge_calls(
                 for s in &alt.stmts {
                     collect_edge_calls(s, sig_env, interner, edges);
                 }
+            }
+        }
+        // VHDL-2008 `q <= d when rising_edge(clk);` inside a process.
+        vhdl_ast::SequentialStatement::ConditionalSignalAssignment(ca) => {
+            for cond in ca.alternatives.iter().filter_map(|a| a.condition.as_ref()) {
+                collect_edge_calls_expr(cond, sig_env, interner, edges);
+            }
+        }
+        vhdl_ast::SequentialStatement::ConditionalVariableAssignment(cv) => {
+            for cond in cv.alternatives.iter().filter_map(|a| a.condition.as_ref()) {
+                collect_edge_calls_expr(cond, sig_env, interner, edges);
             }
         }
         _ => {}

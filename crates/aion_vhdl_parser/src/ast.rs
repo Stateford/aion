@@ -499,8 +499,14 @@ pub enum DiscreteRange {
 pub enum ConcurrentStatement {
     /// A process statement.
     Process(ProcessStatement),
-    /// A concurrent signal assignment.
+    /// A concurrent simple signal assignment (e.g., `y <= a and b;`).
     SignalAssignment(ConcurrentSignalAssignment),
+    /// A concurrent conditional signal assignment
+    /// (`y <= a when s = '1' else b;`).
+    ConditionalSignalAssignment(ConditionalSignalAssignment),
+    /// A concurrent selected signal assignment
+    /// (`with s select y <= a when '1', b when others;`).
+    SelectedSignalAssignment(SelectedSignalAssignment),
     /// A component instantiation.
     ComponentInstantiation(ComponentInstantiation),
     /// A for-generate statement.
@@ -539,14 +545,20 @@ pub enum SensitivityList {
     None,
 }
 
-/// A concurrent signal assignment (e.g., `y <= a and b;`).
+/// A concurrent simple signal assignment (e.g., `y <= a and b;`).
+///
+/// A simple assignment whose waveform is `unaffected` is represented as a
+/// [`ConditionalSignalAssignment`] with a single unconditional alternative,
+/// so `waveforms` here always holds at least one element.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConcurrentSignalAssignment {
     /// Optional label.
     pub label: Option<Ident>,
-    /// Target signal.
+    /// Target signal, or a positional aggregate of signals (`(a, b)`).
     pub target: Expr,
-    /// Value expression(s) with optional conditions.
+    /// Optional delay mechanism (`transport`, `[reject t] inertial`).
+    pub delay: Option<DelayMechanism>,
+    /// The waveform elements (`value [after t] {, ...}`).
     pub waveforms: Vec<Waveform>,
     /// Source span.
     pub span: Span,
@@ -559,6 +571,114 @@ pub struct Waveform {
     pub value: Expr,
     /// Optional `after` time expression.
     pub after: Option<Expr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// The delay mechanism of a signal assignment, written between `<=` and the
+/// waveform. It only affects the simulation timing of the projected waveform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DelayMechanism {
+    /// `transport` — every waveform element is propagated, no pulse rejection.
+    Transport {
+        /// Span of the `transport` keyword.
+        span: Span,
+    },
+    /// `[reject time] inertial` — pulses shorter than the reject limit
+    /// (by default, the first element's delay) are suppressed.
+    Inertial {
+        /// The explicit pulse-rejection limit from `reject <time>`, if given.
+        reject: Option<Expr>,
+        /// Span from `reject` (or `inertial`) through `inertial`.
+        span: Span,
+    },
+}
+
+/// The waveform part of a signal assignment alternative: either a list of
+/// waveform elements or the keyword `unaffected` (no new transaction).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SignalWaveform {
+    /// One or more waveform elements (`a after 1 ns, b after 2 ns`).
+    Elements(Vec<Waveform>),
+    /// The keyword `unaffected`: the target keeps its current drive.
+    Unaffected(Span),
+}
+
+impl SignalWaveform {
+    /// Returns the source span covering this waveform (all of its elements,
+    /// or the `unaffected` keyword). An empty element list, which the parser
+    /// never produces, yields [`Span::DUMMY`].
+    pub fn span(&self) -> Span {
+        match self {
+            SignalWaveform::Elements(elems) => match (elems.first(), elems.last()) {
+                (Some(first), Some(last)) => first.span.merge(last.span),
+                _ => Span::DUMMY,
+            },
+            SignalWaveform::Unaffected(span) => *span,
+        }
+    }
+}
+
+/// One alternative of a conditional signal assignment:
+/// `waveform when condition` or, for the trailing `else` branch, `waveform`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionalWaveform {
+    /// The waveform assigned when this alternative is chosen.
+    pub waveform: SignalWaveform,
+    /// The guarding condition; `None` only for a final unconditional `else`.
+    pub condition: Option<Expr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// One alternative of a selected signal assignment: `waveform when choices`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectedWaveform {
+    /// The waveform assigned when one of `choices` matches the selector.
+    pub waveform: SignalWaveform,
+    /// The choices (`'1'`, `"00" | "01"`, `0 to 3`, `others`).
+    pub choices: Vec<Choice>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// A conditional signal assignment, concurrent or VHDL-2008 sequential:
+/// `target <= [delay] wf when c1 else wf when c2 else wf;`.
+///
+/// Alternatives are tried in order; the first whose condition is true is
+/// assigned. If the last alternative has a condition and none hold, the
+/// target is left unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionalSignalAssignment {
+    /// Optional statement label.
+    pub label: Option<Ident>,
+    /// Target signal, or a positional aggregate of signals (`(a, b)`).
+    pub target: Expr,
+    /// Optional delay mechanism (`transport`, `[reject t] inertial`).
+    pub delay: Option<DelayMechanism>,
+    /// The alternatives in priority order (at least one).
+    pub alternatives: Vec<ConditionalWaveform>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// A selected signal assignment, concurrent or VHDL-2008 sequential:
+/// `with sel select[?] target <= [delay] wf when choices, ...;`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectedSignalAssignment {
+    /// Optional statement label.
+    pub label: Option<Ident>,
+    /// The selector expression after `with`.
+    pub selector: Expr,
+    /// `true` for the VHDL-2008 matching form `select?` (choices compared
+    /// with `?=`, so `'-'` acts as a don't-care).
+    pub matching: bool,
+    /// Target signal, or a positional aggregate of signals (`(a, b)`).
+    pub target: Expr,
+    /// Optional delay mechanism (`transport`, `[reject t] inertial`).
+    pub delay: Option<DelayMechanism>,
+    /// The alternatives (at least one).
+    pub alternatives: Vec<SelectedWaveform>,
     /// Source span.
     pub span: Span,
 }
@@ -659,15 +779,39 @@ pub struct ConcurrentAssert {
 /// A sequential statement in a process or subprogram body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SequentialStatement {
-    /// A signal assignment (e.g., `q <= d;`).
+    /// A simple signal assignment (e.g., `q <= d;`).
+    ///
+    /// As with [`ConcurrentSignalAssignment`], `q <= unaffected;` is
+    /// represented as a [`SequentialStatement::ConditionalSignalAssignment`].
     SignalAssignment {
-        /// Target signal.
+        /// Target signal, or a positional aggregate of signals (`(a, b)`).
         target: Expr,
+        /// Optional delay mechanism (`transport`, `[reject t] inertial`).
+        delay: Option<DelayMechanism>,
         /// Waveform values.
         waveforms: Vec<Waveform>,
         /// Source span.
         span: Span,
     },
+    /// A VHDL-2008 sequential conditional signal assignment
+    /// (`q <= a when c else b;`).
+    ConditionalSignalAssignment(ConditionalSignalAssignment),
+    /// A VHDL-2008 sequential selected signal assignment
+    /// (`with s select q <= a when '1', b when others;`).
+    SelectedSignalAssignment(SelectedSignalAssignment),
+    /// A VHDL-2008 conditional variable assignment (`v := a when c else b;`).
+    ConditionalVariableAssignment(ConditionalVariableAssignment),
+    /// A VHDL-2008 selected variable assignment
+    /// (`with s select v := a when '1', b when others;`).
+    SelectedVariableAssignment(SelectedVariableAssignment),
+    /// A VHDL-2008 simple or conditional force assignment
+    /// (`s <= force [in|out] expr [when c else ...];`).
+    ForceAssignment(ForceAssignment),
+    /// A VHDL-2008 selected force assignment
+    /// (`with sel select s <= force [in|out] expr when choices, ...;`).
+    SelectedForceAssignment(SelectedForceAssignment),
+    /// A VHDL-2008 release assignment (`s <= release [in|out];`).
+    ReleaseAssignment(ReleaseAssignment),
     /// A variable assignment (e.g., `count := count + 1;`).
     VariableAssignment {
         /// Target variable.
@@ -750,6 +894,127 @@ pub enum SequentialStatement {
     },
     /// An error node produced during error recovery.
     Error(Span),
+}
+
+/// One alternative of a conditional variable or force assignment:
+/// `expr when condition`, or a trailing unconditional `else expr`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionalExpr {
+    /// The value assigned when this alternative is chosen.
+    pub value: Expr,
+    /// The guarding condition; `None` only for a final unconditional `else`
+    /// (or the single value of a simple force assignment).
+    pub condition: Option<Expr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// One alternative of a selected variable or force assignment:
+/// `expr when choices`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectedExpr {
+    /// The value assigned when one of `choices` matches the selector.
+    pub value: Expr,
+    /// The choices (`'1'`, `"00" | "01"`, `0 to 3`, `others`).
+    pub choices: Vec<Choice>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// A VHDL-2008 conditional variable assignment:
+/// `target := e1 when c1 else e2 when c2 else e3;`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionalVariableAssignment {
+    /// Optional statement label.
+    pub label: Option<Ident>,
+    /// Target variable, or a positional aggregate of variables.
+    pub target: Expr,
+    /// The alternatives in priority order; only the last may be
+    /// unconditional. If every condition is false the variable is unchanged.
+    pub alternatives: Vec<ConditionalExpr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// A VHDL-2008 selected variable assignment:
+/// `with sel select[?] target := e1 when choices, ...;`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectedVariableAssignment {
+    /// Optional statement label.
+    pub label: Option<Ident>,
+    /// The selector expression after `with`.
+    pub selector: Expr,
+    /// `true` for the matching form `select?`.
+    pub matching: bool,
+    /// Target variable, or a positional aggregate of variables.
+    pub target: Expr,
+    /// The alternatives (at least one).
+    pub alternatives: Vec<SelectedExpr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// The optional mode of a VHDL-2008 force or release assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForceMode {
+    /// `in` — force/release the effective value seen by readers.
+    In,
+    /// `out` — force/release the driving value seen by the port's driver.
+    Out,
+}
+
+/// A VHDL-2008 simple or conditional force assignment:
+/// `target <= force [in|out] e1 [when c1 else e2 ...];`.
+///
+/// Force assignments are a simulation/verification construct that overrides
+/// a signal's value until it is released.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForceAssignment {
+    /// Optional statement label.
+    pub label: Option<Ident>,
+    /// The forced signal.
+    pub target: Expr,
+    /// The explicit force mode, if written.
+    pub mode: Option<ForceMode>,
+    /// The forced value(s): a single unconditional entry for a simple force,
+    /// or a priority-ordered conditional list.
+    pub alternatives: Vec<ConditionalExpr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// A VHDL-2008 selected force assignment:
+/// `with sel select[?] target <= force [in|out] e1 when choices, ...;`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectedForceAssignment {
+    /// Optional statement label.
+    pub label: Option<Ident>,
+    /// The selector expression after `with`.
+    pub selector: Expr,
+    /// `true` for the matching form `select?`.
+    pub matching: bool,
+    /// The forced signal.
+    pub target: Expr,
+    /// The explicit force mode, if written.
+    pub mode: Option<ForceMode>,
+    /// The alternatives (at least one).
+    pub alternatives: Vec<SelectedExpr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// A VHDL-2008 release assignment: `target <= release [in|out];`, which
+/// ends a previous force on the target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseAssignment {
+    /// Optional statement label.
+    pub label: Option<Ident>,
+    /// The released signal.
+    pub target: Expr,
+    /// The explicit release mode, if written.
+    pub mode: Option<ForceMode>,
+    /// Source span.
+    pub span: Span,
 }
 
 /// An if statement with optional elsif/else branches.
@@ -1193,6 +1458,106 @@ mod tests {
         let json = serde_json::to_string(&ti).unwrap();
         let back: TypeIndication = serde_json::from_str(&json).unwrap();
         assert_eq!(back.span, dummy_span());
+    }
+
+    fn dummy_name_expr() -> Expr {
+        Expr::Name(Name {
+            primary: Ident::from_raw(0),
+            parts: Vec::new(),
+            span: dummy_span(),
+        })
+    }
+
+    #[test]
+    fn serde_roundtrip_conditional_and_selected_assignments() {
+        let cond = ConcurrentStatement::ConditionalSignalAssignment(ConditionalSignalAssignment {
+            label: None,
+            target: dummy_name_expr(),
+            delay: Some(DelayMechanism::Inertial {
+                reject: Some(Expr::IntLiteral { span: dummy_span() }),
+                span: dummy_span(),
+            }),
+            alternatives: vec![
+                ConditionalWaveform {
+                    waveform: SignalWaveform::Elements(vec![Waveform {
+                        value: dummy_name_expr(),
+                        after: None,
+                        span: dummy_span(),
+                    }]),
+                    condition: Some(dummy_name_expr()),
+                    span: dummy_span(),
+                },
+                ConditionalWaveform {
+                    waveform: SignalWaveform::Unaffected(dummy_span()),
+                    condition: None,
+                    span: dummy_span(),
+                },
+            ],
+            span: dummy_span(),
+        });
+        let json = serde_json::to_string(&cond).unwrap();
+        let back: ConcurrentStatement = serde_json::from_str(&json).unwrap();
+        match back {
+            ConcurrentStatement::ConditionalSignalAssignment(c) => {
+                assert_eq!(c.alternatives.len(), 2);
+                assert!(matches!(
+                    c.alternatives[1].waveform,
+                    SignalWaveform::Unaffected(_)
+                ));
+                assert!(matches!(
+                    c.delay,
+                    Some(DelayMechanism::Inertial {
+                        reject: Some(_),
+                        ..
+                    })
+                ));
+            }
+            other => panic!("expected conditional assignment, got {other:?}"),
+        }
+
+        let force = SequentialStatement::SelectedForceAssignment(SelectedForceAssignment {
+            label: None,
+            selector: dummy_name_expr(),
+            matching: true,
+            target: dummy_name_expr(),
+            mode: Some(ForceMode::Out),
+            alternatives: vec![SelectedExpr {
+                value: dummy_name_expr(),
+                choices: vec![Choice::Others(dummy_span())],
+                span: dummy_span(),
+            }],
+            span: dummy_span(),
+        });
+        let json = serde_json::to_string(&force).unwrap();
+        let back: SequentialStatement = serde_json::from_str(&json).unwrap();
+        match back {
+            SequentialStatement::SelectedForceAssignment(f) => {
+                assert!(f.matching);
+                assert_eq!(f.mode, Some(ForceMode::Out));
+            }
+            other => panic!("expected selected force, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_waveform_span() {
+        let a = Span::new(FileId::from_raw(0), 2, 5);
+        let b = Span::new(FileId::from_raw(0), 7, 12);
+        let wf = SignalWaveform::Elements(vec![
+            Waveform {
+                value: Expr::IntLiteral { span: a },
+                after: None,
+                span: a,
+            },
+            Waveform {
+                value: Expr::IntLiteral { span: b },
+                after: None,
+                span: b,
+            },
+        ]);
+        assert_eq!(wf.span(), Span::new(FileId::from_raw(0), 2, 12));
+        assert_eq!(SignalWaveform::Unaffected(a).span(), a);
+        assert_eq!(SignalWaveform::Elements(Vec::new()).span(), Span::DUMMY);
     }
 
     #[test]
