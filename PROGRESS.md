@@ -5,6 +5,17 @@
 
 ---
 
+## 2026-11-02 — Elaborator: Unary Plus Lowered as Identity
+
+- **Silent miscompile fixed:** Verilog/SV unary `+` and VHDL unary `+` (`Pos`) were lowered to `UnaryOp::Neg`, so `assign y = +a;` built `y = -a` with no diagnostic. `+(-a)` became `Neg(Neg(a))`. The `map_*_unary_op` helpers now return `Option<UnaryOp>`, with `None` for unary plus, and `lower_{verilog,sv,vhdl}_expr` return the lowered operand directly. No IR variant was added.
+- **Const eval:** `eval_{verilog,sv,vhdl}_expr` now evaluate unary plus as an integer identity. Before, `parameter P = +3` failed with "non-constant expression" (E209).
+- **Checked, not affected:** lint, sim and synth only see IR `UnaryOp`, which has no plus variant.
+- **Tests:**
+  - 12 elaborated-IR tests (`+a`, `-a`, `+(-a)`, `-(+a)` for Verilog, SV and VHDL) and a mapping test;
+  - 6 const-eval tests (`+3`, `-3`, `+-3`, `-+3` per language, and unary plus of a non-constant);
+  - 4 end-to-end sim tests in `aion_conformance/tests/sim_assign_semantics.rs`.
+- **Known gaps (unchanged, out of scope):** other unary mappings are still approximate. `RedNand`/`RedNor`/`RedXnor` drop the inversion, VHDL `abs` and SV `++`/`--` lower to `Neg`, and VHDL `??` lowers to `Not`. Body-level `parameter`/`localparam` declarations are not entered into the const env, and parameters are not resolvable as expression operands (E204).
+
 ## 2026-11-01 — Sim: Unified Process Execution (Fixes #4)
 
 - **One execution path:** a single `SimKernel::run_process` handles Finish and Suspend for every path: delta step, initial blocks, the time-0 combinational pass and wakeups. Delays inside `always` blocks are no longer dropped (SIM-2).

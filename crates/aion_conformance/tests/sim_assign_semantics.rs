@@ -374,3 +374,73 @@ endmodule
     assert_eq!(value(&kernel, "q"), Some(0x0F));
     assert_eq!(value(&kernel, "r"), Some(0x0F));
 }
+
+/// Source for the unary-plus simulation tests; `NET` is `wire` (Verilog) or
+/// `logic` (SV).
+const UNARY_PLUS_SRC: &str = r#"
+module tb;
+  reg [7:0] a;
+  NET [7:0] y_plus, y_neg, y_plus_neg, y_neg_plus;
+  assign y_plus = +a;
+  assign y_neg = -a;
+  assign y_plus_neg = +(-a);
+  assign y_neg_plus = -(+a);
+  initial a = 8'd5;
+endmodule
+"#;
+
+/// Source for the unary-plus parameter tests: `+3` and `+-3` go through the
+/// constant evaluator and set the declared widths of `w_p` and `w_n`.
+const UNARY_PLUS_PARAM_SRC: &str = r#"
+module tb #(parameter P = +3, parameter N = +-3);
+  NET [P:0] w_p;
+  NET [N+8:0] w_n;
+endmodule
+"#;
+
+/// Returns the width in bits of `top.<name>`.
+fn width(kernel: &SimKernel, name: &str) -> u32 {
+    let id = kernel
+        .find_signal(&format!("top.{name}"))
+        .unwrap_or_else(|| panic!("signal {name} not found"));
+    kernel.signal_value(id).width()
+}
+
+/// Checks that unary plus simulates as the identity and unary minus as
+/// two's-complement negation, including when the two are nested.
+fn check_unary_plus(file_name: &str, net: &str) {
+    let src = UNARY_PLUS_SRC.replace("NET", net);
+    let (kernel, _) = simulate(file_name, &src, "tb");
+    assert_eq!(value(&kernel, "y_plus"), Some(5), "+a must equal a");
+    assert_eq!(value(&kernel, "y_neg"), Some(251), "-a");
+    assert_eq!(value(&kernel, "y_plus_neg"), Some(251), "+(-a)");
+    assert_eq!(value(&kernel, "y_neg_plus"), Some(251), "-(+a)");
+}
+
+/// Checks that `+3` and `+-3` evaluate to 3 and -3 as parameter values.
+fn check_unary_plus_params(file_name: &str, net: &str) {
+    let src = UNARY_PLUS_PARAM_SRC.replace("NET", net);
+    let (kernel, _) = simulate(file_name, &src, "tb");
+    assert_eq!(width(&kernel, "w_p"), 4, "parameter +3 gives [3:0]");
+    assert_eq!(width(&kernel, "w_n"), 6, "parameter +-3 gives [5:0]");
+}
+
+#[test]
+fn verilog_unary_plus_is_identity() {
+    check_unary_plus("tb.v", "wire");
+}
+
+#[test]
+fn sv_unary_plus_is_identity() {
+    check_unary_plus("tb.sv", "logic");
+}
+
+#[test]
+fn verilog_unary_plus_parameter_is_identity() {
+    check_unary_plus_params("tb.v", "wire");
+}
+
+#[test]
+fn sv_unary_plus_parameter_is_identity() {
+    check_unary_plus_params("tb.sv", "logic");
+}

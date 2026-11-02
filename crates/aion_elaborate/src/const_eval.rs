@@ -269,6 +269,15 @@ pub fn eval_verilog_expr(
             let n = const_to_i64(&val)?;
             Some(ConstValue::Int(-n))
         }
+        v_ast::Expr::Unary {
+            op: v_ast::UnaryOp::Plus,
+            operand,
+            ..
+        } => {
+            // Unary plus is the identity.
+            let val = eval_verilog_expr(operand, source_db, interner, env, sink)?;
+            Some(ConstValue::Int(const_to_i64(&val)?))
+        }
         v_ast::Expr::SystemCall {
             name, args, span, ..
         } => {
@@ -375,6 +384,15 @@ pub fn eval_sv_expr(
             let n = const_to_i64(&val)?;
             Some(ConstValue::Int(-n))
         }
+        sv_ast::Expr::Unary {
+            op: sv_ast::UnaryOp::Plus,
+            operand,
+            ..
+        } => {
+            // Unary plus is the identity.
+            let val = eval_sv_expr(operand, source_db, interner, env, sink)?;
+            Some(ConstValue::Int(const_to_i64(&val)?))
+        }
         sv_ast::Expr::SystemCall {
             name, args, span, ..
         } => {
@@ -477,6 +495,15 @@ pub fn eval_vhdl_expr(
             let val = eval_vhdl_expr(operand, source_db, interner, env, sink)?;
             let n = const_to_i64(&val)?;
             Some(ConstValue::Int(-n))
+        }
+        vhdl_ast::Expr::Unary {
+            op: vhdl_ast::UnaryOp::Pos,
+            operand,
+            ..
+        } => {
+            // Unary plus is the identity.
+            let val = eval_vhdl_expr(operand, source_db, interner, env, sink)?;
+            Some(ConstValue::Int(const_to_i64(&val)?))
         }
         vhdl_ast::Expr::Paren { inner, .. } => {
             eval_vhdl_expr(inner, source_db, interner, env, sink)
@@ -1023,6 +1050,155 @@ mod tests {
         let expr = vhdl_ast::Expr::Others { span: Span::DUMMY };
         let result = eval_vhdl_expr(&expr, &db, &interner, &env, &sink);
         assert!(result.is_none());
+        assert!(sink.has_errors());
+    }
+
+    // ---- Unary plus / minus ----
+
+    /// Wraps `inner` in the Verilog unary operators `ops`, outermost first.
+    fn v_unary(ops: &[v_ast::UnaryOp], inner: v_ast::Expr) -> v_ast::Expr {
+        ops.iter().rev().fold(inner, |e, op| v_ast::Expr::Unary {
+            op: *op,
+            operand: Box::new(e),
+            span: Span::DUMMY,
+        })
+    }
+
+    /// Wraps `inner` in the SystemVerilog unary operators `ops`, outermost first.
+    fn sv_unary(ops: &[sv_ast::UnaryOp], inner: sv_ast::Expr) -> sv_ast::Expr {
+        ops.iter().rev().fold(inner, |e, op| sv_ast::Expr::Unary {
+            op: *op,
+            operand: Box::new(e),
+            span: Span::DUMMY,
+        })
+    }
+
+    /// Wraps `inner` in the VHDL unary operators `ops`, outermost first.
+    fn vhdl_unary(ops: &[vhdl_ast::UnaryOp], inner: vhdl_ast::Expr) -> vhdl_ast::Expr {
+        ops.iter().rev().fold(inner, |e, op| vhdl_ast::Expr::Unary {
+            op: *op,
+            operand: Box::new(e),
+            span: Span::DUMMY,
+        })
+    }
+
+    #[test]
+    fn eval_verilog_unary_plus_minus() {
+        use v_ast::UnaryOp::{Minus, Plus};
+        let (db, span) = make_source("3");
+        let interner = Interner::new();
+        let env = ConstEnv::new();
+        let sink = DiagnosticSink::new();
+        let lit = || v_ast::Expr::Literal { span };
+        for (ops, want) in [
+            (&[Plus][..], 3),
+            (&[Minus][..], -3),
+            (&[Plus, Minus][..], -3),
+            (&[Minus, Plus][..], -3),
+        ] {
+            let expr = v_unary(ops, lit());
+            assert_eq!(
+                eval_verilog_expr(&expr, &db, &interner, &env, &sink),
+                Some(ConstValue::Int(want)),
+                "{ops:?}"
+            );
+        }
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn eval_verilog_unary_plus_of_non_constant_returns_none() {
+        let (db, _) = make_source("");
+        let interner = Interner::new();
+        let env = ConstEnv::new();
+        let sink = DiagnosticSink::new();
+        let expr = v_unary(
+            &[v_ast::UnaryOp::Plus],
+            v_ast::Expr::Concat {
+                elements: Vec::new(),
+                span: Span::DUMMY,
+            },
+        );
+        assert!(eval_verilog_expr(&expr, &db, &interner, &env, &sink).is_none());
+        assert!(sink.has_errors());
+    }
+
+    #[test]
+    fn eval_sv_unary_plus_minus() {
+        use sv_ast::UnaryOp::{Minus, Plus};
+        let (db, span) = make_source("3");
+        let interner = Interner::new();
+        let env = ConstEnv::new();
+        let sink = DiagnosticSink::new();
+        let lit = || sv_ast::Expr::Literal { span };
+        for (ops, want) in [
+            (&[Plus][..], 3),
+            (&[Minus][..], -3),
+            (&[Plus, Minus][..], -3),
+            (&[Minus, Plus][..], -3),
+        ] {
+            let expr = sv_unary(ops, lit());
+            assert_eq!(
+                eval_sv_expr(&expr, &db, &interner, &env, &sink),
+                Some(ConstValue::Int(want)),
+                "{ops:?}"
+            );
+        }
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn eval_sv_unary_plus_of_non_constant_returns_none() {
+        let (db, _) = make_source("");
+        let interner = Interner::new();
+        let env = ConstEnv::new();
+        let sink = DiagnosticSink::new();
+        let expr = sv_unary(
+            &[sv_ast::UnaryOp::Plus],
+            sv_ast::Expr::Concat {
+                elements: Vec::new(),
+                span: Span::DUMMY,
+            },
+        );
+        assert!(eval_sv_expr(&expr, &db, &interner, &env, &sink).is_none());
+        assert!(sink.has_errors());
+    }
+
+    #[test]
+    fn eval_vhdl_unary_plus_minus() {
+        use vhdl_ast::UnaryOp::{Neg, Pos};
+        let (db, span) = make_source("3");
+        let interner = Interner::new();
+        let env = ConstEnv::new();
+        let sink = DiagnosticSink::new();
+        let lit = || vhdl_ast::Expr::IntLiteral { span };
+        for (ops, want) in [
+            (&[Pos][..], 3),
+            (&[Neg][..], -3),
+            (&[Pos, Neg][..], -3),
+            (&[Neg, Pos][..], -3),
+        ] {
+            let expr = vhdl_unary(ops, lit());
+            assert_eq!(
+                eval_vhdl_expr(&expr, &db, &interner, &env, &sink),
+                Some(ConstValue::Int(want)),
+                "{ops:?}"
+            );
+        }
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn eval_vhdl_unary_plus_of_non_constant_returns_none() {
+        let (db, _) = make_source("");
+        let interner = Interner::new();
+        let env = ConstEnv::new();
+        let sink = DiagnosticSink::new();
+        let expr = vhdl_unary(
+            &[vhdl_ast::UnaryOp::Pos],
+            vhdl_ast::Expr::Others { span: Span::DUMMY },
+        );
+        assert!(eval_vhdl_expr(&expr, &db, &interner, &env, &sink).is_none());
         assert!(sink.has_errors());
     }
 }
