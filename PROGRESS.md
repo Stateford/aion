@@ -5,6 +5,21 @@
 
 ---
 
+## 2026-11-02 — VHDL Parser: Expression Precedence and Associativity per LRM 9.2 (Fixes #20)
+
+- **New binding powers** (`aion_vhdl_parser/src/expr.rs`): logical (1,2), relational (3,4), shift (5,6), adding (7,8), **sign prefix 9**, multiplying (10,11), `**` (12,13), and `not`/`abs`/`??`/reductions at prefix 14. A sign now covers a whole term, so `-7 mod 3` is `-(7 mod 3)` (VHDL-3). Before, every unary operator was at 11.
+- **LRM restrictions (VHDL-14):** each one now raises E101 with a suggested parenthesization, and the parser still builds the tree and keeps going:
+  - mixed logical operators (`a and b or c`) and `nand`/`nor` chains are errors; `a and b and c` stays legal;
+  - chained relational, shift and `**` operators (`a = b = c`, `a sll 1 sll 2`, `2 ** 3 ** 2`) are errors;
+  - a sign right after an adding, multiplying or `**` operator (`a + -b`, `a ** -b`) is an error;
+  - `**` combined with `not`/`abs` (`abs a ** 2`, `a ** not b`) is an error, and so is a nested prefix (`not not a`).
+- **Reductions:** the VHDL-2008 unary `and/or/nand/nor/xor/xnor v` operators are parsed as factors, using the new `UnaryOp::Red*` variants. The elaborator maps them to the IR `RedAnd`/`RedOr`/`RedXor`, and the nand/nor/xnor forms to `Not(Red*)`.
+- **Tests:**
+  - 20 parser tests: a precedence table covering every level boundary in both orders, associativity, the legal parenthesized forms, a rejection test for each illegal form (checking the recovered tree), the reductions, and full-design recovery;
+  - 3 elaborator lowering tests.
+- **Repo check:** the example `.vhd` files and the existing tests use none of the newly rejected forms.
+- **Known gaps:** an expression of the form `?? primary` is not checked further (for example `?? a and b`).
+
 ## 2026-11-01 — Sim: Unified Process Execution (Fixes #4)
 
 - **One execution path:** a single `SimKernel::run_process` handles Finish and Suspend for every path: delta step, initial blocks, the time-0 combinational pass and wakeups. Delays inside `always` blocks are no longer dropped (SIM-2).
