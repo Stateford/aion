@@ -391,7 +391,19 @@ fn resolve_range_attribute(
     let dimension = match &attr.dimension {
         None => 1,
         Some(expr) => {
-            let value = const_eval::eval_vhdl_expr(expr, source_db, interner, const_env, sink)?;
+            // `eval_vhdl_expr` reports most failures itself (E209), but some
+            // paths (e.g. an integer literal that overflows i64) return `None`
+            // silently. Report those here so a failed dimension never goes
+            // unreported.
+            let errors_before = sink.error_count();
+            let Some(value) =
+                const_eval::eval_vhdl_expr(expr, source_db, interner, const_env, sink)
+            else {
+                if sink.error_count() == errors_before {
+                    return fail("the dimension argument is not an integer constant");
+                }
+                return None;
+            };
             match const_eval::const_to_i64(&value) {
                 Some(n) => n,
                 None => return fail("the dimension argument is not an integer constant"),
@@ -625,6 +637,31 @@ mod tests {
         assert!(d.message.contains("dimension 2"), "{}", d.message);
         let d = single_e212("signal v : std_logic_vector(3 downto 0);", "v'range(0)");
         assert!(d.message.contains("dimension 0"), "{}", d.message);
+    }
+
+    #[test]
+    fn unevaluable_dimension_is_always_reported() {
+        // An integer literal that overflows i64 makes the constant evaluator
+        // return `None` without a diagnostic; the range resolver must still
+        // report it rather than fail silently.
+        let d = single_e212(
+            "signal v : std_logic_vector(3 downto 0);",
+            "v'range(99999999999999999999)",
+        );
+        assert!(d.message.contains("dimension argument"), "{}", d.message);
+    }
+
+    #[test]
+    fn evaluator_diagnostic_is_not_duplicated() {
+        // When the evaluator already reported the failure (E209 for an
+        // unknown name), no extra E212 is added.
+        let (ranges, diags) = resolve_loops(
+            "signal v : std_logic_vector(3 downto 0);",
+            "process begin for i in v'range(nope) loop null; end loop; end process;",
+        );
+        assert_eq!(ranges, vec![None]);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, errors::E209);
     }
 
     #[test]
