@@ -10,6 +10,7 @@ use aion_common::{Ident, Interner};
 use aion_diagnostics::DiagnosticSink;
 use aion_source::Span;
 
+use crate::binding::is_extended_identifier;
 use crate::errors;
 
 /// A VHDL entity paired with its architectures.
@@ -192,17 +193,29 @@ impl<'a> ModuleRegistry<'a> {
                 },
             );
             self.first_span.insert(name, entity.span);
-            self.vhdl_folded
-                .entry(interner.resolve(name).to_ascii_lowercase())
-                .or_insert(name);
+            // Extended identifiers (`\Top\`) are case-sensitive: never index
+            // them for case-insensitive lookup.
+            let text = interner.resolve(name);
+            if !is_extended_identifier(text) {
+                self.vhdl_folded
+                    .entry(text.to_ascii_lowercase())
+                    .or_insert(name);
+            }
         }
     }
 
     /// Records a case-sensitive Verilog/SV module name in the folded index,
     /// marking the folded spelling ambiguous if another module already owns it.
+    ///
+    /// Escaped identifiers (`\Foo `) are skipped: a basic VHDL name never
+    /// refers to one.
     fn record_verilog_folded(&mut self, name: Ident, interner: &Interner) {
+        let text = interner.resolve(name);
+        if is_extended_identifier(text) {
+            return;
+        }
         self.verilog_folded
-            .entry(interner.resolve(name).to_ascii_lowercase())
+            .entry(text.to_ascii_lowercase())
             .and_modify(|slot| {
                 if *slot != Some(name) {
                     *slot = None;
@@ -255,14 +268,16 @@ impl<'a> ModuleRegistry<'a> {
     /// An exact match always wins. Otherwise the name is matched
     /// case-insensitively against VHDL entities only, because VHDL basic
     /// identifiers are case-insensitive and are stored folded to lowercase.
-    /// Verilog/SV modules are never matched case-insensitively from here.
+    /// Verilog/SV modules are never matched case-insensitively from here, and
+    /// neither are extended/escaped names (`\Top\`), which are case-sensitive.
     /// Returns `name` unchanged when nothing matches.
     pub fn canonical_name(&self, name: Ident, interner: &Interner) -> Ident {
-        if self.first_span.contains_key(&name) {
+        let text = interner.resolve(name);
+        if self.first_span.contains_key(&name) || is_extended_identifier(text) {
             return name;
         }
         self.vhdl_folded
-            .get(&interner.resolve(name).to_ascii_lowercase())
+            .get(&text.to_ascii_lowercase())
             .copied()
             .unwrap_or(name)
     }
@@ -273,13 +288,15 @@ impl<'a> ModuleRegistry<'a> {
     /// An exact match always wins. Because the VHDL reference is
     /// case-insensitive, it then matches any VHDL entity or a Verilog/SV
     /// module whose name differs only in case, provided exactly one such
-    /// Verilog/SV module exists. Returns `name` unchanged when nothing (or
-    /// more than one case-variant module) matches.
+    /// Verilog/SV module exists. An extended identifier (`\Top\`) is
+    /// case-sensitive and only ever matches exactly. Returns `name` unchanged
+    /// when nothing (or more than one case-variant module) matches.
     pub fn canonical_vhdl_name(&self, name: Ident, interner: &Interner) -> Ident {
-        if self.first_span.contains_key(&name) {
+        let text = interner.resolve(name);
+        if self.first_span.contains_key(&name) || is_extended_identifier(text) {
             return name;
         }
-        let folded = interner.resolve(name).to_ascii_lowercase();
+        let folded = text.to_ascii_lowercase();
         if let Some(&id) = self.vhdl_folded.get(&folded) {
             return id;
         }
@@ -287,6 +304,14 @@ impl<'a> ModuleRegistry<'a> {
             Some(Some(id)) => *id,
             _ => name,
         }
+    }
+
+    /// Returns `true` if `name` is registered as a VHDL entity.
+    ///
+    /// Used to decide whether named port/generic associations from a
+    /// Verilog/SV instance must be matched case-insensitively.
+    pub fn is_vhdl_entity(&self, name: Ident) -> bool {
+        self.vhdl.contains_key(&name)
     }
 
     /// Returns the source span of a module's declaration, if found.
@@ -546,5 +571,31 @@ mod tests {
         assert!(reg
             .lookup(reg.canonical_vhdl_name(mux, &interner))
             .is_none());
+    }
+
+    #[test]
+    fn extended_identifiers_are_never_folded() {
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let ext = interner.get_or_intern("\\Top\\");
+        let escaped = interner.get_or_intern("\\Esc ");
+        let v = [verilog_file(&[escaped])];
+        let vhdl = [vhdl_entity_file(ext)];
+        let reg = ModuleRegistry::from_parsed_design(&v, &[], &vhdl, &interner, &sink);
+
+        // Exact spelling still resolves.
+        assert_eq!(reg.canonical_name(ext, &interner), ext);
+        assert_eq!(reg.canonical_vhdl_name(ext, &interner), ext);
+        // `\TOP\` is a different, case-sensitive name in both canonicalizers.
+        let upper = interner.get_or_intern("\\TOP\\");
+        assert_eq!(reg.canonical_name(upper, &interner), upper);
+        assert_eq!(reg.canonical_vhdl_name(upper, &interner), upper);
+        // Basic `top` never binds to the extended entity either.
+        let basic = interner.get_or_intern("top");
+        assert_eq!(reg.canonical_name(basic, &interner), basic);
+        assert_eq!(reg.canonical_vhdl_name(basic, &interner), basic);
+        // An escaped Verilog name is not reachable by folding.
+        let esc_upper = interner.get_or_intern("\\ESC ");
+        assert_eq!(reg.canonical_vhdl_name(esc_upper, &interner), esc_upper);
     }
 }
