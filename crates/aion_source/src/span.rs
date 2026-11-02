@@ -34,14 +34,14 @@ impl Span {
     ///
     /// Takes the minimum start and maximum end of the two spans.
     ///
-    /// # Panics
-    ///
-    /// Panics if the two spans are from different files.
+    /// If the spans are in different files (which happens when a construct
+    /// starts in one file and ends in an `` `include ``d file or in macro
+    /// expansion text), there is no single range covering both, and `self`
+    /// is returned unchanged so the result is still a valid span.
     pub fn merge(self, other: Span) -> Span {
-        assert_eq!(
-            self.file, other.file,
-            "cannot merge spans from different files"
-        );
+        if self.file != other.file {
+            return self;
+        }
         Span {
             file: self.file,
             start: self.start.min(other.start),
@@ -94,6 +94,14 @@ mod tests {
         let a = Span::new(f, 5, 15);
         let b = Span::new(f, 10, 25);
         assert_eq!(a.merge(b), b.merge(a));
+    }
+
+    #[test]
+    fn merge_across_files_keeps_self() {
+        let a = Span::new(FileId::from_raw(0), 5, 15);
+        let b = Span::new(FileId::from_raw(1), 0, 2);
+        assert_eq!(a.merge(b), a);
+        assert_eq!(b.merge(a), b);
     }
 
     #[test]
