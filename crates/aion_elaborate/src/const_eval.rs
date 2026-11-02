@@ -58,8 +58,13 @@ pub(crate) fn parse_verilog_literal(text: &str) -> Option<i64> {
 ///
 /// For sized literals like `24'h000000`, returns `(Some(24), 0)`.
 /// For unsized literals like `42` or `'hFF`, returns `(None, value)`.
+/// Whitespace inside the token (`8 'h FF`, allowed by IEEE 1364-2005 §3.5.1)
+/// is ignored like underscores.
 pub(crate) fn parse_verilog_literal_with_width(text: &str) -> Option<(Option<u32>, i64)> {
-    let text = text.replace('_', "");
+    let text: String = text
+        .chars()
+        .filter(|c| *c != '_' && !c.is_whitespace())
+        .collect();
 
     if let Some(tick_pos) = text.find('\'') {
         // Extract the explicit width prefix (e.g., "24" from "24'h000000")
@@ -688,6 +693,28 @@ mod tests {
             parse_verilog_literal_with_width("8'h00"),
             Some((Some(8), 0))
         );
+    }
+
+    #[test]
+    fn parse_literal_with_width_ignores_lrm_whitespace() {
+        assert_eq!(
+            parse_verilog_literal_with_width("8 'hFF"),
+            Some((Some(8), 255))
+        );
+        assert_eq!(
+            parse_verilog_literal_with_width("8'h FF"),
+            Some((Some(8), 255))
+        );
+        assert_eq!(
+            parse_verilog_literal_with_width("4 'sb\n1010"),
+            Some((Some(4), 10))
+        );
+    }
+
+    #[test]
+    fn parse_literal_with_width_rejects_invalid_digits() {
+        assert_eq!(parse_verilog_literal_with_width("4'b102"), None);
+        assert_eq!(parse_verilog_literal_with_width("4'b"), None);
     }
 
     // ---- clog2 ----
