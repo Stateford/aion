@@ -277,6 +277,13 @@ impl Lexer<'_> {
         {
             self.pos += 1;
             self.eat_decimal_digits();
+            // Fixed-point time literal: `1.5ps` (no exponent allowed)
+            if self.eat_time_unit(false) {
+                return Token {
+                    kind: SvToken::TimeLiteral,
+                    span: self.span_from(start),
+                };
+            }
             self.eat_exponent();
             return Token {
                 kind: SvToken::RealLiteral,
@@ -295,10 +302,41 @@ impl Lexer<'_> {
             };
         }
 
+        // Integer time literal: `10ns`, `1s`, and the special `1step`
+        let is_one = &self.source[start..self.pos] == b"1";
+        if self.eat_time_unit(is_one) {
+            return Token {
+                kind: SvToken::TimeLiteral,
+                span: self.span_from(start),
+            };
+        }
+
         Token {
             kind: SvToken::IntLiteral,
             span: self.span_from(start),
         }
+    }
+
+    /// Consumes a time unit written directly after a number, turning the
+    /// number into a time literal (IEEE 1800-2017 5.8).
+    ///
+    /// Recognizes `s`, `ms`, `us`, `ns`, `ps`, `fs`, and, when `allow_step` is
+    /// set (the number was exactly `1`), `step`. The unit must not continue
+    /// as an identifier: `10nsx` stays an integer followed by `nsx`. Returns
+    /// `true` if a unit was consumed.
+    fn eat_time_unit(&mut self, allow_step: bool) -> bool {
+        const UNITS: [&[u8]; 6] = [b"ms", b"us", b"ns", b"ps", b"fs", b"s"];
+        let rest = &self.source[self.pos..];
+        let step: &[u8] = b"step";
+        let candidates = UNITS.iter().copied().chain(allow_step.then_some(step));
+        for unit in candidates {
+            let ends_word = rest.get(unit.len()).is_none_or(|&c| !is_ident_char(c));
+            if rest.starts_with(unit) && ends_word {
+                self.pos += unit.len();
+                return true;
+            }
+        }
+        false
     }
 
     /// Lex an unsized based literal starting with tick: `'b1010`, `'hFF`, `'sb1010`
@@ -794,6 +832,45 @@ mod tests {
                 SvToken::RealLiteral,
                 SvToken::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn time_literals() {
+        let tokens = lex_tokens("10ns 1.5ps 100fs 1s 2ms 3us 1step 1_000ps");
+        let k = kinds(&tokens);
+        assert_eq!(k.len(), 9);
+        assert!(k[..8].iter().all(|&t| t == SvToken::TimeLiteral), "{k:?}");
+        assert_eq!(k[8], SvToken::Eof);
+        assert_eq!(tokens[1].span.start, 5);
+        assert_eq!(tokens[1].span.end, 10);
+    }
+
+    #[test]
+    fn time_unit_must_end_the_word() {
+        // `10nsx` is not a time literal; `2step` is not `1step`; a space
+        // separates a number from an identifier.
+        let tokens = lex_tokens("10nsx 2step 10 ns");
+        assert_eq!(
+            kinds(&tokens),
+            vec![
+                SvToken::IntLiteral,
+                SvToken::Identifier,
+                SvToken::IntLiteral,
+                SvToken::Identifier,
+                SvToken::IntLiteral,
+                SvToken::Identifier,
+                SvToken::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn real_with_exponent_is_not_time_literal() {
+        let tokens = lex_tokens("1.0e3ns");
+        assert_eq!(
+            kinds(&tokens),
+            vec![SvToken::RealLiteral, SvToken::Identifier, SvToken::Eof]
         );
     }
 

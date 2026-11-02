@@ -22,7 +22,7 @@ use crate::expr::{
 /// Default timescale: 1 time unit = 1 ns = 1,000,000 fs.
 ///
 /// Applied to delay literal values when no explicit `timescale is specified.
-const DEFAULT_TIMESCALE_FS: u64 = 1_000_000;
+pub(crate) const DEFAULT_TIMESCALE_FS: u64 = 1_000_000;
 
 /// Lowers a Verilog AST statement to an IR statement.
 pub fn lower_verilog_stmt(
@@ -36,9 +36,18 @@ pub fn lower_verilog_stmt(
     match stmt {
         Statement::Blocking {
             target,
+            timing,
             value,
             span,
         } => {
+            // The IR has no delayed assignment: lower as zero-delay and say so.
+            if let Some(t) = timing {
+                sink.emit(errors::warn_intra_assignment_timing_ignored(
+                    matches!(t, aion_verilog_parser::ast::TimingControl::Delay(_)),
+                    false,
+                    t.span(),
+                ));
+            }
             let tgt = lower_to_signal_ref(target, sig_env, source_db, interner, sink);
             let val = lower_verilog_expr(value, sig_env, source_db, interner, sink);
             IrStmt::Assign {
@@ -50,9 +59,18 @@ pub fn lower_verilog_stmt(
         }
         Statement::NonBlocking {
             target,
+            timing,
             value,
             span,
         } => {
+            // The IR has no delayed assignment: lower as zero-delay and say so.
+            if let Some(t) = timing {
+                sink.emit(errors::warn_intra_assignment_timing_ignored(
+                    matches!(t, aion_verilog_parser::ast::TimingControl::Delay(_)),
+                    true,
+                    t.span(),
+                ));
+            }
             let tgt = lower_to_signal_ref(target, sig_env, source_db, interner, sink);
             let val = lower_verilog_expr(value, sig_env, source_db, interner, sink);
             IrStmt::Assign {
@@ -357,9 +375,18 @@ pub fn lower_sv_stmt(
     match stmt {
         Statement::Blocking {
             target,
+            timing,
             value,
             span,
         } => {
+            // The IR has no delayed assignment: lower as zero-delay and say so.
+            if let Some(t) = timing {
+                sink.emit(errors::warn_intra_assignment_timing_ignored(
+                    matches!(t, aion_sv_parser::ast::TimingControl::Delay(_)),
+                    false,
+                    t.span(),
+                ));
+            }
             let tgt = lower_sv_to_signal_ref(target, sig_env, source_db, interner, sink);
             let val = lower_sv_expr(value, sig_env, source_db, interner, sink);
             IrStmt::Assign {
@@ -371,9 +398,18 @@ pub fn lower_sv_stmt(
         }
         Statement::NonBlocking {
             target,
+            timing,
             value,
             span,
         } => {
+            // The IR has no delayed assignment: lower as zero-delay and say so.
+            if let Some(t) = timing {
+                sink.emit(errors::warn_intra_assignment_timing_ignored(
+                    matches!(t, aion_sv_parser::ast::TimingControl::Delay(_)),
+                    true,
+                    t.span(),
+                ));
+            }
             let tgt = lower_sv_to_signal_ref(target, sig_env, source_db, interner, sink);
             let val = lower_sv_expr(value, sig_env, source_db, interner, sink);
             IrStmt::Assign {
@@ -857,6 +893,14 @@ fn eval_delay_expr_sv(
     interner: &Interner,
     sink: &DiagnosticSink,
 ) -> u64 {
+    // A time literal (`#10ns`, `#(1.5ps)`) carries its own unit.
+    let mut inner = expr;
+    while let aion_sv_parser::ast::Expr::Paren { inner: i, .. } = inner {
+        inner = i;
+    }
+    if let aion_sv_parser::ast::Expr::TimeLiteral { span } = inner {
+        return time_literal_delay_fs(*span, source_db, sink);
+    }
     let env = crate::const_eval::ConstEnv::default();
     if let Some(val) = const_eval::eval_sv_expr(expr, source_db, interner, &env, sink) {
         if let Some(v) = const_eval::const_to_i64(&val) {
@@ -864,6 +908,49 @@ fn eval_delay_expr_sv(
         }
     }
     0
+}
+
+/// Converts a SystemVerilog time literal used as a delay to femtoseconds.
+///
+/// A literal with a unit is absolute, so `#10ns` is 10,000,000 fs whatever
+/// the time unit; only rounding to the time precision depends on the
+/// timescale, which the elaborator does not know. The IR resolution (1 fs) is
+/// used as the precision: a literal finer than that is rounded with a W207
+/// warning, and `1step` (one precision unit) becomes 1 fs with a W207
+/// warning. A literal too large for 64-bit femtoseconds is an E209 error and
+/// lowers to 0.
+fn time_literal_delay_fs(
+    span: aion_source::Span,
+    source_db: &SourceDb,
+    sink: &DiagnosticSink,
+) -> u64 {
+    let text = source_db.snippet(span);
+    match const_eval::parse_time_literal(text) {
+        Some(const_eval::TimeLiteralValue::Fs { fs, exact: true }) => fs,
+        Some(const_eval::TimeLiteralValue::Fs { fs, exact: false }) => {
+            sink.emit(errors::warn_time_literal_assumed(
+                text,
+                &format!("rounded to {fs} fs, the finest time step Aion represents"),
+                span,
+            ));
+            fs
+        }
+        Some(const_eval::TimeLiteralValue::Step) => {
+            sink.emit(errors::warn_time_literal_assumed(
+                text,
+                "`1step` is one unit of the time precision, which is unknown; assumed 1 fs",
+                span,
+            ));
+            1
+        }
+        None => {
+            sink.emit(errors::error_param_not_const(
+                &format!("time literal `{text}` is out of range"),
+                span,
+            ));
+            0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -896,6 +983,7 @@ mod tests {
                 name: a,
                 span: Span::DUMMY,
             },
+            timing: None,
             value: aion_verilog_parser::ast::Expr::Identifier {
                 name: b,
                 span: Span::DUMMY,
@@ -1302,6 +1390,7 @@ mod tests {
         env.insert(b, SignalId::from_raw(1));
         let stmt = aion_verilog_parser::ast::Statement::NonBlocking {
             target: v_ident(a),
+            timing: None,
             value: v_ident(b),
             span: Span::DUMMY,
         };
@@ -1318,11 +1407,13 @@ mod tests {
         env.insert(b, SignalId::from_raw(1));
         let blocking = aion_sv_parser::ast::Statement::Blocking {
             target: sv_ident(a),
+            timing: None,
             value: sv_ident(b),
             span: Span::DUMMY,
         };
         let nonblocking = aion_sv_parser::ast::Statement::NonBlocking {
             target: sv_ident(a),
+            timing: None,
             value: sv_ident(b),
             span: Span::DUMMY,
         };

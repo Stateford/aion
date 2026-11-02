@@ -527,6 +527,78 @@ pub fn eval_sv_range(
     Some((msb, lsb))
 }
 
+/// The value of a SystemVerilog time literal (`10ns`, `1.5ps`, `1step`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeLiteralValue {
+    /// A number with a time unit, converted to femtoseconds.
+    Fs {
+        /// The duration in femtoseconds, rounded half-up to a whole number.
+        fs: u64,
+        /// `false` if rounding to a whole femtosecond changed the value.
+        exact: bool,
+    },
+    /// `1step`: one unit of the time precision, which depends on the
+    /// timescale in effect.
+    Step,
+}
+
+/// Parses the text of a SystemVerilog time literal into femtoseconds.
+///
+/// Accepts an unsigned integer or fixed-point number (underscores allowed)
+/// immediately followed by `s`, `ms`, `us`, `ns`, `ps`, or `fs`, and the
+/// special literal `1step`. The conversion is exact integer arithmetic: a
+/// time literal is an absolute duration, independent of the time unit.
+/// Returns `None` for malformed text or a value that does not fit in a `u64`
+/// number of femtoseconds.
+pub fn parse_time_literal(text: &str) -> Option<TimeLiteralValue> {
+    let clean: String = text.chars().filter(|&c| c != '_').collect();
+    if clean == "1step" {
+        return Some(TimeLiteralValue::Step);
+    }
+    let unit_at = clean.find(|c: char| c.is_ascii_alphabetic())?;
+    let (number, unit) = clean.split_at(unit_at);
+    let fs_per_unit: u128 = match unit {
+        "s" => 1_000_000_000_000_000,
+        "ms" => 1_000_000_000_000,
+        "us" => 1_000_000_000,
+        "ns" => 1_000_000,
+        "ps" => 1_000,
+        "fs" => 1,
+        _ => return None,
+    };
+    let (int_part, frac_part) = match number.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (number, ""),
+    };
+    if int_part.is_empty()
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    // Digits beyond 10^-15 s are below 1 fs for every unit: keep enough to
+    // round correctly and note whether anything non-zero was cut off.
+    let kept = frac_part.len().min(18);
+    let cut_nonzero = frac_part[kept..].bytes().any(|b| b != b'0');
+    let int_val: u128 = int_part.parse().ok()?;
+    let frac_val: u128 = if kept == 0 {
+        0
+    } else {
+        frac_part[..kept].parse().ok()?
+    };
+    let scale = 10u128.pow(kept as u32);
+    let whole = int_val.checked_mul(fs_per_unit)?;
+    let frac_scaled = frac_val * fs_per_unit;
+    let frac_fs = frac_scaled / scale;
+    let rem = frac_scaled % scale;
+    let round_up = u128::from(rem * 2 >= scale && rem != 0);
+    let fs = u64::try_from(whole.checked_add(frac_fs + round_up)?).ok()?;
+    Some(TimeLiteralValue::Fs {
+        fs,
+        exact: rem == 0 && !cut_nonzero,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,6 +894,58 @@ mod tests {
         assert!(result.is_none());
         assert!(sink.has_errors());
         assert_eq!(sink.error_count(), 1);
+    }
+
+    // ---- parse_time_literal ----
+
+    #[test]
+    fn time_literal_units() {
+        let fs = |t: &str| match parse_time_literal(t) {
+            Some(TimeLiteralValue::Fs { fs, exact: true }) => fs,
+            other => panic!("{t}: {other:?}"),
+        };
+        assert_eq!(fs("10ns"), 10_000_000);
+        assert_eq!(fs("1.5ps"), 1_500);
+        assert_eq!(fs("100fs"), 100);
+        assert_eq!(fs("1s"), 1_000_000_000_000_000);
+        assert_eq!(fs("2ms"), 2_000_000_000_000);
+        assert_eq!(fs("3us"), 3_000_000_000);
+        assert_eq!(fs("1_000ps"), 1_000_000);
+        assert_eq!(fs("0.25ns"), 250_000);
+        assert_eq!(parse_time_literal("1step"), Some(TimeLiteralValue::Step));
+    }
+
+    #[test]
+    fn time_literal_rounding_and_errors() {
+        assert_eq!(
+            parse_time_literal("1.5fs"),
+            Some(TimeLiteralValue::Fs {
+                fs: 2,
+                exact: false
+            })
+        );
+        assert_eq!(
+            parse_time_literal("1.2fs"),
+            Some(TimeLiteralValue::Fs {
+                fs: 1,
+                exact: false
+            })
+        );
+        // Far too many fractional digits still parse and round.
+        assert_eq!(
+            parse_time_literal("1.0000000000000000000001ns"),
+            Some(TimeLiteralValue::Fs {
+                fs: 1_000_000,
+                exact: false
+            })
+        );
+        // Out of range for u64 femtoseconds (~18,446 s).
+        assert_eq!(parse_time_literal("20000s"), None);
+        // Malformed.
+        assert_eq!(parse_time_literal("10"), None);
+        assert_eq!(parse_time_literal("10xs"), None);
+        assert_eq!(parse_time_literal("2step"), None);
+        assert_eq!(parse_time_literal(".5ns"), None);
     }
 
     // ---- eval_sv_expr ----

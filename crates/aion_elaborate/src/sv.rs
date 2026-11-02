@@ -108,9 +108,22 @@ fn apply_sv_params(
 ) {
     let override_map: HashMap<_, _> = overrides.iter().cloned().collect();
 
-    for param in &decl.params {
+    // Header (`#(...)`) parameters first, then body `parameter`/`localparam`
+    // declarations in source order, so a later one can use an earlier one
+    // (`localparam A = 1, B = A + 1;`). A body `parameter` can be overridden
+    // only when the module has no parameter port list; otherwise it acts as a
+    // `localparam` (IEEE 1364-2005 12.2, IEEE 1800-2017 6.20.1).
+    let header = decl.params.iter().map(|p| (p, true));
+    let body = decl.items.iter().filter_map(|item| match item {
+        sv_ast::ModuleItem::ParameterDecl(p) | sv_ast::ModuleItem::LocalparamDecl(p) => {
+            Some((p, !p.local && decl.params.is_empty()))
+        }
+        _ => None,
+    });
+
+    for (param, overridable) in header.chain(body) {
         let name = param.name;
-        let value = if let Some(ov) = override_map.get(&name) {
+        let value = if let Some(ov) = override_map.get(&name).filter(|_| overridable) {
             ov.clone()
         } else if let Some(ref value) = param.value {
             const_eval::eval_sv_expr(value, ctx.source_db, ctx.interner, const_env, ctx.sink)
@@ -192,6 +205,9 @@ fn elaborate_sv_item(
 ) {
     match item {
         sv_ast::ModuleItem::NetDecl(net) => {
+            if let Some(delay) = &net.delay {
+                crate::verilog::warn_net_delay(ctx, "net declaration", delay.span);
+            }
             let ty = types::resolve_sv_range(
                 net.range.as_ref(),
                 net.signed,
@@ -294,6 +310,9 @@ fn elaborate_sv_item(
         sv_ast::ModuleItem::ParameterDecl(_) | sv_ast::ModuleItem::LocalparamDecl(_) => {}
         sv_ast::ModuleItem::PortDecl(_) => {}
         sv_ast::ModuleItem::ContinuousAssign(ca) => {
+            if let Some(delay) = &ca.delay {
+                crate::verilog::warn_net_delay(ctx, "continuous assignment", delay.span);
+            }
             let target =
                 lower_sv_to_signal_ref(&ca.target, sig_env, ctx.source_db, ctx.interner, ctx.sink);
             let value = lower_sv_expr(&ca.value, sig_env, ctx.source_db, ctx.interner, ctx.sink);

@@ -82,9 +82,7 @@ impl VerilogParser<'_> {
         if label.is_some() {
             while !self.at(VerilogToken::End) && !self.at_eof() {
                 if self.is_at_declaration_start() {
-                    if let Some(item) = self.parse_module_item_inner() {
-                        decls.push(item);
-                    }
+                    decls.extend(self.parse_module_item());
                 } else {
                     break;
                 }
@@ -250,6 +248,7 @@ impl VerilogParser<'_> {
         let span = start.merge(self.prev_span());
         Statement::Blocking {
             target,
+            timing: None,
             value,
             span,
         }
@@ -264,6 +263,7 @@ impl VerilogParser<'_> {
         let span = start.merge(self.prev_span());
         Statement::Blocking {
             target,
+            timing: None,
             value,
             span,
         }
@@ -336,35 +336,52 @@ impl VerilogParser<'_> {
         }
     }
 
-    /// Parses an event control: `@(sensitivity_list) stmt` or `@* stmt`.
+    /// Parses an event control: `@(sensitivity_list) stmt`, `@* stmt`, or
+    /// `@name stmt`.
     fn parse_event_control(&mut self) -> Statement {
         let start = self.current_span();
+        let sensitivity = self.parse_event_expression();
+        let body = self.parse_statement();
+        let span = start.merge(self.prev_span());
+
+        Statement::EventControl {
+            sensitivity,
+            body: Box::new(body),
+            span,
+        }
+    }
+
+    /// Parses the `@...` part of an event control and returns the events it
+    /// waits for: `@*`, `@(*)`, `@(a or posedge b, c)`, or `@name`.
+    fn parse_event_expression(&mut self) -> SensitivityList {
         self.expect(VerilogToken::At);
 
         // @* shorthand
         if self.eat(VerilogToken::Star) {
-            let body = self.parse_statement();
-            let span = start.merge(self.prev_span());
-            return Statement::EventControl {
-                sensitivity: SensitivityList::Star,
-                body: Box::new(body),
-                span,
-            };
+            return SensitivityList::Star;
+        }
+
+        // @name: a single named event or signal, without parentheses
+        if matches!(
+            self.current(),
+            VerilogToken::Identifier | VerilogToken::EscapedIdentifier
+        ) {
+            let start = self.current_span();
+            let name = self.expect_ident();
+            let signal = Expr::Identifier { name, span: start };
+            return SensitivityList::List(vec![SensitivityItem {
+                edge: None,
+                signal,
+                span: start,
+            }]);
         }
 
         self.expect(VerilogToken::LeftParen);
 
         // @(*)
-        if self.at(VerilogToken::Star) {
-            self.advance();
+        if self.eat(VerilogToken::Star) {
             self.expect(VerilogToken::RightParen);
-            let body = self.parse_statement();
-            let span = start.merge(self.prev_span());
-            return Statement::EventControl {
-                sensitivity: SensitivityList::Star,
-                body: Box::new(body),
-                span,
-            };
+            return SensitivityList::Star;
         }
 
         // Parse sensitivity items
@@ -375,15 +392,7 @@ impl VerilogParser<'_> {
         }
 
         self.expect(VerilogToken::RightParen);
-
-        let body = self.parse_statement();
-        let span = start.merge(self.prev_span());
-
-        Statement::EventControl {
-            sensitivity: SensitivityList::List(items),
-            body: Box::new(body),
-            span,
-        }
+        SensitivityList::List(items)
     }
 
     /// Parses a single sensitivity list item.
@@ -412,6 +421,64 @@ impl VerilogParser<'_> {
             delay,
             body: Box::new(body),
             span,
+        }
+    }
+
+    /// Parses a `#` delay: `#value`, `#(value)`, or `#(v1, v2[, v3])`.
+    ///
+    /// `max_values` is how many comma-separated values the context allows:
+    /// 1 for procedural intra-assignment delays, 3 (rise, fall, turn-off) for
+    /// nets, continuous assignments, and gates. Extra values are reported as
+    /// an error and dropped. A bare value is a number or a single identifier
+    /// (IEEE 1364-2005 `delay_value`), so `and #d (y, a, b)` does not read
+    /// `d(y, a, b)` as a call.
+    pub(crate) fn parse_delay(&mut self, max_values: usize) -> Delay {
+        let start = self.current_span();
+        self.expect(VerilogToken::Hash);
+        let mut values = Vec::new();
+        if self.eat(VerilogToken::LeftParen) {
+            values.push(self.parse_expr());
+            while self.at(VerilogToken::Comma) {
+                if values.len() == max_values {
+                    if max_values == 1 {
+                        self.error("this delay takes a single value");
+                    } else {
+                        self.error("a delay takes at most 3 values (rise, fall, turn-off)");
+                    }
+                }
+                self.advance();
+                let value = self.parse_expr();
+                if values.len() < max_values {
+                    values.push(value);
+                }
+            }
+            self.expect(VerilogToken::RightParen);
+        } else if matches!(
+            self.current(),
+            VerilogToken::Identifier | VerilogToken::EscapedIdentifier
+        ) {
+            let span = self.current_span();
+            let name = self.expect_ident();
+            values.push(Expr::Identifier { name, span });
+        } else {
+            values.push(self.parse_expr_bp(23));
+        }
+        let span = start.merge(self.prev_span());
+        Delay { values, span }
+    }
+
+    /// Parses an optional intra-assignment timing control right after `=` or
+    /// `<=`: `#5`, `#(5)`, `@(posedge clk)`, `@*`, or `@name`.
+    fn parse_intra_assignment_timing(&mut self) -> Option<TimingControl> {
+        match self.current() {
+            VerilogToken::Hash => Some(TimingControl::Delay(self.parse_delay(1))),
+            VerilogToken::At => {
+                let start = self.current_span();
+                let sensitivity = self.parse_event_expression();
+                let span = start.merge(self.prev_span());
+                Some(TimingControl::Event { sensitivity, span })
+            }
+            _ => None,
         }
     }
 
@@ -457,22 +524,26 @@ impl VerilogParser<'_> {
         match self.current() {
             VerilogToken::Equals => {
                 self.advance();
+                let timing = self.parse_intra_assignment_timing();
                 let value = self.parse_expr();
                 self.expect(VerilogToken::Semicolon);
                 let span = start.merge(self.prev_span());
                 Statement::Blocking {
                     target,
+                    timing,
                     value,
                     span,
                 }
             }
             VerilogToken::LessEquals => {
                 self.advance();
+                let timing = self.parse_intra_assignment_timing();
                 let value = self.parse_expr();
                 self.expect(VerilogToken::Semicolon);
                 let span = start.merge(self.prev_span());
                 Statement::NonBlocking {
                     target,
+                    timing,
                     value,
                     span,
                 }
@@ -867,5 +938,104 @@ mod tests {
             },
             _ => panic!("expected event control"),
         }
+    }
+
+    // ---- PAR-21: intra-assignment timing controls ----
+
+    /// Returns the statements of the first `initial` block, unwrapping a
+    /// `begin ... end` body.
+    fn initial_stmts(items: &[ModuleItem]) -> Vec<Statement> {
+        for item in items {
+            if let ModuleItem::InitialBlock(ib) = item {
+                return match &ib.body {
+                    Statement::Block { stmts, .. } => stmts.clone(),
+                    other => vec![other.clone()],
+                };
+            }
+        }
+        panic!("no initial block found");
+    }
+
+    fn timing_of(stmt: &Statement) -> Option<&TimingControl> {
+        match stmt {
+            Statement::Blocking { timing, .. } | Statement::NonBlocking { timing, .. } => {
+                timing.as_ref()
+            }
+            other => panic!("expected assignment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intra_assignment_delays() {
+        let items = parse_module_items("initial begin q <= #1 d; a = #5 b; c = #(2) e; f = g; end");
+        let stmts = initial_stmts(&items);
+        assert!(matches!(stmts[0], Statement::NonBlocking { .. }));
+        assert!(matches!(stmts[1], Statement::Blocking { .. }));
+        for s in &stmts[..3] {
+            match timing_of(s) {
+                Some(TimingControl::Delay(d)) => assert_eq!(d.values.len(), 1),
+                other => panic!("expected delay, got {other:?}"),
+            }
+        }
+        assert!(timing_of(&stmts[3]).is_none());
+        // The value is the expression after the delay, not the delay itself.
+        match &stmts[0] {
+            Statement::NonBlocking {
+                value: Expr::Identifier { .. },
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn intra_assignment_event_controls() {
+        let items = parse_module_items(
+            "initial begin a = @(posedge clk) b; q <= @(negedge clk or rst) d; c = @* e; f = @ev g; end",
+        );
+        let stmts = initial_stmts(&items);
+        let sens: Vec<_> = stmts
+            .iter()
+            .map(|s| match timing_of(s) {
+                Some(TimingControl::Event { sensitivity, .. }) => sensitivity.clone(),
+                other => panic!("expected event control, got {other:?}"),
+            })
+            .collect();
+        match &sens[0] {
+            SensitivityList::List(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].edge, Some(EdgeKind::Posedge));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(&sens[1], SensitivityList::List(items) if items.len() == 2));
+        assert!(matches!(sens[2], SensitivityList::Star));
+        assert!(matches!(&sens[3], SensitivityList::List(items) if items.len() == 1));
+    }
+
+    #[test]
+    fn event_control_statement_with_bare_name() {
+        let items = parse_module_items("initial @ev x = 1;");
+        let stmts = initial_stmts(&items);
+        assert!(matches!(
+            &stmts[0],
+            Statement::EventControl {
+                sensitivity: SensitivityList::List(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn intra_assignment_delay_rejects_value_list() {
+        let full = "module test; initial a = #(1, 2) b; endmodule";
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let tokens = lexer::lex(full, file, &sink);
+        let _ = VerilogParser::new(tokens, full, file, &interner, &sink).parse_source_file();
+        let diags = sink.take_all();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("single value"));
     }
 }

@@ -988,4 +988,291 @@ mod tests {
         let proc = top.processes.iter().next().unwrap().1;
         assert!(matches!(proc.kind, ProcessKind::Combinational));
     }
+
+    // ---- PAR-1: every parameter of a list is elaborated ----
+    use aion_ir::ConstValue;
+    // ---- PAR-21 / SV time literals: timing controls ----
+
+    /// Parses and elaborates `src` with top `top`, returning the design, the
+    /// interner, and every diagnostic as `(code, span text)`.
+    fn elaborate_src(
+        file_name: &str,
+        src: &str,
+        top: &str,
+    ) -> (
+        Design,
+        Interner,
+        Vec<(aion_diagnostics::DiagnosticCode, String)>,
+    ) {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source(file_name, src.to_string());
+        let mut parsed = ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![],
+        };
+        if file_name.ends_with(".sv") {
+            parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else {
+            parsed.verilog_files.push(aion_verilog_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        }
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        let design = elaborate(&parsed, &make_config(top), &source_db, &interner, &sink).unwrap();
+        let diags = sink
+            .diagnostics()
+            .into_iter()
+            .map(|d| (d.code, source_db.snippet(d.primary_span).to_string()))
+            .collect();
+        (design, interner, diags)
+    }
+
+    fn errors_of(diags: &[(aion_diagnostics::DiagnosticCode, String)]) -> Vec<String> {
+        diags
+            .iter()
+            .filter(|(c, _)| c.category == aion_diagnostics::Category::Error)
+            .map(|(c, s)| format!("{c}: {s}"))
+            .collect()
+    }
+
+    fn spans_with(
+        diags: &[(aion_diagnostics::DiagnosticCode, String)],
+        code: aion_diagnostics::DiagnosticCode,
+    ) -> Vec<String> {
+        diags
+            .iter()
+            .filter(|(c, _)| *c == code)
+            .map(|(_, s)| s.clone())
+            .collect()
+    }
+
+    fn module_named<'a>(
+        design: &'a Design,
+        interner: &Interner,
+        name: &str,
+    ) -> &'a aion_ir::Module {
+        design
+            .modules
+            .iter()
+            .map(|(_, m)| m)
+            .find(|m| interner.resolve(m.name) == name)
+            .unwrap_or_else(|| panic!("no module `{name}`"))
+    }
+
+    fn params_of(m: &aion_ir::Module, interner: &Interner) -> Vec<(String, ConstValue)> {
+        m.params
+            .iter()
+            .map(|p| (interner.resolve(p.name).to_string(), p.value.clone()))
+            .collect()
+    }
+
+    fn signal_width(design: &Design, m: &aion_ir::Module, interner: &Interner, name: &str) -> u32 {
+        let (_, sig) = m
+            .signals
+            .iter()
+            .find(|(_, s)| interner.resolve(s.name) == name)
+            .unwrap_or_else(|| panic!("no signal `{name}`"));
+        design.types.bit_width(sig.ty).expect("sized type")
+    }
+
+    #[test]
+    fn verilog_localparam_list_every_name_is_usable() {
+        let src =
+            "module top; localparam A = 1, B = 2, C = 4; wire [C-1:0] w; wire [A+B:0] v; endmodule";
+        let (design, interner, diags) = elaborate_src("top.v", src, "top");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let top = design.top_module();
+        assert_eq!(
+            params_of(top, &interner),
+            vec![
+                ("A".to_string(), ConstValue::Int(1)),
+                ("B".to_string(), ConstValue::Int(2)),
+                ("C".to_string(), ConstValue::Int(4)),
+            ]
+        );
+        assert_eq!(signal_width(&design, top, &interner, "w"), 4);
+        assert_eq!(signal_width(&design, top, &interner, "v"), 4);
+    }
+
+    #[test]
+    fn sv_localparam_list_every_name_is_usable() {
+        let src = "module top; localparam int A = 1, B = A + 1, C = 4; logic [C-1:0] w; logic [B:0] v; endmodule";
+        let (design, interner, diags) = elaborate_src("top.sv", src, "top");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let top = design.top_module();
+        let names: Vec<_> = params_of(top, &interner).into_iter().collect();
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[1], ("B".to_string(), ConstValue::Int(2)));
+        assert_eq!(signal_width(&design, top, &interner, "w"), 4);
+        assert_eq!(signal_width(&design, top, &interner, "v"), 3);
+    }
+
+    #[test]
+    fn verilog_body_parameter_override_rules() {
+        // Without a `#(...)` list, a body `parameter` is overridable and later
+        // names see the override; with one, a body `parameter` is local.
+        let src = "module child; parameter W = 2, X = W + 1; wire [X-1:0] o; endmodule
+            module child2 #(parameter P = 1) (); parameter Q = 2; endmodule
+            module top; child #(.W(8)) u1(); child2 #(.P(3), .Q(5)) u2(); endmodule";
+        let (design, interner, diags) = elaborate_src("top.v", src, "top");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let child = module_named(&design, &interner, "child");
+        assert_eq!(
+            params_of(child, &interner),
+            vec![
+                ("W".to_string(), ConstValue::Int(8)),
+                ("X".to_string(), ConstValue::Int(9)),
+            ]
+        );
+        assert_eq!(signal_width(&design, child, &interner, "o"), 9);
+        let child2 = module_named(&design, &interner, "child2");
+        assert_eq!(
+            params_of(child2, &interner),
+            vec![
+                ("P".to_string(), ConstValue::Int(3)),
+                ("Q".to_string(), ConstValue::Int(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn verilog_bad_body_parameter_still_reports_e209() {
+        let (_, _, diags) = elaborate_src(
+            "top.v",
+            "module top; localparam A = 1, B = NOPE; endmodule",
+            "top",
+        );
+        assert_eq!(spans_with(&diags, errors::E209), vec!["NOPE".to_string()]);
+    }
+
+    /// Collects the kind of every `Assign` in `stmt`, in order.
+    fn assign_kinds(stmt: &aion_ir::Statement, out: &mut Vec<aion_ir::stmt::AssignKind>) {
+        match stmt {
+            aion_ir::Statement::Assign { kind, .. } => out.push(*kind),
+            aion_ir::Statement::Block { stmts, .. } => {
+                stmts.iter().for_each(|s| assign_kinds(s, out))
+            }
+            aion_ir::Statement::Delay { body, .. } => assign_kinds(body, out),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn w205_intra_assignment_timing_is_reported_and_lowered() {
+        use aion_ir::stmt::AssignKind;
+        for (file, decl) in [
+            ("tb.v", "reg q, d, a, b, clk;"),
+            ("tb.sv", "logic q, d, a, b, clk;"),
+        ] {
+            let src = format!(
+                "module tb; {decl} initial begin q <= #1 d; a = @(posedge clk) b; q <= d; end endmodule"
+            );
+            let (procs, spans) = elaborate_tb(file, &src, errors::W205);
+            assert_eq!(spans, vec!["#1", "@(posedge clk)"], "{file}");
+            let mut kinds = Vec::new();
+            assign_kinds(&procs[0].body, &mut kinds);
+            assert_eq!(
+                kinds,
+                vec![
+                    AssignKind::NonBlocking,
+                    AssignKind::Blocking,
+                    AssignKind::NonBlocking
+                ],
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn w205_silent_without_intra_assignment_timing() {
+        let (_, spans) = elaborate_tb(
+            "tb.v",
+            "module tb; reg q, d; initial begin #1 q <= d; q = d; end endmodule",
+            errors::W205,
+        );
+        assert!(spans.is_empty(), "{spans:?}");
+    }
+
+    #[test]
+    fn w206_net_and_assign_delays_are_reported() {
+        for (file, decl) in [("top.v", "reg a;"), ("top.sv", "logic a;")] {
+            let src = format!(
+                "module top; {decl} wire #1 w; wire y; wire z; assign #(2, 3) y = a; assign z = a; endmodule"
+            );
+            let (design, _, diags) = elaborate_src(file, &src, "top");
+            assert!(errors_of(&diags).is_empty(), "{diags:?}");
+            assert_eq!(
+                spans_with(&diags, errors::W206),
+                vec!["#1", "#(2, 3)"],
+                "{file}"
+            );
+            // Both continuous assignments are still elaborated.
+            assert_eq!(design.top_module().assignments.len(), 2, "{file}");
+        }
+    }
+
+    /// Collects every `Delay` duration in `stmt`, in order.
+    fn delays_fs(stmt: &aion_ir::Statement, out: &mut Vec<u64>) {
+        match stmt {
+            aion_ir::Statement::Delay {
+                duration_fs, body, ..
+            } => {
+                out.push(*duration_fs);
+                delays_fs(body, out);
+            }
+            aion_ir::Statement::Block { stmts, .. } => stmts.iter().for_each(|s| delays_fs(s, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn sv_time_literal_delays_convert_to_femtoseconds() {
+        let src = "module tb; logic x; initial begin #10ns x = 1; #(1.5ps) x = 0; #2us x = 1; \
+                   #1step x = 0; #3 x = 1; end endmodule";
+        let (procs, spans) = elaborate_tb("tb.sv", src, errors::W207);
+        let mut fs = Vec::new();
+        delays_fs(&procs[0].body, &mut fs);
+        assert_eq!(fs, vec![10_000_000, 1_500, 2_000_000_000, 1, 3_000_000]);
+        // Only `1step` depends on the unknown precision.
+        assert_eq!(spans, vec!["1step"]);
+    }
+
+    #[test]
+    fn sv_time_literal_out_of_range_is_e209() {
+        let (_, spans) = elaborate_tb(
+            "tb.sv",
+            "module tb; logic x; initial #20000s x = 1; endmodule",
+            errors::E209,
+        );
+        assert_eq!(spans, vec!["20000s"]);
+    }
+
+    #[test]
+    fn sv_time_literal_value_counts_assumed_ns_units() {
+        let src = "module tb; logic [63:0] t; initial begin t = 5ns; t = 100ps; end endmodule";
+        let (procs, spans) = elaborate_tb("tb.sv", src, errors::W207);
+        assert_eq!(spans, vec!["100ps"]);
+        let aion_ir::Statement::Block { stmts, .. } = &procs[0].body else {
+            panic!("expected block, got {:?}", procs[0].body);
+        };
+        let values: Vec<u64> = stmts
+            .iter()
+            .map(|s| match s {
+                aion_ir::Statement::Assign {
+                    value: aion_ir::Expr::Literal(lv),
+                    ..
+                } => (0..lv.width())
+                    .filter(|&i| lv.get(i) == aion_common::Logic::One)
+                    .map(|i| 1u64 << i)
+                    .sum(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(values, vec![5, 0]);
+    }
 }

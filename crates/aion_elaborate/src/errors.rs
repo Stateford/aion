@@ -1,10 +1,10 @@
 //! Diagnostic codes and helper functions for elaboration errors and warnings.
 //!
 //! Error codes `E200`--`E211` cover elaboration failures (unknown modules,
-//! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W204`
+//! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W207`
 //! cover non-fatal issues (width mismatches, unconnected ports, `forever`
 //! loops and `always` blocks with no timing control, VHDL defaults that
-//! cannot be evaluated).
+//! cannot be evaluated, ignored delays, and approximated time literals).
 
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode};
 use aion_source::Span;
@@ -110,6 +110,90 @@ pub const W204: DiagnosticCode = DiagnosticCode {
     category: Category::Warning,
     number: 204,
 };
+
+/// Intra-assignment timing control (`a = #5 b;`, `q <= @(posedge clk) d;`)
+/// that the IR cannot represent and that is therefore ignored.
+pub const W205: DiagnosticCode = DiagnosticCode {
+    category: Category::Warning,
+    number: 205,
+};
+
+/// Delay on a continuous assignment or net declaration (`assign #2 y = a;`,
+/// `wire #1 w;`) that is ignored.
+pub const W206: DiagnosticCode = DiagnosticCode {
+    category: Category::Warning,
+    number: 206,
+};
+
+/// SystemVerilog time literal whose value depends on a time unit or
+/// precision the elaborator does not know (no `timescale`/`timeunit`), so an
+/// assumed value is used.
+pub const W207: DiagnosticCode = DiagnosticCode {
+    category: Category::Warning,
+    number: 207,
+};
+
+/// Creates a warning for an intra-assignment timing control that is ignored.
+///
+/// `is_delay` is `true` for `#` delays and `false` for `@` event controls;
+/// `nonblocking` selects the `<=` wording. The assignment is lowered as a
+/// plain zero-delay assignment. That is what synthesis implements, but
+/// simulation timing differs, so the user is told instead of the semantics
+/// changing silently.
+pub fn warn_intra_assignment_timing_ignored(
+    is_delay: bool,
+    nonblocking: bool,
+    span: Span,
+) -> Diagnostic {
+    let what = if is_delay { "delay" } else { "event control" };
+    let (op, note) = if nonblocking {
+        (
+            "<=",
+            "the value is still sampled now, but the target is updated in this time step \
+             instead of after the timing control",
+        )
+    } else {
+        (
+            "=",
+            "the value is still sampled now, but the target is updated immediately \
+             instead of after the timing control",
+        )
+    };
+    Diagnostic::warning(
+        W205,
+        format!("intra-assignment {what} in `{op}` assignment is ignored"),
+        span,
+    )
+    .with_note(note)
+    .with_note("synthesis ignores delays, so synthesized hardware is unaffected")
+    .with_help(
+        "for simulation timing, sample into a temporary and delay the assignment \
+         explicitly, or move the control before the statement if that is the intent",
+    )
+}
+
+/// Creates a warning for a delay on a continuous assignment or net
+/// declaration, which is ignored.
+///
+/// `what` names the construct, e.g. "continuous assignment" or "net
+/// declaration". The connection is lowered with zero delay, which matches
+/// synthesis but not delayed simulation.
+pub fn warn_net_delay_ignored(what: &str, span: Span) -> Diagnostic {
+    Diagnostic::warning(W206, format!("delay on {what} is ignored"), span)
+        .with_note("the value propagates with zero delay in Aion's synthesis and simulation")
+}
+
+/// Creates a warning for a SystemVerilog time literal whose value had to be
+/// approximated or assumed.
+///
+/// `text` is the literal as written and `detail` explains the assumption,
+/// e.g. "`1step` is one unit of the time precision, assumed to be 1 fs".
+pub fn warn_time_literal_assumed(text: &str, detail: &str, span: Span) -> Diagnostic {
+    Diagnostic::warning(W207, format!("time literal `{text}`: {detail}"), span).with_note(
+        "no `timescale`/`timeunit` is known to the elaborator; delays without a unit are \
+         taken as 1 ns",
+    )
+}
 
 /// Creates a warning for a VHDL `signal`/`variable`/`constant` whose default
 /// value (`:= expr`) the elaborator cannot evaluate to a constant.
@@ -342,6 +426,36 @@ mod tests {
         assert!(d.message.contains("`t`"));
         assert!(!d.notes.is_empty());
         assert!(!d.help.is_empty());
+    }
+
+    #[test]
+    fn intra_assignment_timing_warning() {
+        let d = warn_intra_assignment_timing_ignored(true, true, Span::DUMMY);
+        assert_eq!(d.code, W205);
+        assert_eq!(format!("{W205}"), "W205");
+        assert!(d.message.contains("delay"));
+        assert!(d.message.contains("<="));
+        assert!(!d.notes.is_empty());
+        assert!(!d.help.is_empty());
+
+        let d = warn_intra_assignment_timing_ignored(false, false, Span::DUMMY);
+        assert_eq!(d.code, W205);
+        assert!(d.message.contains("event control"));
+        assert!(!d.message.contains("<="));
+    }
+
+    #[test]
+    fn net_delay_and_time_literal_warnings() {
+        let d = warn_net_delay_ignored("continuous assignment", Span::DUMMY);
+        assert_eq!(d.code, W206);
+        assert_eq!(format!("{W206}"), "W206");
+        assert!(d.message.contains("continuous assignment"));
+
+        let d = warn_time_literal_assumed("1step", "assumed 1 fs", Span::DUMMY);
+        assert_eq!(d.code, W207);
+        assert_eq!(format!("{W207}"), "W207");
+        assert!(d.message.contains("`1step`"));
+        assert!(!d.notes.is_empty());
     }
 
     #[test]

@@ -324,9 +324,7 @@ impl<'src> SvParser<'src> {
     fn parse_interface_items(&mut self) -> Vec<ModuleItem> {
         let mut items = Vec::new();
         while !self.at(SvToken::Endinterface) && !self.at_eof() {
-            if let Some(item) = self.parse_module_item_inner() {
-                items.push(item);
-            }
+            items.extend(self.parse_module_item());
         }
         items
     }
@@ -335,18 +333,20 @@ impl<'src> SvParser<'src> {
     fn parse_package_items(&mut self) -> Vec<ModuleItem> {
         let mut items = Vec::new();
         while !self.at(SvToken::Endpackage) && !self.at_eof() {
-            if let Some(item) = self.parse_package_item_inner() {
-                items.push(item);
+            match self.current() {
+                // A parameter list declares one item per name.
+                SvToken::Parameter => items.extend(self.parse_parameter_item(false)),
+                SvToken::Localparam => items.extend(self.parse_parameter_item(true)),
+                _ => items.extend(self.parse_package_item_inner()),
             }
         }
         items
     }
 
-    /// Parses a single package item (subset of module items).
+    /// Parses a single package item (subset of module items) other than a
+    /// parameter declaration, which [`Self::parse_package_items`] handles.
     fn parse_package_item_inner(&mut self) -> Option<ModuleItem> {
         match self.current() {
-            SvToken::Parameter => Some(self.parse_parameter_item(false)),
-            SvToken::Localparam => Some(self.parse_parameter_item(true)),
             SvToken::Typedef => Some(self.parse_typedef_item()),
             SvToken::Function => Some(self.parse_function_declaration()),
             SvToken::Task => Some(self.parse_task_declaration()),
@@ -376,10 +376,23 @@ impl<'src> SvParser<'src> {
         self.expect(SvToken::Hash);
         self.expect(SvToken::LeftParen);
 
-        let mut params = Vec::new();
+        let mut params: Vec<ParameterDecl> = Vec::new();
         if !self.at(SvToken::RightParen) {
             loop {
-                let param = self.parse_single_parameter_decl(false);
+                // `#(parameter int A = 1, B = 2)`: a name without its own
+                // keyword continues the previous declaration and inherits its
+                // kind and, when it gives none of its own, its data type,
+                // signedness, and range.
+                let continues = !matches!(self.current(), SvToken::Parameter | SvToken::Localparam);
+                let inherit_local = continues && params.last().is_some_and(|p| p.local);
+                let mut param = self.parse_single_parameter_decl(inherit_local);
+                if let (true, Some(prev)) = (continues, params.last()) {
+                    if param.type_spec.is_none() && !param.signed && param.range.is_none() {
+                        param.type_spec = prev.type_spec.clone();
+                        param.signed = prev.signed;
+                        param.range = prev.range.clone();
+                    }
+                }
                 params.push(param);
                 if !self.eat(SvToken::Comma) {
                     break;
@@ -958,5 +971,34 @@ mod tests {
             }
             _ => panic!("expected module"),
         }
+    }
+
+    #[test]
+    fn param_port_list_continuation_inherits() {
+        let ast = parse_ok(
+            "module m #(parameter int A = 1, B = 2, localparam C = 3, D = 4, parameter E = 5)();
+            endmodule",
+        );
+        let SvItem::Module(m) = &ast.items[0] else {
+            panic!("expected module")
+        };
+        assert_eq!(m.params.len(), 5);
+        assert!(
+            matches!(m.params[1].type_spec, Some(TypeSpec::Simple(VarType::Int))),
+            "B inherits A's type"
+        );
+        assert!(!m.params[1].local);
+        assert!(
+            m.params[2].local && m.params[3].local,
+            "D continues `localparam`"
+        );
+        assert!(!m.params[4].local, "explicit `parameter` resets the kind");
+    }
+
+    #[test]
+    fn param_port_list_missing_name_reports_error() {
+        let (ast, errors) = parse_sv("module m #(parameter A = 1, )(); endmodule");
+        assert!(!errors.is_empty());
+        assert!(!ast.items.is_empty());
     }
 }

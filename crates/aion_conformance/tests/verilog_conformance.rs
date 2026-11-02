@@ -364,3 +364,30 @@ endmodule
     let result = full_pipeline_verilog(src, "decoder");
     assert!(!result.has_errors, "errors: {:?}", result.diagnostics);
 }
+
+#[test]
+fn comma_separated_localparams_and_delays() {
+    // PAR-1: every name of a parameter list is kept; PAR-21: delays parse.
+    let src = r#"
+module delayed (
+    input clk,
+    input a,
+    input b,
+    output y,
+    output z
+);
+    localparam W = 2, D = 3, SUM = W + D;
+    wire [SUM-1:0] #1 unused_bus;
+    wire [SUM-1:0] bus;
+    reg [D-1:0] q;
+    assign #2 y = a;
+    and #1 g1 (z, a, b), g2 (bus[0], a, b);
+    always @(posedge clk) q <= #1 {a, b, a};
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "delayed");
+    assert!(!result.has_errors, "errors: {:?}", result.diagnostics);
+    let top = result.design.top_module();
+    assert_eq!(top.params.len(), 3, "W, D and SUM must all be elaborated");
+    assert_eq!(top.processes.len(), 1);
+}

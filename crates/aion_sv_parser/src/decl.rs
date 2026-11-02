@@ -21,9 +21,7 @@ impl SvParser<'_> {
     pub fn parse_module_items(&mut self) -> Vec<ModuleItem> {
         let mut items = Vec::new();
         while !self.at(SvToken::Endmodule) && !self.at_eof() {
-            if let Some(item) = self.parse_module_item_inner() {
-                items.push(item);
-            }
+            items.extend(self.parse_module_item());
         }
         items
     }
@@ -57,8 +55,36 @@ impl SvParser<'_> {
         )
     }
 
-    /// Parses a single module item.
-    pub(crate) fn parse_module_item_inner(&mut self) -> Option<ModuleItem> {
+    /// Parses one module item declaration and returns every AST item it
+    /// declares.
+    ///
+    /// Most declarations yield exactly one item, but a comma-separated
+    /// parameter list (`localparam A = 0, B = 1;`) yields one
+    /// [`ModuleItem::ParameterDecl`]/[`ModuleItem::LocalparamDecl`] per name,
+    /// and a multi-instance gate statement (`and g1(...), g2(...);`) yields
+    /// one [`ModuleItem::GateInst`] per instance. Every caller that collects
+    /// module items must go through this so none of them is dropped.
+    pub(crate) fn parse_module_item(&mut self) -> Vec<ModuleItem> {
+        match self.current() {
+            SvToken::Parameter => self.parse_parameter_item(false),
+            SvToken::Localparam => self.parse_parameter_item(true),
+            SvToken::And
+            | SvToken::Or
+            | SvToken::Nand
+            | SvToken::Nor
+            | SvToken::Xor
+            | SvToken::Xnor
+            | SvToken::Not
+            | SvToken::Buf => self.parse_gate_instantiation(),
+            _ => self.parse_module_item_inner().into_iter().collect(),
+        }
+    }
+
+    /// Parses a single module item that declares exactly one AST item.
+    ///
+    /// Parameters and gate instantiations, which can declare several items,
+    /// are handled by [`Self::parse_module_item`]; call that instead.
+    fn parse_module_item_inner(&mut self) -> Option<ModuleItem> {
         match self.current() {
             // Net declarations
             SvToken::Wire | SvToken::Tri | SvToken::Supply0 | SvToken::Supply1 => {
@@ -81,12 +107,6 @@ impl SvParser<'_> {
 
             // Real declaration
             SvToken::Real => Some(self.parse_real_declaration()),
-
-            // Parameter
-            SvToken::Parameter => Some(self.parse_parameter_item(false)),
-
-            // Localparam
-            SvToken::Localparam => Some(self.parse_parameter_item(true)),
 
             // Port declarations (non-ANSI style)
             SvToken::Input | SvToken::Output | SvToken::Inout => {
@@ -144,16 +164,6 @@ impl SvParser<'_> {
             // Modport (inside interfaces)
             SvToken::Modport => Some(self.parse_modport_declaration()),
 
-            // Gate primitives
-            SvToken::And
-            | SvToken::Or
-            | SvToken::Nand
-            | SvToken::Nor
-            | SvToken::Xor
-            | SvToken::Xnor
-            | SvToken::Not
-            | SvToken::Buf => Some(self.parse_gate_instantiation()),
-
             // Identifier: could be module instantiation or named-type variable
             SvToken::Identifier | SvToken::EscapedIdentifier => {
                 let next = self.peek_kind(1);
@@ -203,6 +213,12 @@ impl SvParser<'_> {
         } else {
             None
         };
+        // Optional net delay: `wire [7:0] #1 w;`
+        let delay = if self.at(SvToken::Hash) {
+            Some(self.parse_delay(3))
+        } else {
+            None
+        };
 
         let names = self.parse_decl_name_list();
         self.expect(SvToken::Semicolon);
@@ -212,6 +228,7 @@ impl SvParser<'_> {
             net_type,
             signed,
             range,
+            delay,
             names,
             span,
         })
@@ -358,20 +375,30 @@ impl SvParser<'_> {
     // Parameter / Localparam
     // ========================================================================
 
-    /// Parses a parameter or localparam item in a module body.
-    pub(crate) fn parse_parameter_item(&mut self, local: bool) -> ModuleItem {
-        let start = self.current_span();
-        let param = self.parse_single_parameter_decl(local);
-        // Handle comma-separated parameters
-        let mut params = vec![param];
+    /// Parses a `parameter`/`localparam` declaration in a module, interface,
+    /// or package body and returns one item per declared name.
+    ///
+    /// `localparam logic [1:0] IDLE = 0, RUN = 1, DONE = 2;` yields three
+    /// [`ModuleItem::LocalparamDecl`] items. Following names inherit the data
+    /// type, `signed` flag, and range of the first one (IEEE 1800-2017 6.20.1:
+    /// one type applies to the whole `list_of_param_assignments`).
+    pub(crate) fn parse_parameter_item(&mut self, local: bool) -> Vec<ModuleItem> {
+        let first = self.parse_single_parameter_decl(local);
+        let mut params = Vec::new();
         while self.eat(SvToken::Comma) {
             let p_start = self.current_span();
+            // Lenient: accept a per-name type/`signed`/range, else inherit.
             let type_spec = self.try_parse_simple_type_spec();
             let signed = self.eat(SvToken::Signed);
             let range = if self.at(SvToken::LeftBracket) {
                 Some(self.parse_range())
             } else {
                 None
+            };
+            let (type_spec, signed, range) = if type_spec.is_none() && !signed && range.is_none() {
+                (first.type_spec.clone(), first.signed, first.range.clone())
+            } else {
+                (type_spec, signed, range)
             };
             let name = self.expect_ident();
             let value = if self.eat(SvToken::Equals) {
@@ -381,7 +408,7 @@ impl SvParser<'_> {
             };
             let span = p_start.merge(self.prev_span());
             params.push(ParameterDecl {
-                local,
+                local: first.local,
                 signed,
                 type_spec,
                 range,
@@ -391,13 +418,17 @@ impl SvParser<'_> {
             });
         }
         self.expect(SvToken::Semicolon);
-        let _span = start.merge(self.prev_span());
 
-        if local {
-            ModuleItem::LocalparamDecl(params.into_iter().next().unwrap())
-        } else {
-            ModuleItem::ParameterDecl(params.into_iter().next().unwrap())
-        }
+        std::iter::once(first)
+            .chain(params)
+            .map(|p| {
+                if p.local {
+                    ModuleItem::LocalparamDecl(p)
+                } else {
+                    ModuleItem::ParameterDecl(p)
+                }
+            })
+            .collect()
     }
 
     // ========================================================================
@@ -456,12 +487,19 @@ impl SvParser<'_> {
     fn parse_continuous_assign(&mut self) -> ModuleItem {
         let start = self.current_span();
         self.expect(SvToken::Assign);
+        // Optional delay: `assign #2 y = a;` / `assign #(1, 2) y = a;`
+        let delay = if self.at(SvToken::Hash) {
+            Some(self.parse_delay(3))
+        } else {
+            None
+        };
         let target = self.parse_expr();
         self.expect(SvToken::Equals);
         let value = self.parse_expr();
         self.expect(SvToken::Semicolon);
         let span = start.merge(self.prev_span());
         ModuleItem::ContinuousAssign(ContinuousAssign {
+            delay,
             target,
             value,
             span,
@@ -1086,37 +1124,60 @@ impl SvParser<'_> {
     // Gate primitives
     // ========================================================================
 
-    /// Parses a gate primitive instantiation (e.g., `and g1(y, a, b);`).
-    fn parse_gate_instantiation(&mut self) -> ModuleItem {
+    /// Parses a gate primitive instantiation and returns one item per
+    /// instance.
+    ///
+    /// Accepts an optional delay and several comma-separated instances:
+    /// `and #1 g1(y, a, b), g2(z, c, d);` yields two [`GateInst`] items,
+    /// each carrying a copy of the delay.
+    fn parse_gate_instantiation(&mut self) -> Vec<ModuleItem> {
         let start = self.current_span();
         let text = self.current_text();
         let gate_type = self.interner.get_or_intern(text);
         self.advance();
 
-        let name = if self.at(SvToken::Identifier) && self.peek_is(SvToken::LeftParen) {
-            Some(self.expect_ident())
+        // Optional gate delay: `and #1 ...`, `and #(1, 2) ...`
+        let delay = if self.at(SvToken::Hash) {
+            Some(self.parse_delay(3))
         } else {
             None
         };
 
-        self.expect(SvToken::LeftParen);
-        let mut ports = Vec::new();
-        if !self.at(SvToken::RightParen) {
-            ports.push(self.parse_expr());
-            while self.eat(SvToken::Comma) {
-                ports.push(self.parse_expr());
-            }
-        }
-        self.expect(SvToken::RightParen);
-        self.expect(SvToken::Semicolon);
-        let span = start.merge(self.prev_span());
+        let mut items = Vec::new();
+        let mut inst_start = start;
+        loop {
+            let name = if self.at(SvToken::Identifier) && self.peek_is(SvToken::LeftParen) {
+                Some(self.expect_ident())
+            } else {
+                None
+            };
 
-        ModuleItem::GateInst(GateInst {
-            gate_type,
-            name,
-            ports,
-            span,
-        })
+            self.expect(SvToken::LeftParen);
+            let mut ports = Vec::new();
+            if !self.at(SvToken::RightParen) {
+                ports.push(self.parse_expr());
+                while self.eat(SvToken::Comma) {
+                    ports.push(self.parse_expr());
+                }
+            }
+            self.expect(SvToken::RightParen);
+            let span = inst_start.merge(self.prev_span());
+
+            items.push(ModuleItem::GateInst(GateInst {
+                gate_type,
+                name,
+                delay: delay.clone(),
+                ports,
+                span,
+            }));
+
+            if !self.eat(SvToken::Comma) {
+                break;
+            }
+            inst_start = self.current_span();
+        }
+        self.expect(SvToken::Semicolon);
+        items
     }
 
     // ========================================================================
@@ -1136,9 +1197,7 @@ impl SvParser<'_> {
             // Generate wrapper with items
             let mut items = Vec::new();
             while !self.at(SvToken::Endgenerate) && !self.at_eof() {
-                if let Some(item) = self.parse_module_item_inner() {
-                    items.push(item);
-                }
+                items.extend(self.parse_module_item());
             }
             self.expect(SvToken::Endgenerate);
             let span = start.merge(self.prev_span());
@@ -1179,15 +1238,14 @@ impl SvParser<'_> {
         let has_begin = label.is_some() || self.at(SvToken::End);
         if has_begin {
             while !self.at(SvToken::End) && !self.at_eof() {
-                if let Some(item) = self.parse_module_item_inner() {
-                    items.push(item);
-                }
+                items.extend(self.parse_module_item());
             }
             self.expect(SvToken::End);
         } else {
             while !self.at(SvToken::Endgenerate) && !self.at_eof() {
-                if let Some(item) = self.parse_module_item_inner() {
-                    items.push(item);
+                let parsed = self.parse_module_item();
+                if !parsed.is_empty() {
+                    items.extend(parsed);
                     break;
                 }
             }
@@ -1236,13 +1294,11 @@ impl SvParser<'_> {
                 let _ = self.expect_ident();
             }
             while !self.at(SvToken::End) && !self.at_eof() {
-                if let Some(item) = self.parse_module_item_inner() {
-                    items.push(item);
-                }
+                items.extend(self.parse_module_item());
             }
             self.expect(SvToken::End);
-        } else if let Some(item) = self.parse_module_item_inner() {
-            items.push(item);
+        } else {
+            items.extend(self.parse_module_item());
         }
         items
     }
@@ -1336,9 +1392,7 @@ impl SvParser<'_> {
                     let port = self.parse_port_decl_in_subprogram();
                     inputs.push(port);
                 } else if self.is_at_declaration_start() {
-                    if let Some(item) = self.parse_module_item_inner() {
-                        decls.push(item);
-                    }
+                    decls.extend(self.parse_module_item());
                 } else {
                     break;
                 }
@@ -1407,9 +1461,7 @@ impl SvParser<'_> {
                     let port = self.parse_port_decl_in_subprogram();
                     ports.push(port);
                 } else if self.is_at_declaration_start() {
-                    if let Some(item) = self.parse_module_item_inner() {
-                        decls.push(item);
-                    }
+                    decls.extend(self.parse_module_item());
                 } else {
                     break;
                 }
@@ -1969,5 +2021,184 @@ mod tests {
         if let ModuleItem::VarDecl(ref v) = m.items[0] {
             assert_eq!(v.names.len(), 3);
         }
+    }
+
+    // ---- PAR-1: comma-separated parameters / PAR-21: delays ----
+
+    /// Parses `source`, returning all top-level items, the interner (to
+    /// resolve names), and every diagnostic.
+    fn parse_full(source: &str) -> (Vec<SvItem>, Interner, Vec<aion_diagnostics::Diagnostic>) {
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let tokens = lexer::lex(source, file, &sink);
+        let ast = SvParser::new(tokens, source, file, &interner, &sink).parse_source_file();
+        (ast.items, interner, sink.take_all())
+    }
+
+    fn module_items(items: &[SvItem]) -> &[ModuleItem] {
+        match &items[0] {
+            SvItem::Module(m) => &m.items,
+            other => panic!("expected module, got {other:?}"),
+        }
+    }
+
+    /// Returns `(name, value text, local)` for every parameter item.
+    fn param_items(
+        items: &[ModuleItem],
+        interner: &Interner,
+        source: &str,
+    ) -> Vec<(String, String, bool)> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                ModuleItem::ParameterDecl(p) | ModuleItem::LocalparamDecl(p) => {
+                    let is_local = matches!(item, ModuleItem::LocalparamDecl(_));
+                    assert_eq!(is_local, p.local);
+                    let v = p.value.as_ref().expect("value").span();
+                    Some((
+                        interner.resolve(p.name).to_string(),
+                        source[v.start as usize..v.end as usize].to_string(),
+                        p.local,
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn owned(v: &[(&str, &str, bool)]) -> Vec<(String, String, bool)> {
+        v.iter()
+            .map(|(n, val, l)| (n.to_string(), val.to_string(), *l))
+            .collect()
+    }
+
+    #[test]
+    fn localparam_list_keeps_every_name() {
+        let src =
+            "module t; localparam logic [1:0] IDLE = 2'd0, RUN = 2'd1, DONE = 2'd2; endmodule";
+        let (items, interner, diags) = parse_full(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let items = module_items(&items);
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            param_items(items, &interner, src),
+            owned(&[
+                ("IDLE", "2'd0", true),
+                ("RUN", "2'd1", true),
+                ("DONE", "2'd2", true)
+            ])
+        );
+        // Later names inherit the data type and range.
+        match &items[2] {
+            ModuleItem::LocalparamDecl(p) => {
+                assert!(matches!(
+                    p.type_spec,
+                    Some(TypeSpec::Simple(VarType::Logic))
+                ));
+                assert!(p.range.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parameter_lists_in_package_interface_and_generate() {
+        let src = "package p; localparam A = 1, B = 2; parameter int C = 3, D = 4; endpackage
+            interface i; localparam E = 5, F = 6; endinterface
+            module t; generate if (1) begin localparam G = 7, H = 8; end endgenerate endmodule";
+        let (items, interner, diags) = parse_full(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let names = |items: &[ModuleItem]| -> Vec<String> {
+            param_items(items, &interner, src)
+                .into_iter()
+                .map(|(n, _, _)| n)
+                .collect()
+        };
+        match &items[0] {
+            SvItem::Package(p) => assert_eq!(names(&p.items), ["A", "B", "C", "D"]),
+            other => panic!("{other:?}"),
+        }
+        match &items[1] {
+            SvItem::Interface(i) => assert_eq!(names(&i.items), ["E", "F"]),
+            other => panic!("{other:?}"),
+        }
+        match &items[2] {
+            SvItem::Module(m) => match &m.items[0] {
+                ModuleItem::GenerateBlock(GenerateBlock::If { then_items, .. }) => {
+                    assert_eq!(names(then_items), ["G", "H"]);
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parameter_list_missing_name_reports_error() {
+        let (items, _, diags) = parse_full("module t; localparam A = 1, ; wire w; endmodule");
+        assert!(!diags.is_empty());
+        let items = module_items(&items);
+        assert!(matches!(items[0], ModuleItem::LocalparamDecl(_)));
+        assert!(items.iter().any(|i| matches!(i, ModuleItem::NetDecl(_))));
+    }
+
+    #[test]
+    fn delays_on_assign_net_and_gate() {
+        let src = "module t;
+            assign #2 y = a;
+            assign #(1, 2) z = b;
+            assign #1.5ps v = c;
+            wire #10ns w;
+            wire [3:0] #1 bus = d;
+            and #1 g1(p, q, r), g2(s, u, x);
+        endmodule";
+        let (items, interner, diags) = parse_full(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let items = module_items(&items);
+        assert_eq!(items.len(), 7);
+        let assign_delay = |i: usize| match &items[i] {
+            ModuleItem::ContinuousAssign(ca) => ca.delay.clone().expect("delay"),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(assign_delay(0).values.len(), 1);
+        assert_eq!(assign_delay(1).values.len(), 2);
+        assert!(matches!(
+            assign_delay(2).values[0],
+            Expr::TimeLiteral { .. }
+        ));
+        match &items[3] {
+            ModuleItem::NetDecl(n) => {
+                assert!(matches!(
+                    n.delay.as_ref().unwrap().values[0],
+                    Expr::TimeLiteral { .. }
+                ));
+            }
+            other => panic!("{other:?}"),
+        }
+        match &items[4] {
+            ModuleItem::NetDecl(n) => {
+                assert!(n.delay.is_some() && n.range.is_some());
+                assert!(n.names[0].init.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+        for (idx, name) in [(5, "g1"), (6, "g2")] {
+            match &items[idx] {
+                ModuleItem::GateInst(g) => {
+                    assert_eq!(interner.resolve(g.name.unwrap()), name);
+                    assert!(g.delay.is_some());
+                    assert_eq!(g.ports.len(), 3);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn delay_with_too_many_values_is_an_error() {
+        let (_, _, diags) = parse_full("module t; wire #(1, 2, 3, 4) w; endmodule");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("at most 3"));
     }
 }

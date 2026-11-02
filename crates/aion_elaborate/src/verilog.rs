@@ -118,9 +118,22 @@ fn apply_verilog_params(
 ) {
     let override_map: HashMap<_, _> = overrides.iter().cloned().collect();
 
-    for param in &decl.params {
+    // Header (`#(...)`) parameters first, then body `parameter`/`localparam`
+    // declarations in source order, so a later one can use an earlier one
+    // (`localparam A = 1, B = A + 1;`). A body `parameter` can be overridden
+    // only when the module has no parameter port list; otherwise it acts as a
+    // `localparam` (IEEE 1364-2005 12.2, IEEE 1800-2017 6.20.1).
+    let header = decl.params.iter().map(|p| (p, true));
+    let body = decl.items.iter().filter_map(|item| match item {
+        v_ast::ModuleItem::ParameterDecl(p) | v_ast::ModuleItem::LocalparamDecl(p) => {
+            Some((p, !p.local && decl.params.is_empty()))
+        }
+        _ => None,
+    });
+
+    for (param, overridable) in header.chain(body) {
         let name = param.name;
-        let value = if let Some(ov) = override_map.get(&name) {
+        let value = if let Some(ov) = override_map.get(&name).filter(|_| overridable) {
             ov.clone()
         } else if let Some(ref value) = param.value {
             const_eval::eval_verilog_expr(value, ctx.source_db, ctx.interner, const_env, ctx.sink)
@@ -202,6 +215,9 @@ fn elaborate_verilog_item(
 ) {
     match item {
         v_ast::ModuleItem::NetDecl(net) => {
+            if let Some(delay) = &net.delay {
+                warn_net_delay(ctx, "net declaration", delay.span);
+            }
             let ty = types::resolve_verilog_net_type(
                 Some(&net.net_type),
                 net.range.as_ref(),
@@ -278,15 +294,16 @@ fn elaborate_verilog_item(
                 sig_env.insert(dn.name, sid);
             }
         }
-        v_ast::ModuleItem::ParameterDecl(_pd) | v_ast::ModuleItem::LocalparamDecl(_pd) => {
-            // Already handled in apply_verilog_params for module-level,
-            // but localparams in the body need evaluation too.
-            // (Already in const_env if they appeared in params list)
+        v_ast::ModuleItem::ParameterDecl(_) | v_ast::ModuleItem::LocalparamDecl(_) => {
+            // Evaluated into the const env by `apply_verilog_params`.
         }
         v_ast::ModuleItem::PortDecl(_) => {
             // Non-ANSI port declarations — handled by elaborate_verilog_ports
         }
         v_ast::ModuleItem::ContinuousAssign(ca) => {
+            if let Some(delay) = &ca.delay {
+                warn_net_delay(ctx, "continuous assignment", delay.span);
+            }
             let target =
                 lower_to_signal_ref(&ca.target, sig_env, ctx.source_db, ctx.interner, ctx.sink);
             let value =
@@ -343,6 +360,17 @@ fn elaborate_verilog_item(
         }
         v_ast::ModuleItem::Error(_) => {}
     }
+}
+
+/// Reports a delay on a net declaration or continuous assignment as ignored
+/// (W206).
+///
+/// Delays on nets, continuous assignments, and gates do not affect
+/// synthesized hardware, and the IR models connections as zero-delay, so the
+/// delay is dropped; the warning keeps that visible for simulation users.
+/// Gate instances are not elaborated yet, so gate delays are not reported.
+pub(crate) fn warn_net_delay(ctx: &ElaborationContext<'_>, what: &str, span: Span) {
+    ctx.sink.emit(errors::warn_net_delay_ignored(what, span));
 }
 
 /// Analyzes a Verilog always block to determine ProcessKind and sensitivity.
@@ -686,6 +714,7 @@ mod tests {
                     net_type: v_ast::NetType::Wire,
                     signed: false,
                     range: None,
+                    delay: None,
                     names: vec![v_ast::DeclName {
                         name: w,
                         dimensions: vec![],
@@ -737,6 +766,7 @@ mod tests {
                     net_type: v_ast::NetType::Wire,
                     signed: false,
                     range: None,
+                    delay: None,
                     names: vec![
                         v_ast::DeclName {
                             name: a,
@@ -754,6 +784,7 @@ mod tests {
                     span: Span::DUMMY,
                 }),
                 v_ast::ModuleItem::ContinuousAssign(v_ast::ContinuousAssign {
+                    delay: None,
                     target: v_ast::Expr::Identifier {
                         name: a,
                         span: Span::DUMMY,

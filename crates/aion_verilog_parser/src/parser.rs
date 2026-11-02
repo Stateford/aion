@@ -250,11 +250,25 @@ impl<'src> VerilogParser<'src> {
         self.expect(VerilogToken::Hash);
         self.expect(VerilogToken::LeftParen);
 
-        let mut params = Vec::new();
+        let mut params: Vec<ParameterDecl> = Vec::new();
         if !self.at(VerilogToken::RightParen) {
             // Expect `parameter` keyword
             loop {
-                let param = self.parse_single_parameter_decl(false);
+                // `#(parameter [7:0] A = 1, B = 2)`: a name without its own
+                // keyword continues the previous declaration and inherits its
+                // kind, signedness, and range.
+                let continues = !matches!(
+                    self.current(),
+                    VerilogToken::Parameter | VerilogToken::Localparam
+                );
+                let inherit_local = continues && params.last().is_some_and(|p| p.local);
+                let mut param = self.parse_single_parameter_decl(inherit_local);
+                if let (true, Some(prev)) = (continues, params.last()) {
+                    if !param.signed && param.range.is_none() {
+                        param.signed = prev.signed;
+                        param.range = prev.range.clone();
+                    }
+                }
                 params.push(param);
                 if !self.eat(VerilogToken::Comma) {
                     break;
@@ -665,5 +679,32 @@ mod tests {
             }
             _ => panic!("expected module"),
         }
+    }
+
+    #[test]
+    fn param_port_list_continuation_inherits() {
+        let ast = parse_ok(
+            "module m #(parameter [7:0] A = 1, B = 2, localparam C = 3, D = 4, parameter E = 5)();
+            endmodule",
+        );
+        let VerilogItem::Module(m) = &ast.items[0] else {
+            panic!("expected module")
+        };
+        assert_eq!(m.params.len(), 5);
+        assert!(m.params[1].range.is_some(), "B inherits A's range");
+        assert!(!m.params[1].local);
+        assert!(
+            m.params[2].local && m.params[3].local,
+            "D continues `localparam`"
+        );
+        assert!(m.params[3].range.is_none());
+        assert!(!m.params[4].local, "explicit `parameter` resets the kind");
+    }
+
+    #[test]
+    fn param_port_list_missing_name_reports_error() {
+        let (ast, errors) = parse_verilog("module m #(parameter A = 1, )(); endmodule");
+        assert!(!errors.is_empty());
+        assert!(!ast.items.is_empty());
     }
 }

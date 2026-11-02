@@ -224,6 +224,7 @@ pub fn lower_sv_expr(
         }
         Expr::Literal { span } => lower_verilog_literal(*span, source_db),
         Expr::RealLiteral { span } => lower_verilog_literal(*span, source_db),
+        Expr::TimeLiteral { span } => lower_sv_time_literal_value(*span, source_db, sink),
         Expr::StringLiteral { .. } => IrExpr::Literal(LogicVec::all_zero(1)),
         Expr::Unary { op, operand, span } => {
             let ir_op = map_sv_unary_op(*op);
@@ -692,6 +693,50 @@ fn resolve_signal(
         sink.emit(errors::error_unknown_signal(interner.resolve(name), span));
         poison(span)
     }
+}
+
+/// Lowers a SystemVerilog time literal used as a value (`x = 5ns;`,
+/// `$time > 10ns`) to a 64-bit count of time units.
+///
+/// The elaborator assumes a 1 ns time unit (see
+/// [`DEFAULT_TIMESCALE_FS`](crate::stmt::DEFAULT_TIMESCALE_FS)), so `10ns`
+/// lowers to `10`. A literal that is not a whole number of nanoseconds
+/// (`100ps`, `1step`) is rounded half-up with a W207 warning; an
+/// out-of-range literal is an E209 error and lowers to 0.
+fn lower_sv_time_literal_value(span: Span, source_db: &SourceDb, sink: &DiagnosticSink) -> IrExpr {
+    let text = source_db.snippet(span);
+    let unit = crate::stmt::DEFAULT_TIMESCALE_FS;
+    let count = match const_eval::parse_time_literal(text) {
+        Some(const_eval::TimeLiteralValue::Fs { fs, exact }) => {
+            let count = fs / unit + u64::from(fs % unit >= unit / 2);
+            if !exact || fs % unit != 0 {
+                sink.emit(errors::warn_time_literal_assumed(
+                    text,
+                    &format!(
+                        "not a whole number of the assumed 1 ns time unit; rounded to {count}"
+                    ),
+                    span,
+                ));
+            }
+            count
+        }
+        Some(const_eval::TimeLiteralValue::Step) => {
+            sink.emit(errors::warn_time_literal_assumed(
+                text,
+                "`1step` depends on the unknown time precision; it rounds to 0 time units",
+                span,
+            ));
+            0
+        }
+        None => {
+            sink.emit(errors::error_param_not_const(
+                &format!("time literal `{text}` is out of range"),
+                span,
+            ));
+            0
+        }
+    };
+    IrExpr::Literal(logic_vec_from_u64(64, count))
 }
 
 /// Produces a poison zero-width literal for error recovery.

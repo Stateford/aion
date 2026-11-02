@@ -282,6 +282,12 @@ impl SvParser<'_> {
                 self.advance();
                 Expr::RealLiteral { span }
             }
+            // Time literal (`10ns`, `1step`)
+            SvToken::TimeLiteral => {
+                let span = self.current_span();
+                self.advance();
+                Expr::TimeLiteral { span }
+            }
             // String literal
             SvToken::StringLiteral => {
                 let span = self.current_span();
