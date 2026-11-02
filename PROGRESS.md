@@ -12,8 +12,8 @@
   - `canonical_name`, used for the `aion.toml` top and for Verilog/SV instantiations. An exact match wins; otherwise the name is matched case-insensitively against VHDL entities only, so Verilog stays case-sensitive.
   - `canonical_vhdl_name`, used for VHDL instantiations. It also binds to a Verilog/SV module that differs only in case, as long as exactly one such module exists.
 - **Tests:**
-  - 6 parser tests: basic and keyword folding, use clauses, extended identifiers staying case-sensitive, `eat_ident`, and the missing-identifier error;
-  - 9 elaborator end-to-end tests: mixed-case declare/use, `of TOP`, `top = "TOP"`, unknown names still reported, Verilog↔VHDL instantiation, ambiguous and exact-preferred cases, Verilog top stays case-sensitive;
+  - 7 parser tests: basic and keyword folding, attribute names, use clauses, extended identifiers staying case-sensitive, `eat_ident`, and the missing-identifier error;
+  - 8 elaborator end-to-end tests: mixed-case declare/use, `of TOP`, `top = "TOP"`, unknown names still reported, Verilog↔VHDL instantiation, ambiguous and exact-preferred cases, Verilog top stays case-sensitive;
   - 2 registry tests.
   - Existing tests that looked up VHDL objects by mixed-case names (`K`, `p.K`) now use the folded names.
 - **Known gaps:**
