@@ -16,7 +16,7 @@
   - a truncation that would drop significant elements is an error;
   - underlines must sit between characters.
   
-  The lexer reports these errors with precise spans. The elaborator now uses the same expansion for every form, so `8UX"F"` gives `00001111`, `8SX"F"` gives `11111111` and literals wider than 64 bits are correct. A literal it cannot convert gets the new **E212** error.
+  The lexer reports these errors with precise spans. The elaborator now uses the same expansion for every form, so `8UX"F"` gives `00001111`, `8SX"F"` gives `11111111` and literals wider than 64 bits are correct. A literal it cannot convert gets the new **E213** error.
 - **Tick vs. char literal (VHDL-16):** the lexer tracks the last token. After an identifier, extended identifier, `)`, `all`, `subtype` or a string literal, `'` is a `Tick`. Otherwise `'c'` (including multi-byte `c`) is a char literal. `character'(' ')` and `t'('a')` now lex correctly.
 - **Based literals (VHDL-21):**
   - the base must be 2..=16;
@@ -30,7 +30,7 @@
   - `bit_string` ×11 and lexer ×31 new, plus `nested_block_comment` updated to assert LRM behaviour;
   - parser integration ×2 (one renders smart-quote diagnostics);
   - renderer ×5 (mid-char span, out-of-range offset, multibyte caret alignment, multi-line span);
-  - elaborator ×9 (sized, signed, `D` and >64-bit values, metavalues, E212, default-value end-to-end).
+  - elaborator ×9 (sized, signed, `D` and >64-bit values, metavalues, E213, default-value end-to-end).
 - **Known gaps:** `%` as a replacement for `"` is not supported. `aion_source::SourceFile::snippet` still slices bytes directly; the lexer no longer produces non-boundary spans, so this is safe today. Based literals are validated but the elaborator still evaluates only decimal integers.
 
 ## 2026-11-01 — Sim: Unified Process Execution (Fixes #4)

@@ -1551,7 +1551,7 @@ mod tests {
         let _ = lower_vhdl_expr(&bad, &env, &sdb, &interner, &sink);
         let diags = sink.diagnostics();
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, errors::E212);
+        assert_eq!(diags[0].code, errors::E213);
 
         let good = aion_vhdl_parser::ast::Expr::BitStringLiteral {
             span: aion_source::Span::new(fid, 7, 13),
