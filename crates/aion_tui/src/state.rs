@@ -158,6 +158,8 @@ pub struct TuiState {
     pub waveform_signals: Vec<usize>,
     /// Whether help popup is visible.
     pub show_help: bool,
+    /// First visible line of the help popup (scrolled with j/k while open).
+    pub help_scroll: u16,
     /// Set of signal indices whose bus bits are expanded in the waveform.
     pub expanded_signals: HashSet<usize>,
 }
@@ -202,6 +204,7 @@ impl TuiState {
             value_format: ValueFormat::Hex,
             waveform_signals,
             show_help: false,
+            help_scroll: 0,
             expanded_signals: HashSet::new(),
         }
     }

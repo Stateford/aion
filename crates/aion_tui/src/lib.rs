@@ -27,6 +27,7 @@
 pub mod app;
 pub mod commands;
 pub mod event;
+pub mod help;
 pub mod render;
 pub mod state;
 pub mod terminal;
