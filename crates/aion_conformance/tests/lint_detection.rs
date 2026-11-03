@@ -1126,3 +1126,132 @@ endmodule
         "combinational process with full coverage should not trigger C204"
     );
 }
+
+// ============================================================================
+// Review follow-ups for the lint-context work (#39)
+// ============================================================================
+
+#[test]
+fn vhdl_aggregate_target_members_are_still_unused_w101() {
+    // Regression: `(carry, s) <= ...` is a positional aggregate target whose
+    // members are written. The `(` opening the target is not an index
+    // bracket, so `carry` must still be reported as unused.
+    let src = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity top is
+    port (a : in unsigned(3 downto 0); b : in unsigned(3 downto 0);
+          y : out unsigned(3 downto 0));
+end entity;
+
+architecture rtl of top is
+    signal carry : std_logic;
+    signal s : unsigned(3 downto 0);
+begin
+    (carry, s) <= ('0' & a) + b;
+    y <= s;
+end architecture;
+"#;
+    let result = full_pipeline_vhdl(src, "top");
+    assert_eq!(
+        w101_messages(&result),
+        vec!["unused signal `carry`"],
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn vhdl_dynamic_index_of_write_is_a_read_no_w101() {
+    let src = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity top is
+    port (clk : in std_logic; sel : in unsigned(2 downto 0); d : in std_logic;
+          q : out std_logic_vector(7 downto 0));
+end entity;
+
+architecture rtl of top is
+    signal mem : std_logic_vector(7 downto 0);
+    signal addr : unsigned(2 downto 0);
+begin
+    addr <= sel;
+    process (clk)
+    begin
+        if rising_edge(clk) then
+            mem(to_integer(addr)) <= d;
+        end if;
+    end process;
+    q <= mem;
+end architecture;
+"#;
+    let result = full_pipeline_vhdl(src, "top");
+    assert!(
+        w101_messages(&result).is_empty(),
+        "addr is read as an index: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn sized_literal_in_index_is_not_a_signal_w101() {
+    // `8'd1` must not be read as an identifier `d1`: the unused wire `d1`
+    // is still reported, while `addr` counts as read by the index.
+    let src = r#"
+module top (input clk, input [2:0] sel, input x, output [7:0] q);
+    reg [7:0] mem;
+    wire [2:0] addr;
+    wire d1;
+    wire hA;
+    wire b10;
+    assign addr = sel;
+    always @(posedge clk) begin
+        mem[addr + 8'd1] <= x;
+        mem[addr + 4'hA] <= x;
+        mem[addr + 2'b10] <= x;
+    end
+    assign q = mem;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    let mut msgs = w101_messages(&result);
+    msgs.sort_unstable();
+    assert_eq!(
+        msgs,
+        vec![
+            "unused signal `b10`",
+            "unused signal `d1`",
+            "unused signal `hA`"
+        ],
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn verilog_names_are_matched_case_sensitively_c201() {
+    // `CLK` and `clk` are different signals in Verilog. C201 must check
+    // each one's own spelling, so only `CLK` violates snake_case.
+    let src = r#"
+module top (input wire CLK, clk, output y);
+    assign y = CLK & clk;
+endmodule
+"#;
+    let result = full_pipeline_verilog_with_config(src, &naming_config("top"));
+    let msgs: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 201)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        msgs,
+        vec!["signal name `CLK` does not follow the snake_case convention"],
+        "{:#?}",
+        result.diagnostics
+    );
+}

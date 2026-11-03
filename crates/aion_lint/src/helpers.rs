@@ -424,10 +424,14 @@ pub(crate) fn is_duplicate_specialization(module: &Module, design: &Design) -> b
 /// disappears from the IR even though the assignment reads it. For every
 /// assignment whose target contains a whole-signal reference, this inspects
 /// the source text of the statement, takes the part before the assignment
-/// operator, and collects the identifiers written inside `[...]` or `(...)`.
-/// Concatenation braces `{...}` are *not* index brackets: the signals listed
-/// in `{carry, s} = a + b` are written, not read, and must stay eligible for
-/// W101.
+/// operator, and collects the identifiers written inside an index bracket:
+/// any `[...]`, or a `(...)` that directly follows a name (`mem(addr)`).
+/// Concatenation braces `{...}` and a VHDL aggregate target `(carry, s)` are
+/// *not* index brackets: the signals they list are written, not read, and
+/// must stay eligible for W101. Literal text is skipped too, so the base
+/// letter and digits of a Verilog sized literal (`d1` in `8'd1`), a VHDL
+/// attribute name (`length` in `x'length`) or the contents of a string are
+/// never taken for signal names.
 ///
 /// Names are compared the way the source language does: identifiers from
 /// VHDL files are folded to lowercase (matching the interned VHDL names),
@@ -513,33 +517,138 @@ fn add_dynamic_index_reads(
     let Some(text) = ctx.source_text(span) else {
         return;
     };
-    let fold_case = ctx.is_vhdl_source(span);
+    let vhdl = ctx.is_vhdl_source(span);
     let lhs = assignment_lhs(text);
     let bytes = lhs.as_bytes();
-    let mut depth = 0usize;
+    // One entry per open bracket: `true` if it encloses (part of) an index.
+    let mut open: Vec<bool> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        let b = bytes[i];
-        match b {
-            b'[' | b'(' => depth += 1,
-            b']' | b')' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        if depth > 0 && is_ident_start(b) && (i == 0 || !is_ident_byte(bytes[i - 1])) {
-            let start = i;
-            while i < bytes.len() && is_ident_byte(bytes[i]) {
-                i += 1;
+        let in_index = open.last() == Some(&true);
+        match bytes[i] {
+            b'[' => open.push(true),
+            // `mem(addr)` indexes `mem`; `(carry, s)` opening the target, or
+            // a `(` after `,`/`(`/an operator, groups or aggregates instead.
+            // Inside an index every bracket is part of the index expression.
+            b'(' => open.push(in_index || follows_name(bytes, i)),
+            b']' | b')' => {
+                open.pop();
             }
-            let ident = &lhs[start..i];
-            names.insert(if fold_case {
-                ident.to_ascii_lowercase()
-            } else {
-                ident.to_string()
-            });
-            continue;
+            b'"' => {
+                i = skip_string(bytes, i, vhdl);
+                continue;
+            }
+            b'\'' => {
+                i = if vhdl {
+                    skip_vhdl_tick(bytes, i)
+                } else {
+                    skip_verilog_based_literal(bytes, i)
+                };
+                continue;
+            }
+            // VHDL based literal `16#FF#`: its digits are not names.
+            b'#' if vhdl => {
+                i = bytes[i + 1..]
+                    .iter()
+                    .position(|&c| c == b'#')
+                    .map_or(bytes.len(), |p| i + p + 2);
+                continue;
+            }
+            b if is_ident_start(b) && (i == 0 || !is_ident_byte(bytes[i - 1])) => {
+                let start = i;
+                while i < bytes.len() && is_ident_byte(bytes[i]) {
+                    i += 1;
+                }
+                // `x"FF"` in VHDL: the identifier is a bit-string base.
+                let bit_string_base = vhdl && bytes.get(i) == Some(&b'"');
+                if in_index && !bit_string_base {
+                    let ident = &lhs[start..i];
+                    names.insert(if vhdl {
+                        ident.to_ascii_lowercase()
+                    } else {
+                        ident.to_string()
+                    });
+                }
+                continue;
+            }
+            _ => {}
         }
         i += 1;
     }
+}
+
+/// Returns true if the `(` at `bytes[open]` directly follows a name — an
+/// identifier character, `)` or `]`, ignoring whitespace — and so starts an
+/// index or call (`mem(addr)`, `f(x)(y)`) rather than a parenthesised group
+/// or aggregate.
+fn follows_name(bytes: &[u8], open: usize) -> bool {
+    bytes[..open]
+        .iter()
+        .rev()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|&b| is_ident_byte(b) || b == b')' || b == b']')
+}
+
+/// Returns the index just past the string literal starting with the `"` at
+/// `bytes[start]` (or the end of `bytes` if it is unterminated). Verilog
+/// strings use `\` escapes; VHDL doubles the quote instead, which scans as
+/// two adjacent strings and needs no special case.
+fn skip_string(bytes: &[u8], start: usize, vhdl: bool) -> usize {
+    let mut j = start + 1;
+    while j < bytes.len() && bytes[j] != b'"' {
+        if !vhdl && bytes[j] == b'\\' {
+            j += 1;
+        }
+        j += 1;
+    }
+    (j + 1).min(bytes.len())
+}
+
+/// Returns the index just past the Verilog/SystemVerilog based-literal tail
+/// that starts with the `'` at `bytes[tick]`: an optional signedness `s`, a
+/// base letter (`b`, `o`, `d`, `h`, any case) and its digits, so that the
+/// `d1` of `8'd1` or the `hA` of `4'hA` is not read as a signal name.
+///
+/// Anything else after the `'` (an SV cast `'(`, a fill literal `'0`) only
+/// skips the `'` itself.
+fn skip_verilog_based_literal(bytes: &[u8], tick: usize) -> usize {
+    let mut j = tick + 1;
+    if matches!(bytes.get(j), Some(b's' | b'S')) {
+        j += 1;
+    }
+    if !matches!(
+        bytes.get(j),
+        Some(b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H')
+    ) {
+        return tick + 1;
+    }
+    j += 1;
+    while bytes.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+        j += 1;
+    }
+    while bytes.get(j).is_some_and(|&b| {
+        b.is_ascii_hexdigit() || matches!(b, b'_' | b'x' | b'X' | b'z' | b'Z' | b'?')
+    }) {
+        j += 1;
+    }
+    j
+}
+
+/// Returns the index just past the VHDL construct that starts with the `'`
+/// at `bytes[tick]`: a character literal (`'1'`) or an attribute name
+/// (`'length` in `x'length`). Neither is a signal. Anything else (the `'` of
+/// a qualified expression `t'(...)`) only skips the `'` itself.
+fn skip_vhdl_tick(bytes: &[u8], tick: usize) -> usize {
+    if bytes.get(tick + 2) == Some(&b'\'') {
+        return tick + 3;
+    }
+    let mut j = tick + 1;
+    if bytes.get(j).is_some_and(|&b| is_ident_start(b)) {
+        while bytes.get(j).is_some_and(|&b| is_ident_byte(b)) {
+            j += 1;
+        }
+    }
+    j
 }
 
 /// Returns true if `b` can start an HDL identifier.
@@ -1625,6 +1734,119 @@ mod tests {
             names.into_iter().collect::<Vec<_>>(),
             vec!["addr".to_string()]
         );
+    }
+
+    /// Returns the sorted dynamic-index reads of one continuous assignment
+    /// whose source text is `text` in a file named `file`, with a target of
+    /// two whole signals (as both a dynamic index and an aggregate lower to).
+    fn index_reads_of(file: &str, text: &str) -> Vec<String> {
+        use aion_common::Interner;
+        use aion_source::SourceDb;
+
+        let interner = Interner::new();
+        let mut db = SourceDb::new();
+        let fid = db.add_source(file, text.to_string());
+        let mut module = mk_module();
+        let a = add_wire(&mut module, 0);
+        let b = add_wire(&mut module, 1);
+        module.assignments.push(Assignment {
+            target: SignalRef::Concat(vec![SignalRef::Signal(a), SignalRef::Signal(b)]),
+            value: Expr::Literal(LogicVec::all_zero(1)),
+            span: Span::new(fid, 0, text.len() as u32),
+        });
+        let ctx = LintContext::new(&interner, &db);
+        let mut names: Vec<_> = dynamic_index_reads(&module, &ctx).into_iter().collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn vhdl_aggregate_target_is_not_an_index() {
+        assert!(index_reads_of("t.vhd", "(carry, s) <= ('0' & a) + b;").is_empty());
+        assert!(index_reads_of("t.vhd", "( (carry), s ) <= z;").is_empty());
+        // A real index inside an aggregate is still a read.
+        assert_eq!(index_reads_of("t.vhd", "(mem(K), q) <= z;"), vec!["k"]);
+    }
+
+    #[test]
+    fn vhdl_indexed_write_counts_index_as_read() {
+        assert_eq!(index_reads_of("t.vhd", "mem(addr) <= d;"), vec!["addr"]);
+        assert_eq!(index_reads_of("t.vhd", "mem (addr) <= d;"), vec!["addr"]);
+        assert_eq!(
+            index_reads_of("t.vhd", "mem(to_integer(addr) + (off)) <= d;"),
+            vec!["addr", "off", "to_integer"]
+        );
+        // Chained index after `)`.
+        assert_eq!(index_reads_of("t.vhd", "m(i)(j) <= d;"), vec!["i", "j"]);
+    }
+
+    #[test]
+    fn vhdl_literals_and_attributes_are_not_names() {
+        // Attribute names and character literals after `'`.
+        assert_eq!(
+            index_reads_of("t.vhd", "mem(v'length - 1) <= d;"),
+            vec!["v"]
+        );
+        assert_eq!(index_reads_of("t.vhd", "mem(c, 'a') <= d;"), vec!["c"]);
+        // Based literals, bit-string literals and strings.
+        assert_eq!(index_reads_of("t.vhd", "mem(16#FF# + i) <= d;"), vec!["i"]);
+        assert_eq!(index_reads_of("t.vhd", "mem(i + x\"0F\") <= d;"), vec!["i"]);
+        // A qualified expression only skips the tick.
+        assert_eq!(index_reads_of("t.vhd", "mem(t'(i)) <= d;"), vec!["i", "t"]);
+    }
+
+    #[test]
+    fn verilog_sized_literal_tail_is_not_a_name() {
+        assert_eq!(
+            index_reads_of("t.v", "mem[addr + 8'd1] <= x;"),
+            vec!["addr"]
+        );
+        assert_eq!(
+            index_reads_of(
+                "t.sv",
+                "mem[k + 4'hA + 2'b10 + 3'sd2 + 'o7 + 8'h ff + 4'bx1z?] <= x;"
+            ),
+            vec!["k"]
+        );
+        // An SV cast and a fill literal skip only the tick.
+        assert_eq!(
+            index_reads_of("t.sv", "mem[int'(i) + '1] <= x;"),
+            vec!["i", "int"]
+        );
+        // String contents are not names.
+        assert_eq!(
+            index_reads_of("t.v", "mem[i + \"a\\\"b\"] <= x;"),
+            vec!["i"]
+        );
+    }
+
+    #[test]
+    fn follows_name_cases() {
+        assert!(follows_name(b"mem(", 3));
+        assert!(follows_name(b"mem  (", 5));
+        assert!(follows_name(b"f(x)(", 4));
+        assert!(follows_name(b"a[1](", 4));
+        assert!(!follows_name(b"(", 0));
+        assert!(!follows_name(b"  (", 2));
+        assert!(!follows_name(b"a, (", 3));
+        assert!(!follows_name(b"((", 1));
+        assert!(!follows_name(b"a + (", 4));
+    }
+
+    #[test]
+    fn literal_skippers_stop_at_the_right_place() {
+        assert_eq!(skip_verilog_based_literal(b"'d1]", 0), 3);
+        assert_eq!(skip_verilog_based_literal(b"'Sh_Fz]", 0), 6);
+        assert_eq!(skip_verilog_based_literal(b"'(x)", 0), 1);
+        assert_eq!(skip_verilog_based_literal(b"'s", 0), 1);
+        assert_eq!(skip_verilog_based_literal(b"'", 0), 1);
+        assert_eq!(skip_vhdl_tick(b"'1')", 0), 3);
+        assert_eq!(skip_vhdl_tick(b"'high)", 0), 5);
+        assert_eq!(skip_vhdl_tick(b"'(", 0), 1);
+        assert_eq!(skip_vhdl_tick(b"'", 0), 1);
+        assert_eq!(skip_string(b"\"ab\" x", 0, true), 4);
+        assert_eq!(skip_string(b"\"a\\\"b\" x", 0, false), 6);
+        assert_eq!(skip_string(b"\"open", 0, false), 5);
     }
 
     #[test]

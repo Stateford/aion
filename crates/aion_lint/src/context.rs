@@ -189,9 +189,16 @@ impl<'a> LintContext<'a> {
     /// VHDL folds basic identifiers to lowercase when interning them, so the
     /// interned string of `DATA_WIDTH` is `data_width`. Checks that depend on
     /// letter case (naming conventions) must look at the original spelling:
+    /// for a span in a VHDL file (see [`is_vhdl_source`](Self::is_vhdl_source))
     /// this finds the first whole-word, case-insensitive occurrence of the
-    /// interned name inside the span's text. When the text is unavailable or
-    /// does not contain the name, the interned string is returned.
+    /// interned name inside the span's text.
+    ///
+    /// Verilog and SystemVerilog identifiers are case-sensitive and interned
+    /// exactly as written, so there `CLK` and `clk` are different names and
+    /// matching must be case-sensitive; the only case-sensitive match is the
+    /// interned string itself, which is what is returned. When the text is
+    /// unavailable or does not contain the name, the interned string is
+    /// returned as well.
     pub fn source_spelling(&self, ident: Ident, span: Span) -> Cow<'a, str> {
         let Some(interned) = self.try_name(ident) else {
             return Cow::Borrowed(UNKNOWN_NAME);
@@ -200,6 +207,10 @@ impl<'a> LintContext<'a> {
         let wanted = interned.rsplit('.').next().unwrap_or(interned);
         if wanted.is_empty() {
             return Cow::Borrowed(interned);
+        }
+        if !self.is_vhdl_source(span) {
+            // Case-sensitive language: the interned name is the spelling.
+            return Cow::Borrowed(wanted);
         }
         let Some(text) = self.source_text(span) else {
             return Cow::Borrowed(wanted);
@@ -444,6 +455,44 @@ mod tests {
         assert_eq!(
             ctx.source_spelling(Ident::from_raw(1000), span),
             UNKNOWN_NAME
+        );
+    }
+
+    #[test]
+    fn source_spelling_is_case_sensitive_for_verilog() {
+        let interner = Interner::new();
+        let mut db = SourceDb::new();
+        let text = "input wire CLK, clk";
+        let v = db.add_source("t.v", text.to_string());
+        let sv = db.add_source("t.sv", text.to_string());
+        let ctx = LintContext::new(&interner, &db);
+        let clk = interner.get_or_intern("clk");
+        let upper = interner.get_or_intern("CLK");
+        for f in [v, sv] {
+            let span = Span::new(f, 0, text.len() as u32);
+            // `clk` is its own signal; `CLK` earlier in the text is not it.
+            assert_eq!(ctx.source_spelling(clk, span), "clk");
+            assert_eq!(ctx.source_spelling(upper, span), "CLK");
+        }
+    }
+
+    #[test]
+    fn source_spelling_is_case_insensitive_for_vhdl_only() {
+        let interner = Interner::new();
+        let mut db = SourceDb::new();
+        let text = "signal CLK : bit;";
+        let vhd = db.add_source("t.vhd", text.to_string());
+        let v = db.add_source("t.v", text.to_string());
+        let ctx = LintContext::new(&interner, &db);
+        let clk = interner.get_or_intern("clk");
+        assert_eq!(
+            ctx.source_spelling(clk, Span::new(vhd, 0, text.len() as u32)),
+            "CLK"
+        );
+        // The same text in a Verilog file does not contain `clk`.
+        assert_eq!(
+            ctx.source_spelling(clk, Span::new(v, 0, text.len() as u32)),
+            "clk"
         );
     }
 
