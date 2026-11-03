@@ -149,6 +149,13 @@ pub(crate) fn lower_expr(expr: &Expr, netlist: &mut Netlist) -> SignalRef {
                 BinaryOp::Xor => CellKind::Xor { width },
                 BinaryOp::Shl => CellKind::Shl { width },
                 BinaryOp::Shr => CellKind::Shr { width },
+                // `>>>` of an unsigned operand is a logical shift.
+                BinaryOp::AShr if !expr_is_signed(lhs, netlist) => CellKind::Shr { width },
+                BinaryOp::AShr => {
+                    let lhs_width = expr_width(lhs, netlist).unwrap_or(width);
+                    lower_signed_ashr(left, right, lhs_width, width, out, netlist);
+                    return SignalRef::Signal(out);
+                }
                 BinaryOp::Eq | BinaryOp::Ne => CellKind::Eq { width },
                 BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => CellKind::Lt { width },
                 BinaryOp::LogicAnd | BinaryOp::LogicOr => {
@@ -408,6 +415,123 @@ pub(crate) fn lower_expr(expr: &Expr, netlist: &mut Netlist) -> SignalRef {
             SignalRef::Signal(out)
         }
     }
+}
+
+/// Returns `true` if `expr` is signed by the Verilog expression typing rules
+/// (IEEE 1364-2005 5.5.1), as the simulator evaluates it: a whole signal of
+/// a signed vector or integer type is signed; `~`/`-` keep their operand's
+/// signedness; arithmetic, bitwise and `?:` results are signed only if both
+/// operands are; a shift or power takes its left operand's signedness.
+/// Literals, selects, concatenations and everything else are unsigned.
+fn expr_is_signed(expr: &Expr, netlist: &Netlist) -> bool {
+    match expr {
+        Expr::Signal(SignalRef::Signal(id)) => matches!(
+            netlist.types.get(netlist.signals.get(*id).ty),
+            Type::Integer | Type::BitVec { signed: true, .. }
+        ),
+        Expr::Unary {
+            op: UnaryOp::Not | UnaryOp::Neg,
+            operand,
+            ..
+        } => expr_is_signed(operand, netlist),
+        Expr::Binary { op, lhs, rhs, .. } => match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Xor => expr_is_signed(lhs, netlist) && expr_is_signed(rhs, netlist),
+            BinaryOp::Shl | BinaryOp::Shr | BinaryOp::AShr | BinaryOp::Pow => {
+                expr_is_signed(lhs, netlist)
+            }
+            _ => false,
+        },
+        Expr::Ternary {
+            true_val,
+            false_val,
+            ..
+        } => expr_is_signed(true_val, netlist) && expr_is_signed(false_val, netlist),
+        _ => false,
+    }
+}
+
+/// Emits the cells for an arithmetic right shift of a signed operand,
+/// driving `out` (`width` bits) with `left >>> right`.
+///
+/// There is no arithmetic-shift cell, so it is built from a logical shift
+/// using `a >>> n == ((a ^ m) >> n) ^ m`, where `m` replicates the sign bit
+/// `a[lhs_width - 1]` across the result: for a non-negative `a` the mask is
+/// zero, and for a negative `a` the double inversion turns the zeros the
+/// logical shift brings in into ones.
+fn lower_signed_ashr(
+    left: SignalRef,
+    right: SignalRef,
+    lhs_width: u32,
+    width: u32,
+    out: aion_ir::SignalId,
+    netlist: &mut Netlist,
+) {
+    let bit_ty = netlist.types.intern(Type::Bit);
+    let vec_ty = if width == 1 {
+        bit_ty
+    } else {
+        netlist.types.intern(Type::BitVec {
+            width,
+            signed: false,
+        })
+    };
+    let sign = netlist.add_signal("ashr_sign", bit_ty, SignalKind::Wire);
+    netlist.add_cell(
+        "ashr_sign",
+        CellKind::Slice {
+            offset: lhs_width.max(1) - 1,
+            width: 1,
+        },
+        vec![
+            netlist.input_conn("A", left.clone()),
+            netlist.output_conn("Y", SignalRef::Signal(sign)),
+        ],
+    );
+    let mask = netlist.add_signal("ashr_mask", vec_ty, SignalKind::Wire);
+    netlist.add_cell(
+        "ashr_mask",
+        CellKind::Repeat { count: width },
+        vec![
+            netlist.input_conn("A", SignalRef::Signal(sign)),
+            netlist.output_conn("Y", SignalRef::Signal(mask)),
+        ],
+    );
+    let flipped = netlist.add_signal("ashr_flip", vec_ty, SignalKind::Wire);
+    netlist.add_cell(
+        "ashr_flip",
+        CellKind::Xor { width },
+        vec![
+            netlist.input_conn("A", left),
+            netlist.input_conn("B", SignalRef::Signal(mask)),
+            netlist.output_conn("Y", SignalRef::Signal(flipped)),
+        ],
+    );
+    let shifted = netlist.add_signal("ashr_shift", vec_ty, SignalKind::Wire);
+    netlist.add_cell(
+        "ashr_shift",
+        CellKind::Shr { width },
+        vec![
+            netlist.input_conn("A", SignalRef::Signal(flipped)),
+            netlist.input_conn("B", right),
+            netlist.output_conn("Y", SignalRef::Signal(shifted)),
+        ],
+    );
+    netlist.add_cell(
+        "ashr_unflip",
+        CellKind::Xor { width },
+        vec![
+            netlist.input_conn("A", SignalRef::Signal(shifted)),
+            netlist.input_conn("B", SignalRef::Signal(mask)),
+            netlist.output_conn("Y", SignalRef::Signal(out)),
+        ],
+    );
 }
 
 /// Tries to evaluate an expression as a constant integer.
@@ -1004,6 +1128,101 @@ mod tests {
             .iter()
             .any(|(_, c)| matches!(&c.kind, CellKind::Shl { .. }));
         assert!(has_shl);
+    }
+
+    /// Adds an 8-bit signal with the given signedness, returning its id.
+    fn add_vec8(netlist: &mut Netlist, name: &str, signed: bool) -> SignalId {
+        let ty = netlist.types.intern(Type::BitVec { width: 8, signed });
+        netlist.add_signal(name, ty, SignalKind::Wire)
+    }
+
+    fn ashr_of(sig: SignalId, ty: TypeId) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::AShr,
+            lhs: Box::new(Expr::Signal(SignalRef::Signal(sig))),
+            rhs: Box::new(Expr::Literal(LogicVec::from_u64(1, 8))),
+            ty,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn kinds(netlist: &Netlist) -> Vec<CellKind> {
+        netlist.cells.iter().map(|(_, c)| c.kind.clone()).collect()
+    }
+
+    #[test]
+    fn lower_ashr_of_unsigned_operand_is_a_logical_shift() {
+        let interner = Interner::new();
+        let mut netlist = make_netlist(&interner);
+        let ty = vec8_ty(&mut netlist);
+        let u = add_vec8(&mut netlist, "u", false);
+        let before = netlist.cells.len();
+        lower_expr(&ashr_of(u, ty), &mut netlist);
+        let new: Vec<_> = kinds(&netlist).into_iter().skip(before).collect();
+        assert!(new.iter().any(|k| matches!(k, CellKind::Shr { width: 8 })));
+        assert!(!new.iter().any(|k| matches!(k, CellKind::Xor { .. })));
+    }
+
+    #[test]
+    fn lower_ashr_of_signed_operand_sign_fills_via_mask() {
+        let interner = Interner::new();
+        let mut netlist = make_netlist(&interner);
+        let ty = vec8_ty(&mut netlist);
+        let s = add_vec8(&mut netlist, "s", true);
+        let out = lower_expr(&ashr_of(s, ty), &mut netlist);
+        let k = kinds(&netlist);
+        // sign = s[7]; mask = {8{sign}}; out = ((s ^ mask) >> 1) ^ mask
+        assert!(k.iter().any(|k| matches!(
+            k,
+            CellKind::Slice {
+                offset: 7,
+                width: 1
+            }
+        )));
+        assert!(k.iter().any(|k| matches!(k, CellKind::Repeat { count: 8 })));
+        assert!(k.iter().any(|k| matches!(k, CellKind::Shr { width: 8 })));
+        assert_eq!(
+            k.iter()
+                .filter(|k| matches!(k, CellKind::Xor { width: 8 }))
+                .count(),
+            2
+        );
+        // The result is driven by the final XOR.
+        let SignalRef::Signal(out) = out else {
+            panic!("expected a signal");
+        };
+        let driver = netlist.driver_map()[&out];
+        assert!(matches!(
+            netlist.cells.get(driver).kind,
+            CellKind::Xor { width: 8 }
+        ));
+    }
+
+    #[test]
+    fn expr_is_signed_follows_verilog_typing() {
+        let interner = Interner::new();
+        let mut netlist = make_netlist(&interner);
+        let ty = vec8_ty(&mut netlist);
+        let s = add_vec8(&mut netlist, "s", true);
+        let u = add_vec8(&mut netlist, "u", false);
+        let rd = |id| Expr::Signal(SignalRef::Signal(id));
+        let bin = |op, l, r| Expr::Binary {
+            op,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+            ty,
+            span: Span::DUMMY,
+        };
+        assert!(expr_is_signed(&rd(s), &netlist));
+        assert!(!expr_is_signed(&rd(u), &netlist));
+        assert!(expr_is_signed(&bin(BinaryOp::Add, rd(s), rd(s)), &netlist));
+        assert!(!expr_is_signed(&bin(BinaryOp::Add, rd(s), rd(u)), &netlist));
+        assert!(expr_is_signed(&bin(BinaryOp::AShr, rd(s), rd(u)), &netlist));
+        assert!(!expr_is_signed(&bin(BinaryOp::Eq, rd(s), rd(s)), &netlist));
+        assert!(!expr_is_signed(
+            &Expr::Literal(LogicVec::from_u64(1, 8)),
+            &netlist
+        ));
     }
 
     #[test]

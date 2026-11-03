@@ -28,3 +28,33 @@
   - Record constraints (`rec_t(f(7 downto 0))`) are not parsed.
   - The elaborator still ignores named choices in aggregates it already accepted before this change (`(0 => '1', others => '0')` lowers as a concat). This is pre-existing, out of scope here, and recorded as a follow-up.
 - **Phase:** Phase 3 — Bitstream & Integration (unchanged).
+
+### Review follow-up
+
+- **Arithmetic right shift (`>>>`):** Verilog, SV and SV `>>>=` used to lower to the logical `BinaryOp::Shr`, so `reg signed [7:0] s = -8; r = s >>> 1;` gave `0x7C` instead of `0xFC`.
+  - `aion_ir` gains `BinaryOp::AShr`. It sign-fills when the left operand is signed and is otherwise identical to `Shr` (IEEE 1364 5.1.12). `<<<` still lowers to `Shl`.
+  - `aion_sim` sign-fills using its existing signedness typing (new `shift_right_arith`; the edit is limited to shift evaluation).
+  - `aion_synth` lowers an unsigned operand to a `Shr` cell. A signed operand is built as `((a ^ m) >> n) ^ m`, where `m` replicates the sign bit, and signedness is decided by the new `expr_is_signed`.
+  - The parameter constant evaluator does not accept shifts at all. It still reports E209, so nothing is miscompiled there.
+- **VHDL aggregates with named/`others` choices** (new module `aion_elaborate::vhdl_aggregate`). Before, `(3 => '1', others => '0')` lowered to the 2-bit concat `"10"`, and `(others => '1')` to a 1-bit `'1'`, which zero-extends to `0x01`.
+  - **Recorded shape:** every VHDL port, signal, variable and constant of known width now records an `AggregateContext` in `SignalEnv`: its width, plus its index range when it is a 1-D array of single bits.
+  - **Where context is used:** signal and variable assignments, conditional and selected alternatives (concurrent, sequential, clocked), and case bodies lower the value against the target. This covers whole objects and constant slices in the same direction.
+  - **Layout:** choices map to positions through the target's `to`/`downto` range, with the leftmost index as the MSB. Supported forms: index, range and `|` choices; positional elements followed by `others`; and `others => x` with a non-constant single bit, which becomes a `Repeat`.
+  - **Uniform fills:** `(others => c)` and nested `(others => (others => c))` only need the width.
+  - **Defaults:** named aggregates are laid out over the declared range. A layout that fails is still W204.
+  - **New errors:**
+    - E210 when no index range is known, or for a non-constant choice;
+    - E210 for a named aggregate without `others` on a descending target. Its direction would come from the ascending index subtype (1076-2008 9.3.3.3), so the bit order would not follow the indices;
+    - E205 for an out-of-range index, an index given twice, a missing position, or too many positional elements.
+  - **Exception:** with no context, `(others => '0')` still lowers to a 1-bit zero. Zero-extension makes that exact, as with SV `'0`.
+- **Tests:**
+  - new `aion_conformance/tests/sim_arith_shift.rs` (3) and `vhdl_aggregate_semantics.rs` (14);
+  - `vhdl_aggregate` unit tests (11);
+  - sim `ashr_sign_fills_signed_and_zero_fills_unsigned`;
+  - synth AShr/`expr_is_signed` (3);
+  - elaborate op mapping (1), and the no-context aggregate test extended.
+- **Left unsupported / found:**
+  - Non-constant or attribute choices (`v'range => '0'`) and choices naming architecture constants (only generics are constants here) give E210.
+  - Aggregates for element targets `m(i)` or arrays of vectors support only uniform fills.
+  - Pre-existing and out of scope: `lower_vhdl_to_signal_ref` ignores index and slice suffixes. `y(0) <= '1'` assigns all of `y`, so `x"F0"` becomes `0x01`.
+  - VHDL `sra`/`rol`/`ror` are still approximated as logical shifts.
