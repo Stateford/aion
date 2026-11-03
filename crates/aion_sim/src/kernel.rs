@@ -1465,7 +1465,7 @@ fn collect_expr_reads_inner(
 ) {
     match expr {
         Expr::Signal(sr) => collect_signal_ref_reads(sr, signal_map, result),
-        Expr::Literal(_) | Expr::NamedConst { .. } => {}
+        Expr::Literal(_) | Expr::SignedLiteral { .. } | Expr::NamedConst { .. } => {}
         Expr::Unary { operand, .. } => collect_expr_reads_inner(operand, signal_map, result),
         Expr::Binary { lhs, rhs, .. } => {
             collect_expr_reads_inner(lhs, signal_map, result);
@@ -2038,6 +2038,31 @@ mod tests {
         let reads = collect_expr_read_signals(&expr, &map);
         assert!(reads.contains(&SimSignalId::from_raw(10)));
         assert!(reads.contains(&SimSignalId::from_raw(11)));
+    }
+
+    #[test]
+    fn collect_expr_reads_skips_signed_literals() {
+        // `s + 1`: the signed literal reads no signal; the signal still counts.
+        let mut map = HashMap::new();
+        map.insert(SignalId::from_raw(0), SimSignalId::from_raw(10));
+        let expr = Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(Expr::Signal(SignalRef::Signal(SignalId::from_raw(0)))),
+            rhs: Box::new(Expr::SignedLiteral {
+                value: LogicVec::from_u64(1, 1),
+                sized: false,
+            }),
+            ty: aion_ir::TypeId::from_raw(0),
+            span: Span::DUMMY,
+        };
+        let reads = collect_expr_read_signals(&expr, &map);
+        assert_eq!(reads.len(), 1);
+        assert!(reads.contains(&SimSignalId::from_raw(10)));
+        let lit = Expr::SignedLiteral {
+            value: LogicVec::from_u64(2, 8),
+            sized: true,
+        };
+        assert!(collect_expr_read_signals(&lit, &map).is_empty());
     }
 
     #[test]

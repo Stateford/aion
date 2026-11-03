@@ -770,7 +770,9 @@ fn sv_pattern_bit(
         Expr::Literal { span } => {
             // Sized literals may carry x/z digits: take the literal's LSB.
             match lower_verilog_literal(*span, source_db) {
-                IrExpr::Literal(lv) if lv.width() > 0 => Some(lv.get(0)),
+                IrExpr::Literal(lv) | IrExpr::SignedLiteral { value: lv, .. } if lv.width() > 0 => {
+                    Some(lv.get(0))
+                }
                 _ => None,
             }
         }
@@ -1329,6 +1331,12 @@ pub(crate) fn logic_vec_from_u64(width: u32, val: u64) -> LogicVec {
 ///
 /// For sized literals like `24'h000000`, the explicit width is used.
 /// For unsized literals like `42`, width is inferred from the value.
+///
+/// A signed literal (IEEE 1364-2005 3.5.1) lowers to an
+/// [`IrExpr::SignedLiteral`] with the same bits: an unsized decimal number
+/// (`42`) or a based literal with the `s` flag (`8'sd2`, `'sh7`). Every
+/// other literal (`8'd2`, `'hFF`) is unsigned and lowers to
+/// [`IrExpr::Literal`].
 fn lower_verilog_literal(span: Span, source_db: &SourceDb) -> IrExpr {
     let text = source_db.snippet(span);
     if let Some((explicit_width, val)) = const_eval::parse_verilog_literal_with_width(text) {
@@ -1340,9 +1348,27 @@ fn lower_verilog_literal(span: Span, source_db: &SourceDb) -> IrExpr {
             64 - val.unsigned_abs().leading_zeros()
         };
         let width = width.max(1);
-        IrExpr::Literal(logic_vec_from_u64(width, val as u64))
+        let value = logic_vec_from_u64(width, val as u64);
+        if verilog_literal_is_signed(text) {
+            IrExpr::SignedLiteral {
+                value,
+                sized: explicit_width.is_some(),
+            }
+        } else {
+            IrExpr::Literal(value)
+        }
     } else {
         IrExpr::Literal(LogicVec::all_zero(32))
+    }
+}
+
+/// Returns whether a Verilog/SV numeric literal token is signed: a decimal
+/// number with no base (`42`), or a based literal whose base carries the
+/// `s`/`S` flag (`8'sd2`, `'SH7`). IEEE 1364-2005 3.5.1.
+fn verilog_literal_is_signed(text: &str) -> bool {
+    match text.find('\'') {
+        None => true,
+        Some(tick) => text[tick + 1..].trim_start().starts_with(['s', 'S']),
     }
 }
 
@@ -1868,7 +1894,56 @@ mod tests {
             span: aion_source::Span::new(fid, 0, 2),
         };
         let ir = lower_verilog_expr(&ast_expr, &env, &sdb, &interner, &sink);
-        assert!(matches!(ir, IrExpr::Literal(_)));
+        // An unsized decimal is a signed integer (IEEE 1364-2005 3.5.1).
+        assert!(matches!(ir, IrExpr::SignedLiteral { sized: false, .. }));
+    }
+
+    /// Lowers the literal token `text` and returns `(bits, signed, sized)`,
+    /// where `bits` is MSB first, `signed` says whether it lowered to a
+    /// `SignedLiteral`, and `sized` is that variant's flag (`true` for an
+    /// unsigned literal).
+    fn lower_lit_token(text: &str) -> (String, bool, bool) {
+        let (mut sdb, _interner, _sink, _env) = setup();
+        let fid = sdb.add_source("test.v", text.to_string());
+        let span = aion_source::Span::new(fid, 0, text.len() as u32);
+        let (lv, signed, sized) = match lower_verilog_literal(span, &sdb) {
+            IrExpr::Literal(lv) => (lv, false, true),
+            IrExpr::SignedLiteral { value, sized } => (value, true, sized),
+            other => panic!("{text}: expected a literal, got {other:?}"),
+        };
+        let bits = (0..lv.width())
+            .rev()
+            .map(|i| {
+                if lv.get(i) == aion_common::Logic::One {
+                    '1'
+                } else {
+                    '0'
+                }
+            })
+            .collect();
+        (bits, signed, sized)
+    }
+
+    #[test]
+    fn signed_literals_lower_to_signed_literal() {
+        // Unsized decimals and `s`-flagged based literals are signed; the
+        // bits are the same as an unsigned literal would carry.
+        assert_eq!(lower_lit_token("5"), ("101".into(), true, false));
+        assert_eq!(lower_lit_token("0"), ("0".into(), true, false));
+        assert_eq!(lower_lit_token("8'sd2"), ("00000010".into(), true, true));
+        assert_eq!(lower_lit_token("4'SHf"), ("1111".into(), true, true));
+        assert_eq!(lower_lit_token("'sd5"), ("101".into(), true, false));
+        assert_eq!(lower_lit_token("8 'sb1"), ("00000001".into(), true, true));
+    }
+
+    #[test]
+    fn unsigned_literals_stay_literal() {
+        // Without `s`, a based literal is unsigned, sized or not.
+        assert_eq!(lower_lit_token("8'd2"), ("00000010".into(), false, true));
+        assert_eq!(lower_lit_token("'hF"), ("1111".into(), false, true));
+        assert_eq!(lower_lit_token("2'b10"), ("10".into(), false, true));
+        // An unparseable token (a real) falls back to an unsigned zero.
+        assert_eq!(lower_lit_token("1.5"), ("0".repeat(32), false, true));
     }
 
     #[test]
@@ -1916,7 +1991,7 @@ mod tests {
         let fid = sdb.add_source("test.v", "42".to_string());
         let span = aion_source::Span::new(fid, 0, 2);
         let ir = lower_verilog_literal(span, &sdb);
-        if let IrExpr::Literal(lv) = &ir {
+        if let IrExpr::SignedLiteral { value: lv, .. } = &ir {
             // 42 = 0b101010, needs 6 bits
             assert_eq!(lv.width(), 6, "42 should produce 6-bit LogicVec");
         } else {

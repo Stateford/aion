@@ -118,7 +118,7 @@ fn stmt_span(stmt: &Statement) -> Option<aion_source::Span> {
 
 /// Checks if an expression is a literal boolean (all-zeros = false, all-ones = true).
 fn is_literal_bool(expr: &Expr) -> Option<bool> {
-    if let Expr::Literal(lv) = expr {
+    if let Expr::Literal(lv) | Expr::SignedLiteral { value: lv, .. } = expr {
         if lv.is_all_zero() {
             return Some(false);
         }
@@ -272,6 +272,42 @@ mod tests {
         let sink = DiagnosticSink::new();
         DeadLogic.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
+    }
+
+    #[test]
+    fn signed_literal_constant_condition() {
+        // `if (1)` / `if (0)`: unsized decimals lower to signed literals and
+        // are still constant conditions.
+        for (v, expected) in [(1u64, "always true"), (0, "always false")] {
+            let mut module = mk_module();
+            module.processes.alloc(Process {
+                id: ProcessId::from_raw(0),
+                name: None,
+                kind: ProcessKind::Combinational,
+                body: Statement::If {
+                    condition: Expr::SignedLiteral {
+                        value: LogicVec::from_u64(v, 1),
+                        sized: false,
+                    },
+                    then_body: Box::new(Statement::Assign {
+                        target: SignalRef::Signal(SignalId::from_raw(0)),
+                        value: Expr::Literal(LogicVec::from_bool(true)),
+                        kind: aion_ir::AssignKind::Blocking,
+                        span: Span::DUMMY,
+                    }),
+                    else_body: None,
+                    span: Span::DUMMY,
+                },
+                sensitivity: Sensitivity::All,
+                span: Span::DUMMY,
+            });
+            let design = mk_design(module);
+            let sink = DiagnosticSink::new();
+            DeadLogic.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
+            let diags = sink.take_all();
+            assert_eq!(diags.len(), 1, "{v}: {diags:?}");
+            assert!(diags[0].message.contains(expected), "{}", diags[0].message);
+        }
     }
 
     #[test]

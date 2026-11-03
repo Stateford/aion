@@ -367,7 +367,7 @@ pub fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
             // Would need module context to resolve signal types.
             SignalRef::Signal(_) | SignalRef::Concat(_) => None,
         },
-        Expr::Literal(lv) => {
+        Expr::Literal(lv) | Expr::SignedLiteral { value: lv, .. } => {
             if lv.width() == 1 && (lv.is_all_zero() || lv.is_all_one()) {
                 return None;
             }
@@ -390,8 +390,12 @@ pub fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
         Expr::Index { .. } => Some(1),
         Expr::Slice { high, low, .. } => match (high.as_ref(), low.as_ref()) {
             (
-                Expr::Literal(h) | Expr::NamedConst { value: h, .. },
-                Expr::Literal(l) | Expr::NamedConst { value: l, .. },
+                Expr::Literal(h)
+                | Expr::SignedLiteral { value: h, .. }
+                | Expr::NamedConst { value: h, .. },
+                Expr::Literal(l)
+                | Expr::SignedLiteral { value: l, .. }
+                | Expr::NamedConst { value: l, .. },
             ) => range_width(h.to_u64()?, l.to_u64()?),
             _ => None,
         },
@@ -706,7 +710,7 @@ fn collect_expr_signals_into(expr: &Expr, result: &mut HashSet<SignalId>) {
         Expr::Signal(sref) => {
             collect_signal_ref_signals_into(sref, result);
         }
-        Expr::Literal(_) | Expr::NamedConst { .. } => {}
+        Expr::Literal(_) | Expr::SignedLiteral { .. } | Expr::NamedConst { .. } => {}
         Expr::Unary { operand, .. } => {
             collect_expr_signals_into(operand, result);
         }
@@ -1442,6 +1446,29 @@ mod tests {
             span: dummy_span(),
         };
         assert_eq!(expr_width(&e, &design), None);
+    }
+
+    #[test]
+    fn expr_width_signed_literal_like_literal() {
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        let slit = |v, w, sized| Expr::SignedLiteral {
+            value: LogicVec::from_u64(v, w),
+            sized,
+        };
+        // Same width as the unsigned literal with the same bits.
+        assert_eq!(expr_width(&slit(2, 8, true), &design), Some(8));
+        assert_eq!(expr_width(&slit(5, 3, false), &design), Some(3));
+        // A 1-bit 0/1 stays context-dependent, as for `Literal`.
+        assert_eq!(expr_width(&slit(1, 1, false), &design), None);
+        // Constant slice bounds such as `a[7:0]` (unsized decimals).
+        let e = Expr::Slice {
+            expr: Box::new(mk_signal_expr(SignalId::from_raw(0))),
+            high: Box::new(slit(7, 3, false)),
+            low: Box::new(slit(0, 1, false)),
+            span: dummy_span(),
+        };
+        assert_eq!(expr_width(&e, &design), Some(8));
+        assert!(collect_expr_signals(&slit(3, 2, false)).is_empty());
     }
 
     #[test]

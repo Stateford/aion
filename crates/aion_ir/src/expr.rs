@@ -77,7 +77,11 @@ pub enum BinaryOp {
 pub enum Expr {
     /// A reference to a signal (or part of a signal).
     Signal(SignalRef),
-    /// A literal constant value.
+    /// A literal constant value, typed unsigned at exactly its own width.
+    ///
+    /// This is a sized or based literal without the `s` flag (`8'd2`,
+    /// `'hFF`, `4'bx01z`), a VHDL literal, or a constant the elaborator
+    /// synthesized. Signed Verilog literals use [`Expr::SignedLiteral`].
     Literal(LogicVec),
     /// A reference to a named compile-time constant (a Verilog/SV
     /// `parameter` or `localparam`, or a VHDL generic), already resolved to
@@ -172,6 +176,31 @@ pub enum Expr {
         /// Source location.
         span: Span,
     },
+    /// A signed Verilog/SystemVerilog literal (IEEE 1364-2005 3.5.1): an
+    /// unsized decimal number such as `5`, or a based literal with the `s`
+    /// flag such as `8'sd2` or `'sh7`.
+    ///
+    /// `value` holds exactly the bits an [`Expr::Literal`] for the same token
+    /// would, so a consumer that does not care about signedness (synthesis,
+    /// most lint rules) can treat both variants alike. Only expression typing
+    /// differs: the literal is signed, so an operation whose other operands
+    /// are all signed stays signed (`s < 0` with `reg signed [7:0] s`).
+    ///
+    /// The variant is the last one so that adding it kept the serialized
+    /// tags of every other variant unchanged.
+    SignedLiteral {
+        /// The literal's bits. For a sized literal this is its declared
+        /// width, with the MSB as the sign bit. For an unsized literal it is
+        /// the non-negative magnitude at the smallest width that holds it
+        /// (the same bits `Literal` would carry).
+        value: LogicVec,
+        /// Whether the literal has an explicit size (`8'sd2`). An unsized
+        /// literal (`5`, `'sd5`) is a 32-bit signed integer in expressions:
+        /// its `value` is zero-extended to 32 bits (wider only if the
+        /// magnitude needs it) before the sign bit is read, so `1` is +1,
+        /// not a 1-bit -1.
+        sized: bool,
+    },
 }
 
 #[cfg(test)]
@@ -226,6 +255,49 @@ mod tests {
         // A literal of the same value does not deserialize as a NamedConst.
         let lit_json = serde_json::to_string(&Expr::Literal(value)).unwrap();
         assert_ne!(json, lit_json);
+    }
+
+    #[test]
+    fn signed_literal_bincode_roundtrip() {
+        for (value, sized) in [
+            (LogicVec::from_u64(2, 8), true),
+            (LogicVec::from_u64(5, 3), false),
+        ] {
+            let e = Expr::SignedLiteral {
+                value: value.clone(),
+                sized,
+            };
+            let config = bincode::config::standard();
+            let bytes = bincode::serde::encode_to_vec(&e, config).unwrap();
+            let (back, _): (Expr, usize) =
+                bincode::serde::decode_from_slice(&bytes, config).unwrap();
+            match back {
+                Expr::SignedLiteral { value: v, sized: z } => {
+                    assert_eq!(v, value);
+                    assert_eq!(z, sized);
+                }
+                other => panic!("expected SignedLiteral, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn signed_literal_is_distinct_from_unsigned_literal() {
+        let value = LogicVec::from_u64(2, 8);
+        let config = bincode::config::standard();
+        let signed = bincode::serde::encode_to_vec(
+            Expr::SignedLiteral {
+                value: value.clone(),
+                sized: true,
+            },
+            config,
+        )
+        .unwrap();
+        let unsigned = bincode::serde::encode_to_vec(Expr::Literal(value), config).unwrap();
+        assert_ne!(signed, unsigned);
+        let (back, _): (Expr, usize) =
+            bincode::serde::decode_from_slice(&unsigned, config).unwrap();
+        assert!(matches!(back, Expr::Literal(_)));
     }
 
     #[test]

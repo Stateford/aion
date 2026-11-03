@@ -108,7 +108,7 @@ fn check_expr_magic_numbers(
     match expr {
         // A parameter reference is the named constant this rule asks for.
         Expr::NamedConst { .. } => {}
-        Expr::Literal(lv) => {
+        Expr::Literal(lv) | Expr::SignedLiteral { value: lv, .. } => {
             // Skip 1-bit literals and values 0/1
             if lv.width() <= 1 {
                 return;
@@ -337,6 +337,29 @@ mod tests {
         assert!(diags[0].message.contains("0xDEAD"));
         assert!(diags[0].message.contains("16-bit"));
         assert!(!diags[0].help.is_empty());
+    }
+
+    #[test]
+    fn signed_literal_magic_number() {
+        // `y = 42` (an unsized decimal) is a magic number; `y = 1` is not.
+        let mut module = mk_module();
+        for v in [42u64, 1] {
+            let w = 64 - v.leading_zeros();
+            module.assignments.push(Assignment {
+                target: SignalRef::Signal(SignalId::from_raw(0)),
+                value: Expr::SignedLiteral {
+                    value: LogicVec::from_u64(v, w),
+                    sized: false,
+                },
+                span: Span::DUMMY,
+            });
+        }
+        let design = mk_design(module);
+        let sink = DiagnosticSink::new();
+        MagicNumber.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
+        let diags = sink.take_all();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("0x2A"), "{}", diags[0].message);
     }
 
     #[test]

@@ -70,3 +70,46 @@
     width is unknown.
 - **Phase status:** Phase 3 (Bitstream & Integration) is current; issue #6
   is fully addressed in `aion_sim`, apart from the `>>>` gap above.
+
+### Review follow-up
+
+- **Signed literals.** The IR could not tell `8'sd2` or an unsized `5`
+  from `8'd2`, so the simulator typed every literal unsigned. One literal
+  in an expression made it unsigned: `i < 0` with `integer i = -1` gave 0,
+  and `w16 = s + 1` zero-extended `s`.
+  - `aion_ir`: new `Expr::SignedLiteral { value, sized }`, added as the last
+    variant so the serialized tags of the other variants do not change.
+    `value` holds the same bits `Literal` would.
+  - `aion_elaborate` (`lower_verilog_literal` only): unsized decimals and
+    `'s` based literals lower to `SignedLiteral`. Every other literal stays
+    `Literal`.
+  - `aion_sim`: a sized signed literal is signed at its own width. An unsized
+    one is a 32-bit signed integer (IEEE 1364-2005 3.5.1): it is
+    zero-extended first, so `1` is +1. A magnitude wider than 32 bits gets
+    one extra bit.
+  - `aion_lint` and `aion_synth` treat `SignedLiteral` exactly like
+    `Literal`, so their behaviour does not change.
+- **`$display` specifiers.** `format_display` now parses
+  `%[-][width]<conv>` for `d h x o b t c s m %`. `%0d` used to print `%0d`
+  and swallow its argument.
+  - No width keeps the old output. `%0` prints the minimum digits, which
+    also trims `%0b`.
+  - An explicit width pads decimal, time and text with spaces and
+    `b`/`o`/`h` with zeros. `-` left-justifies.
+  - A huge width is capped at 64 Ki characters.
+  - `%m` takes no argument and prints `%m`, because the evaluator does not
+    know the scope.
+- **Tests:**
+  - Evaluator: 7 new unit tests (4 for display, 3 for signed literals).
+  - `aion_conformance`: 3 end-to-end tests. Two of them (the review repros)
+    fail on the previous commit.
+  - `aion_elaborate`: lowering tests for signed and unsigned literal tokens.
+  - `aion_ir`: serde round-trip tests for the new variant.
+  - Lint (`expr_width`, C203, W108), synthesis and kernel tests for the new
+    variant.
+- **Still open:**
+  - Parameters (`NamedConst`) are still unsigned. The elaborator does not
+    record parameter signedness.
+  - Unsized based literals (`'hFF`) are unsigned, which is correct. The
+    simulator still sizes them at their minimal width, not 32 bits.
+  - X/Z literals still lower to 0 in the elaborator.
