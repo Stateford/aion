@@ -5,31 +5,20 @@
 
 ---
 
-## 2026-11-02 — Verilog/SV Parsers: Parameter Lists, Delays, SV Time Literals (Part of #35)
+## 2026-11-02 — VHDL Parser: Expression Precedence and Associativity per LRM 9.2 (Fixes #20)
 
-- **PAR-1 (parameter lists):** `localparam IDLE = 0, RUN = 1, DONE = 2;` used to keep only `IDLE`. Now each name is its own `ParameterDecl`/`LocalparamDecl` item.
-  - A new `parse_module_item() -> Vec<ModuleItem>` is used by every item-collecting caller: module, interface, package, generate, function/task and named-block bodies.
-  - Later names inherit the type, `signed` and range of the first name. In `#(...)` lists, a name without a keyword inherits the kind of the name before it.
-- **Elaborator:** body `parameter`/`localparam` declarations are now evaluated in order into the const env and `Module::params`. Before this, they were never evaluated, so `wire [C-1:0]` failed with E209. A body `parameter` can be overridden only when the module has no `#(...)` list (IEEE 1364 §12.2).
-- **PAR-21 (delays):** these are now parsed into the AST:
-  - intra-assignment timing (`q <= #1 d;`, `a = #5 b;`, `a = @(posedge clk) b;`, `@*`, `@name`), as a `timing: Option<TimingControl>` field on `Blocking`/`NonBlocking`;
-  - `assign #2`/`#(1,2)`, `wire [..] #1 w [= a]` and gate delays, as `delay: Option<Delay>`;
-  - multi-instance gates (`and #1 g1(..), g2(..);`), which give one `GateInst` per instance.
-  - Event-control statements also accept `@name`.
-- **Elaborator choices:** the IR cannot express a delayed assignment, so `q <= #1 d` (sample now, update 1 unit later) is lowered as zero-delay with the new warning **W205**. This is what synthesis implements, and it is never silent. Delays on continuous assignments and net declarations get the new warning **W206**. Gates are still not elaborated, so gate delays produce no warning.
-- **SV time literals:** the lexer now has a `TimeLiteral` token (`10ns`, `1.5ps`, `100fs`, `1s`, `2ms`, `3us`, `1step`), parsed as `Expr::TimeLiteral`.
-  - Delays convert exactly to fs: `#10ns` = 10,000,000 fs, independent of the timescale.
-  - `1step` (unknown precision) and anything below 1 fs give the new warning **W207**. Out-of-range values give E209.
-  - In value context, a literal becomes a count of the assumed 1 ns unit. W207 fires if the result is not a whole number.
+- **New binding powers** (`aion_vhdl_parser/src/expr.rs`): logical (1,2), relational (3,4), shift (5,6), adding (7,8), **sign prefix 9**, multiplying (10,11), `**` (12,13), and `not`/`abs`/`??`/reductions at prefix 14. A sign now covers a whole term, so `-7 mod 3` is `-(7 mod 3)` (VHDL-3). Before, every unary operator was at 11.
+- **LRM restrictions (VHDL-14):** each one now raises E101 with a suggested parenthesization, and the parser still builds the tree and keeps going:
+  - mixed logical operators (`a and b or c`) and `nand`/`nor` chains are errors; `a and b and c` stays legal;
+  - chained relational, shift and `**` operators (`a = b = c`, `a sll 1 sll 2`, `2 ** 3 ** 2`) are errors;
+  - a sign right after an adding, multiplying or `**` operator (`a + -b`, `a ** -b`) is an error;
+  - `**` combined with `not`/`abs` (`abs a ** 2`, `a ** not b`) is an error, and so is a nested prefix (`not not a`).
+- **Reductions:** the VHDL-2008 unary `and/or/nand/nor/xor/xnor v` operators are parsed as factors, using the new `UnaryOp::Red*` variants. The elaborator maps them to the IR `RedAnd`/`RedOr`/`RedXor`, and the nand/nor/xnor forms to `Not(Red*)`.
 - **Tests:**
-  - Verilog parser +17 and SV parser +14 (including lexer and serde);
-  - const_eval +2, errors +2, elaborator +10;
-  - 1 conformance test.
-- **Known gaps:**
-  - Parameter names inside expressions (`s == IDLE`) still give E204 for header params too: expression lowering does not consult the const env.
-  - Net-declaration initializers (`wire w = a;`) are parsed but dropped by the elaborator.
-  - Not supported yet: min:typ:max delays, drive strengths, `repeat (n) @` intra-assignment controls, gate instance arrays, and `assign a = b, c = d;`.
-
+  - 20 parser tests: a precedence table covering every level boundary in both orders, associativity, the legal parenthesized forms, a rejection test for each illegal form (checking the recovered tree), the reductions, and full-design recovery;
+  - 3 elaborator lowering tests.
+- **Repo check:** the example `.vhd` files and the existing tests use none of the newly rejected forms.
+- **Known gaps:** an expression of the form `?? primary` is not checked further (for example `?? a and b`).
 ## 2026-11-02 — VHDL Parser: Case-Fold Basic Identifiers at Intern Time (Fixes #15)
 
 - **Folding:** a new `VhdlParser::intern_current_ident` backs `expect_ident`, `expect_ident_or_keyword` and `eat_ident`. These are the only places that intern source identifier text, and they cover names, labels, end names, selected names, attribute names and keywords used as names. Basic identifiers and keywords are interned as ASCII lowercase (LRM 15.4.2). Extended identifiers (`\Foo\`) are kept verbatim, backslashes included. A port declared `Clk` and used as `clk`/`CLK` now resolves, and `architecture a of TOP` binds to `entity Top`.
