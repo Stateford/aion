@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use aion_common::{ContentHash, Ident, Logic, LogicVec};
+use aion_diagnostics::DiagnosticSink;
 use aion_ir::arena::Arena;
 use aion_ir::cell::{Cell, CellKind, Connection};
 use aion_ir::ids::{CellId, ModuleId, ProcessId, SignalId, TypeId};
@@ -21,6 +22,7 @@ use crate::const_eval::{self, ConstEnv};
 use crate::context::ElaborationContext;
 use crate::errors;
 use crate::expr::{lower_vhdl_expr, lower_vhdl_to_signal_ref, SignalEnv};
+use crate::ranges::{resolve_vhdl_discrete_range, DeclaredRange, RangeEnv, ResolvedRange};
 use crate::registry::ModuleEntry;
 use crate::stmt::lower_vhdl_stmt;
 use crate::types;
@@ -46,9 +48,19 @@ pub fn elaborate_vhdl_entity(
     let mut sig_env = SignalEnv::new();
     let mut ports = Vec::new();
 
+    // Declared index ranges of generics, ports, objects and types, for
+    // range attributes such as `v'range`.
+    let mut ranges = RangeEnv::new();
+    if let Some(ref generics) = entity.generics {
+        for gen in &generics.decls {
+            ranges.declare_object(&gen.names, &gen.ty, &const_env, ctx.source_db, ctx.interner);
+        }
+    }
+
     elaborate_vhdl_ports(
         entity,
         &const_env,
+        &mut ranges,
         &mut signals,
         &mut sig_env,
         &mut ports,
@@ -57,7 +69,15 @@ pub fn elaborate_vhdl_entity(
 
     // Architecture declarations
     for decl in &arch.decls {
-        elaborate_vhdl_decl(decl, None, &const_env, &mut signals, &mut sig_env, ctx);
+        elaborate_vhdl_decl(
+            decl,
+            None,
+            &const_env,
+            &mut ranges,
+            &mut signals,
+            &mut sig_env,
+            ctx,
+        );
     }
 
     let mut cells: Arena<CellId, Cell> = Arena::new();
@@ -68,6 +88,7 @@ pub fn elaborate_vhdl_entity(
         elaborate_vhdl_concurrent(
             stmt,
             &const_env,
+            &mut ranges,
             &mut signals,
             &mut sig_env,
             &mut cells,
@@ -149,10 +170,12 @@ fn apply_vhdl_generics(
     }
 }
 
-/// Elaborates the port list of a VHDL entity.
+/// Elaborates the port list of a VHDL entity, recording each port's
+/// declared index ranges in `ranges`.
 fn elaborate_vhdl_ports(
     entity: &vhdl_ast::EntityDecl,
     const_env: &ConstEnv,
+    ranges: &mut RangeEnv,
     signals: &mut Arena<SignalId, Signal>,
     sig_env: &mut SignalEnv,
     ports: &mut Vec<Port>,
@@ -167,6 +190,7 @@ fn elaborate_vhdl_ports(
             };
             let ty = types::resolve_vhdl_type(
                 &iface.ty,
+                ranges,
                 &mut ctx.design.types,
                 const_env,
                 ctx.source_db,
@@ -174,6 +198,13 @@ fn elaborate_vhdl_ports(
                 ctx.sink,
             );
             let kind = SignalKind::Port;
+            ranges.declare_object(
+                &iface.names,
+                &iface.ty,
+                const_env,
+                ctx.source_db,
+                ctx.interner,
+            );
 
             for &name in &iface.names {
                 let sid = signals.alloc(Signal {
@@ -212,10 +243,15 @@ fn elaborate_vhdl_ports(
 /// Declared defaults (`:= expr`) become the signal's `init` value; a default
 /// that cannot be evaluated is reported with W204 instead of being dropped
 /// silently.
+///
+/// Every object, type and subtype declaration also records its declared
+/// index ranges in `ranges` (after the object's own type is resolved), so
+/// later range attributes such as `v'range` can be resolved.
 fn elaborate_vhdl_decl(
     decl: &vhdl_ast::Declaration,
     scope: Option<&str>,
     const_env: &ConstEnv,
+    ranges: &mut RangeEnv,
     signals: &mut Arena<SignalId, Signal>,
     sig_env: &mut SignalEnv,
     ctx: &mut ElaborationContext<'_>,
@@ -238,19 +274,24 @@ fn elaborate_vhdl_decl(
             (&vd.names, &vd.ty, kind, &vd.default, vd.span)
         }
         _ => {
-            // Other declarations (type, component, etc.) not handled in Phase 0
+            // Other declarations (component, etc.) are not lowered in Phase 0;
+            // type and subtype declarations only contribute index ranges.
+            ranges.declare(decl, const_env, ctx.source_db, ctx.interner);
             return;
         }
     };
 
+    let ty_ast = ty;
     let ty = types::resolve_vhdl_type(
         ty,
+        ranges,
         &mut ctx.design.types,
         const_env,
         ctx.source_db,
         ctx.interner,
         ctx.sink,
     );
+    ranges.declare_object(names, ty_ast, const_env, ctx.source_db, ctx.interner);
     let width = ctx.design.types.bit_width(ty);
     let init = default.as_ref().and_then(|expr| {
         let value = eval_vhdl_default(expr, width, const_env, signals, sig_env, ctx);
@@ -454,6 +495,7 @@ fn std_logic_char(c: char) -> Option<Logic> {
 fn elaborate_vhdl_concurrent(
     stmt: &vhdl_ast::ConcurrentStatement,
     const_env: &ConstEnv,
+    ranges: &mut RangeEnv,
     signals: &mut Arena<SignalId, Signal>,
     sig_env: &mut SignalEnv,
     cells: &mut Arena<CellId, Cell>,
@@ -470,13 +512,15 @@ fn elaborate_vhdl_concurrent(
             // They are named `<label>.<name>` (unlabelled processes use
             // `_process<N>`, which no VHDL identifier can clash with).
             let outer_env = (!ps.decls.is_empty()).then(|| sig_env.clone());
+            let outer_ranges = (!ps.decls.is_empty()).then(|| ranges.clone());
             let scope = match ps.label {
                 Some(label) => ctx.interner.resolve(label).to_string(),
                 None => format!("_process{}", processes.len()),
             };
             for decl in &ps.decls {
-                elaborate_vhdl_decl(decl, Some(&scope), const_env, signals, sig_env, ctx);
+                elaborate_vhdl_decl(decl, Some(&scope), const_env, ranges, signals, sig_env, ctx);
             }
+            check_vhdl_loop_ranges(&ps.stmts, ranges, const_env, ctx);
 
             // Detect sequential processes by scanning for rising_edge/falling_edge
             let (kind, sensitivity) =
@@ -505,6 +549,9 @@ fn elaborate_vhdl_concurrent(
             if let Some(env) = outer_env {
                 *sig_env = env;
             }
+            if let Some(env) = outer_ranges {
+                *ranges = env;
+            }
         }
         vhdl_ast::ConcurrentStatement::SignalAssignment(sa) => {
             let target = lower_vhdl_to_signal_ref(&sa.target, sig_env, ctx.interner, ctx.sink);
@@ -522,12 +569,83 @@ fn elaborate_vhdl_concurrent(
         vhdl_ast::ConcurrentStatement::ComponentInstantiation(ci) => {
             elaborate_vhdl_component(ci, sig_env, cells, ctx);
         }
-        vhdl_ast::ConcurrentStatement::ForGenerate(_)
-        | vhdl_ast::ConcurrentStatement::IfGenerate(_) => {
+        vhdl_ast::ConcurrentStatement::ForGenerate(fg) => {
+            // The generate body is not expanded in Phase 0, but its range is
+            // still resolved so an unresolvable `x'range` is reported.
+            resolve_loop_range(&fg.range, ranges, const_env, ctx);
+        }
+        vhdl_ast::ConcurrentStatement::IfGenerate(_) => {
             // Generate statements: not fully elaborated in Phase 0
         }
         vhdl_ast::ConcurrentStatement::Assert(_) => {}
         vhdl_ast::ConcurrentStatement::Error(_) => {}
+    }
+}
+
+/// Resolves the discrete range of a `for` loop or `for ... generate`.
+///
+/// Range attributes (`v'range`, `v'reverse_range`) are resolved against
+/// `ranges` and an unresolvable prefix is reported (`E212`). Explicit ranges
+/// and type marks are evaluated quietly: their bounds may name objects the
+/// constant evaluator does not track yet (e.g. architecture constants), and
+/// since loop and generate bodies are not unrolled in Phase 0, failing to
+/// evaluate them is not an error here.
+fn resolve_loop_range(
+    range: &vhdl_ast::DiscreteRange,
+    ranges: &RangeEnv,
+    const_env: &ConstEnv,
+    ctx: &ElaborationContext<'_>,
+) -> Option<ResolvedRange> {
+    let quiet = DiagnosticSink::new();
+    let sink = match range {
+        vhdl_ast::DiscreteRange::Attribute(_) => ctx.sink,
+        _ => &quiet,
+    };
+    resolve_vhdl_discrete_range(range, ranges, const_env, ctx.source_db, ctx.interner, sink)
+}
+
+/// Resolves the range of every `for` loop in a sequential statement list,
+/// recursing into `if`, `case` and loop bodies, so that range attributes
+/// with an unresolvable prefix are reported (`E212`).
+///
+/// While a loop body is walked, the loop parameter shadows any outer object
+/// of the same name (it is a scalar, so `i'range` on it is rejected rather
+/// than silently resolving to an outer array `i`).
+fn check_vhdl_loop_ranges(
+    stmts: &[vhdl_ast::SequentialStatement],
+    ranges: &mut RangeEnv,
+    const_env: &ConstEnv,
+    ctx: &ElaborationContext<'_>,
+) {
+    use vhdl_ast::SequentialStatement as S;
+    for stmt in stmts {
+        match stmt {
+            S::ForLoop(fl) => {
+                let resolved = resolve_loop_range(&fl.range, ranges, const_env, ctx);
+                let shadowed = ranges.get(fl.var).cloned();
+                ranges.insert(fl.var, DeclaredRange::NotArray(resolved));
+                check_vhdl_loop_ranges(&fl.stmts, ranges, const_env, ctx);
+                match shadowed {
+                    Some(prev) => ranges.insert(fl.var, prev),
+                    None => ranges.remove(fl.var),
+                }
+            }
+            S::If(is) => {
+                check_vhdl_loop_ranges(&is.then_stmts, ranges, const_env, ctx);
+                for branch in &is.elsif_branches {
+                    check_vhdl_loop_ranges(&branch.stmts, ranges, const_env, ctx);
+                }
+                check_vhdl_loop_ranges(&is.else_stmts, ranges, const_env, ctx);
+            }
+            S::Case(cs) => {
+                for alt in &cs.alternatives {
+                    check_vhdl_loop_ranges(&alt.stmts, ranges, const_env, ctx);
+                }
+            }
+            S::WhileLoop(wl) => check_vhdl_loop_ranges(&wl.stmts, ranges, const_env, ctx),
+            S::Loop(lp) => check_vhdl_loop_ranges(&lp.stmts, ranges, const_env, ctx),
+            _ => {}
+        }
     }
 }
 
@@ -1119,6 +1237,192 @@ mod tests {
         assert!(
             matches!(kind, ProcessKind::Combinational),
             "process without edge calls should be Combinational"
+        );
+    }
+
+    // ========================================================================
+    // Range attributes (`x'range`, `x'reverse_range`)
+    // ========================================================================
+
+    /// Parses and elaborates `src` (top entity `t`), returning the design,
+    /// the interner, the source text and every diagnostic.
+    fn elab_vhdl(
+        src: &str,
+    ) -> (
+        aion_ir::Design,
+        Interner,
+        String,
+        Vec<aion_diagnostics::Diagnostic>,
+    ) {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source("t.vhd", src.to_string());
+        let parsed = crate::ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![aion_vhdl_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            )],
+        };
+        let config: aion_config::ProjectConfig =
+            toml::from_str("[project]\nname = \"t\"\nversion = \"0.1.0\"\ntop = \"t\"\n").unwrap();
+        let design = crate::elaborate(&parsed, &config, &source_db, &interner, &sink).unwrap();
+        (design, interner, src.to_string(), sink.diagnostics())
+    }
+
+    /// Wraps an architecture body (declarations, `begin`, statements) of
+    /// entity `t`, which has ports `a : std_logic_vector(7 downto 0)` and
+    /// `y : std_logic`.
+    fn range_src(arch_body: &str) -> String {
+        format!(
+            "library ieee;\nuse ieee.std_logic_1164.all;\nuse ieee.numeric_std.all;\n\
+             entity t is port (a : in std_logic_vector(7 downto 0); y : out std_logic);\n\
+             end entity;\narchitecture rtl of t is\n{arch_body}\nend architecture;"
+        )
+    }
+
+    fn e212_snippets(src: &str, diags: &[aion_diagnostics::Diagnostic]) -> Vec<String> {
+        diags
+            .iter()
+            .filter(|d| d.code == errors::E212)
+            .map(|d| src[d.primary_span.start as usize..d.primary_span.end as usize].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn vhdl_range_attribute_sizes_vector_signals() {
+        let (design, interner, _, diags) = elab_vhdl(&range_src(
+            "signal b : std_logic_vector(a'range);\n\
+             signal c : std_logic_vector(a'reverse_range);\n\
+             subtype nib_t is std_logic_vector(3 downto 0);\n\
+             signal d : unsigned(nib_t'range);\n\
+             signal e : std_logic_vector(d'reverse_range);\n\
+             begin\n y <= a(0);",
+        ));
+        assert!(diags.is_empty(), "{diags:?}");
+        let module = &design.modules[design.top];
+        let width = |name: &str| {
+            let sig = module
+                .signals
+                .iter()
+                .map(|(_, s)| s)
+                .find(|s| interner.resolve(s.name) == name)
+                .unwrap_or_else(|| panic!("no signal {name}"));
+            design.types.bit_width(sig.ty)
+        };
+        assert_eq!(width("b"), Some(8));
+        assert_eq!(width("c"), Some(8));
+        assert_eq!(width("d"), Some(4));
+        assert_eq!(width("e"), Some(4));
+    }
+
+    #[test]
+    fn vhdl_for_loops_and_generates_over_range_attributes_elaborate_cleanly() {
+        let (_, _, _, diags) = elab_vhdl(&range_src(
+            "type mem_t is array (0 to 3, 7 downto 0) of std_logic;\n\
+             constant K : std_logic_vector(5 downto 2) := \"0000\";\n\
+             begin\n\
+             p : process (a)\n\
+               variable tmp : std_logic_vector(2 downto 0);\n\
+             begin\n\
+               for i in a'range loop null; end loop;\n\
+               for i in a'reverse_range loop null; end loop;\n\
+               for i in tmp'range loop null; end loop;\n\
+               if a(0) = '1' then\n\
+                 for i in mem_t'range(2) loop\n\
+                   for j in K'reverse_range loop null; end loop;\n\
+                 end loop;\n\
+               end if;\n\
+               y <= a(0);\n\
+             end process;\n\
+             g1 : for i in a'range generate end generate;\n\
+             g2 : for i in K'reverse_range generate end generate;",
+        ));
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn vhdl_unresolved_range_attribute_prefix_is_reported() {
+        let (design, interner, src, diags) = elab_vhdl(&range_src(
+            "signal b : std_logic_vector(nope'range);\n\
+             begin\n\
+             process (a) begin\n\
+               case a(0) is\n\
+                 when '1' => for i in missing'reverse_range loop null; end loop;\n\
+                 when others => null;\n\
+               end case;\n\
+               y <= a(0);\n\
+             end process;\n\
+             g : for i in y'range generate end generate;",
+        ));
+        assert_eq!(
+            e212_snippets(&src, &diags),
+            vec!["nope'range", "missing'reverse_range", "y'range"],
+            "{diags:?}"
+        );
+        let y_diag = diags
+            .iter()
+            .find(|d| d.message.contains("`y'range`"))
+            .unwrap();
+        assert!(
+            y_diag.message.contains("not an array"),
+            "{}",
+            y_diag.message
+        );
+        // The vector sized by the unresolved attribute is an error type, not
+        // a guessed width.
+        let module = &design.modules[design.top];
+        let b = module
+            .signals
+            .iter()
+            .map(|(_, s)| s)
+            .find(|s| interner.resolve(s.name) == "b")
+            .unwrap();
+        assert_eq!(*design.types.get(b.ty), aion_ir::types::Type::Error);
+    }
+
+    #[test]
+    fn vhdl_loop_parameter_shadows_outer_array_in_range_attribute() {
+        let (_, _, src, diags) = elab_vhdl(&range_src(
+            "signal i : std_logic_vector(3 downto 0);\n\
+             begin\n\
+             process (a) begin\n\
+               for i in 0 to 1 loop\n\
+                 for j in i'range loop null; end loop;\n\
+               end loop;\n\
+               for k in i'range loop null; end loop;\n\
+               y <= a(0);\n\
+             end process;",
+        ));
+        // Inside the loop `i` is the integer loop parameter, not the signal;
+        // after the loop the signal is visible again.
+        assert_eq!(e212_snippets(&src, &diags), vec!["i'range"], "{diags:?}");
+        let pos = src.find("for j in i'range").unwrap() + "for j in ".len();
+        let d = diags.iter().find(|d| d.code == errors::E212).unwrap();
+        assert_eq!(d.primary_span.start as usize, pos);
+        assert!(d.message.contains("not an array"), "{}", d.message);
+    }
+
+    #[test]
+    fn vhdl_process_local_range_does_not_leak_to_other_processes() {
+        let (_, _, src, diags) = elab_vhdl(&range_src(
+            "begin\n\
+             p1 : process (a)\n\
+               variable tmp : std_logic_vector(2 downto 0);\n\
+             begin\n\
+               for i in tmp'range loop null; end loop;\n\
+               y <= a(0);\n\
+             end process;\n\
+             p2 : process (a) begin\n\
+               for i in tmp'reverse_range loop null; end loop;\n\
+               y <= a(0);\n\
+             end process;",
+        ));
+        assert_eq!(
+            e212_snippets(&src, &diags),
+            vec!["tmp'reverse_range"],
+            "{diags:?}"
         );
     }
 }
