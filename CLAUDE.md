@@ -158,4 +158,4 @@ crates/
 
 ## Current Phase
 
-Check `PROGRESS.md` for the current implementation phase, and the newest files in `progress/` (`ls -r progress/`) for recent work and what to work on next.
+Check `PROGRESS.md` for the current implementation phase, and the newest files in `progress/` (`ls -r progress/????-??-??-*.md`) for recent work and what to work on next.

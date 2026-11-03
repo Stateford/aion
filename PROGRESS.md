@@ -3,7 +3,7 @@
 **Started:** 2026-02-07
 **Current Phase:** Phase 3 — Bitstream & Integration
 
-> **New entries live in [`progress/`](progress/), one file per task** (`ls -r progress/` for newest first). Don't add entries here: every branch prepending to this file made every open PR conflict whenever anything merged. This file keeps the current phase and the history up to 2026-11-02.
+> **New entries live in [`progress/`](progress/), one file per task** (`ls -r progress/????-??-??-*.md` for newest first). Don't add entries here: every branch prepending to this file made every open PR conflict whenever anything merged. This file keeps the current phase and the history up to 2026-11-02.
 
 ---
 

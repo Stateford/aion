@@ -10,13 +10,15 @@ open PR conflicts as soon as anything merges. Separate files never conflict.
 progress/YYYY-MM-DD-<slug>.md
 ```
 
-- `YYYY-MM-DD` is the date the work was done, so `ls` sorts entries by date
-  and `ls -r progress/` lists the newest first.
-- `<slug>` is the branch name without its `claude/` prefix (for example
-  `fix-31-index-precedence`), or a short kebab-case summary. It only has to be
-  unique.
-- If a branch already has an entry, update that file instead of adding a
-  second one.
+- `YYYY-MM-DD` is the date the work was done, so entries sort by date.
+  List the newest first with `ls -r progress/????-??-??-*.md`; a bare
+  `ls -r progress/` would put this README first.
+- `<slug>` is the branch name without its `claude/` prefix, with any
+  remaining `/` replaced by `-` (for example `fix-31-index-precedence`), or a
+  short kebab-case summary. It must not contain `/` and only has to be unique.
+- One file per **task**. When you revise the same task (for example after
+  review), update its file instead of adding a second one. A different task on
+  the same branch gets its own file.
 
 ## Contents
 

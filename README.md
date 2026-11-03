@@ -256,7 +256,7 @@ cargo doc --no-deps                          # Build documentation
 | **Phase 2** | Backend — Synthesis, architecture models, PnR, timing, bitstream | Complete |
 | **Phase 3** | Polish — LSP, device programming, dependency management, reporting | In Progress |
 
-See [PROGRESS.md](PROGRESS.md) for detailed implementation status.
+See [PROGRESS.md](PROGRESS.md) for the current phase and earlier history, and [`progress/`](progress/) for recent per-task entries.
 
 ## Documentation
 

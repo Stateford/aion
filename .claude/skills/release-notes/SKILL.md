@@ -26,7 +26,9 @@ Generate a changelog summary from git history and PROGRESS.md updates. Optionall
 
 4. **Read the progress entries** for milestone context: the newest files in `progress/` (one per task), plus the phase line and older history in `PROGRESS.md`:
    ```bash
-   ls -r "$CLAUDE_PROJECT_DIR/progress/" | head -20
+   for f in $(ls -r "$CLAUDE_PROJECT_DIR"/progress/????-??-??-*.md | head -20); do
+     cat "$f"
+   done
    head -100 "$CLAUDE_PROJECT_DIR/PROGRESS.md"
    ```
 
