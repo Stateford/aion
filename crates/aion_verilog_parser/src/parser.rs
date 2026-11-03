@@ -24,6 +24,11 @@ pub struct VerilogParser<'src> {
     file: FileId,
     pub(crate) interner: &'src Interner,
     pub(crate) sink: &'src DiagnosticSink,
+    /// Byte range in `source` of each token's text, parallel to `tokens`.
+    ///
+    /// Set when token spans were remapped by the preprocessor and may no
+    /// longer index into `source`. `None` means spans index `source` directly.
+    text_ranges: Option<Vec<(u32, u32)>>,
 }
 
 impl<'src> VerilogParser<'src> {
@@ -45,7 +50,31 @@ impl<'src> VerilogParser<'src> {
             file,
             interner,
             sink,
+            text_ranges: None,
         }
+    }
+
+    /// Creates a parser for tokens lexed from preprocessed text.
+    ///
+    /// `source` is the preprocessed text the tokens were lexed from and
+    /// `text_ranges[i]` is the byte range of token `i`'s text within it, while
+    /// each token's `span` has been remapped to its real location (see
+    /// `aion_vpp::lex_mapped`). Token text is read through `text_ranges`, so
+    /// it stays correct for tokens that came from macro expansions or
+    /// included files.
+    pub fn with_text_ranges(
+        tokens: Vec<Token>,
+        text_ranges: Vec<(u32, u32)>,
+        source: &'src str,
+        file: FileId,
+        interner: &'src Interner,
+        sink: &'src DiagnosticSink,
+    ) -> Self {
+        let mut parser = Self::new(tokens, source, file, interner, sink);
+        if parser.tokens.len() == text_ranges.len() {
+            parser.text_ranges = Some(text_ranges);
+        }
+        parser
     }
 
     // ========================================================================
@@ -64,8 +93,14 @@ impl<'src> VerilogParser<'src> {
 
     /// Returns the source text of the current token.
     pub(crate) fn current_text(&self) -> &'src str {
-        let span = self.current_span();
-        &self.source[span.start as usize..span.end as usize]
+        let (start, end) = match &self.text_ranges {
+            Some(ranges) => ranges[self.pos],
+            None => {
+                let span = self.current_span();
+                (span.start, span.end)
+            }
+        };
+        self.source.get(start as usize..end as usize).unwrap_or("")
     }
 
     /// Returns `true` if the current token matches the given kind.

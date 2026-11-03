@@ -4,7 +4,7 @@
 //! an IR [`Module`](aion_ir::module::Module), handling SV-specific constructs like
 //! `always_comb`, `always_ff`, variable declarations, and compound assignments.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aion_common::{ContentHash, Ident};
 use aion_ir::arena::Arena;
@@ -21,9 +21,9 @@ use aion_sv_parser::ast::{self as sv_ast, Direction};
 use crate::const_eval::{self, ConstEnv};
 use crate::context::ElaborationContext;
 use crate::errors;
-use crate::expr::{lower_sv_expr, lower_sv_to_signal_ref, SignalEnv};
+use crate::expr::{lower_sv_assign_value, lower_sv_to_signal_ref, SignalEnv};
 use crate::registry::ModuleEntry;
-use crate::stmt::{lower_sv_looping_always, lower_sv_stmt};
+use crate::stmt::{lower_sv_looping_always, lower_sv_stmt_sized};
 use crate::types;
 
 /// Elaborates a SystemVerilog module declaration into an IR module.
@@ -52,11 +52,13 @@ pub fn elaborate_sv_module(
     let mut cells: Arena<CellId, Cell> = Arena::new();
     let mut processes: Arena<ProcessId, Process> = Arena::new();
     let mut assignments = Vec::new();
+    let unpacked = collect_sv_unpacked_names(decl);
 
     for item in &decl.items {
         elaborate_sv_item(
             item,
             &const_env,
+            &unpacked,
             &mut signals,
             &mut sig_env,
             &mut cells,
@@ -191,11 +193,62 @@ fn elaborate_sv_ports(
     }
 }
 
+/// Collects the names of module-level declarations that have unpacked
+/// dimensions (e.g. `logic [7:0] mem [0:3]`).
+///
+/// The IR flattens such signals to their element type, so their IR width is
+/// not the width of the declared object; [`packed_width_lookup`] excludes
+/// them so context-sized literals and assignment patterns on them are
+/// diagnosed instead of being sized wrongly.
+fn collect_sv_unpacked_names(decl: &sv_ast::SvModuleDecl) -> HashSet<Ident> {
+    let mut names = HashSet::new();
+    for item in &decl.items {
+        let decl_names = match item {
+            sv_ast::ModuleItem::NetDecl(d) => &d.names,
+            sv_ast::ModuleItem::RegDecl(d) => &d.names,
+            sv_ast::ModuleItem::VarDecl(d) => &d.names,
+            sv_ast::ModuleItem::IntegerDecl(d) => &d.names,
+            sv_ast::ModuleItem::RealDecl(d) => &d.names,
+            _ => continue,
+        };
+        names.extend(
+            decl_names
+                .iter()
+                .filter(|dn| !dn.dimensions.is_empty())
+                .map(|dn| dn.name),
+        );
+    }
+    names
+}
+
+/// Returns a [`WidthLookup`](crate::expr::WidthLookup) giving the bit width of
+/// signals that are plain packed vectors (`Bit`/`BitVec` types without
+/// unpacked dimensions), and `None` for every other signal.
+fn packed_width_lookup<'a>(
+    signals: &'a Arena<SignalId, Signal>,
+    types: &'a aion_ir::types::TypeDb,
+    unpacked: &'a HashSet<Ident>,
+) -> impl Fn(SignalId) -> Option<u32> + 'a {
+    move |sid| {
+        let sig = signals.get(sid);
+        if unpacked.contains(&sig.name) {
+            return None;
+        }
+        match types.get(sig.ty) {
+            aion_ir::types::Type::Bit | aion_ir::types::Type::BitVec { .. } => {
+                types.bit_width(sig.ty)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Elaborates a single SystemVerilog module item.
 #[allow(clippy::too_many_arguments)]
 fn elaborate_sv_item(
     item: &sv_ast::ModuleItem,
     const_env: &ConstEnv,
+    unpacked: &HashSet<Ident>,
     signals: &mut Arena<SignalId, Signal>,
     sig_env: &mut SignalEnv,
     cells: &mut Arena<CellId, Cell>,
@@ -315,7 +368,16 @@ fn elaborate_sv_item(
             }
             let target =
                 lower_sv_to_signal_ref(&ca.target, sig_env, ctx.source_db, ctx.interner, ctx.sink);
-            let value = lower_sv_expr(&ca.value, sig_env, ctx.source_db, ctx.interner, ctx.sink);
+            let widths = packed_width_lookup(signals, &ctx.design.types, unpacked);
+            let value = lower_sv_assign_value(
+                &ca.value,
+                &target,
+                &widths,
+                sig_env,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
             assignments.push(Assignment {
                 target,
                 value,
@@ -323,10 +385,12 @@ fn elaborate_sv_item(
             });
         }
         sv_ast::ModuleItem::AlwaysBlock(ab) => {
+            let widths = packed_width_lookup(signals, &ctx.design.types, unpacked);
             let (kind, sensitivity, body_stmt) = analyze_sv_always(
                 &ab.body,
                 ab.span,
                 sig_env,
+                &widths,
                 ctx.source_db,
                 ctx.interner,
                 ctx.sink,
@@ -341,7 +405,15 @@ fn elaborate_sv_item(
             });
         }
         sv_ast::ModuleItem::AlwaysComb(ac) => {
-            let body = lower_sv_stmt(&ac.body, sig_env, ctx.source_db, ctx.interner, ctx.sink);
+            let widths = packed_width_lookup(signals, &ctx.design.types, unpacked);
+            let body = lower_sv_stmt_sized(
+                &ac.body,
+                sig_env,
+                &widths,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
             processes.alloc(Process {
                 id: ProcessId::from_raw(0),
                 name: None,
@@ -353,7 +425,15 @@ fn elaborate_sv_item(
         }
         sv_ast::ModuleItem::AlwaysFf(af) => {
             let sensitivity = map_sv_sensitivity(&af.sensitivity, sig_env);
-            let body = lower_sv_stmt(&af.body, sig_env, ctx.source_db, ctx.interner, ctx.sink);
+            let widths = packed_width_lookup(signals, &ctx.design.types, unpacked);
+            let body = lower_sv_stmt_sized(
+                &af.body,
+                sig_env,
+                &widths,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
             processes.alloc(Process {
                 id: ProcessId::from_raw(0),
                 name: None,
@@ -364,7 +444,15 @@ fn elaborate_sv_item(
             });
         }
         sv_ast::ModuleItem::AlwaysLatch(al) => {
-            let body = lower_sv_stmt(&al.body, sig_env, ctx.source_db, ctx.interner, ctx.sink);
+            let widths = packed_width_lookup(signals, &ctx.design.types, unpacked);
+            let body = lower_sv_stmt_sized(
+                &al.body,
+                sig_env,
+                &widths,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
             processes.alloc(Process {
                 id: ProcessId::from_raw(0),
                 name: None,
@@ -375,7 +463,15 @@ fn elaborate_sv_item(
             });
         }
         sv_ast::ModuleItem::InitialBlock(ib) => {
-            let body = lower_sv_stmt(&ib.body, sig_env, ctx.source_db, ctx.interner, ctx.sink);
+            let widths = packed_width_lookup(signals, &ctx.design.types, unpacked);
+            let body = lower_sv_stmt_sized(
+                &ib.body,
+                sig_env,
+                &widths,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
             processes.alloc(Process {
                 id: ProcessId::from_raw(0),
                 name: None,
@@ -415,6 +511,7 @@ fn analyze_sv_always(
     body: &sv_ast::Statement,
     always_span: aion_source::Span,
     sig_env: &SignalEnv,
+    widths: &crate::expr::WidthLookup<'_>,
     source_db: &aion_source::SourceDb,
     interner: &aion_common::Interner,
     sink: &aion_diagnostics::DiagnosticSink,
@@ -424,11 +521,18 @@ fn analyze_sv_always(
     } = body
     {
         let (kind, sens) = map_sv_always_sensitivity(sensitivity, sig_env);
-        let ir_body = lower_sv_stmt(body, sig_env, source_db, interner, sink);
+        let ir_body = lower_sv_stmt_sized(body, sig_env, widths, source_db, interner, sink);
         (kind, sens, ir_body)
     } else {
-        let ir_body =
-            lower_sv_looping_always(body, always_span, sig_env, source_db, interner, sink);
+        let ir_body = lower_sv_looping_always(
+            body,
+            always_span,
+            sig_env,
+            widths,
+            source_db,
+            interner,
+            sink,
+        );
         (ProcessKind::Combinational, Sensitivity::All, ir_body)
     }
 }

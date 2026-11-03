@@ -19,6 +19,27 @@ use crate::errors;
 /// Maps interned signal names to their signal IDs within a module.
 pub type SignalEnv = HashMap<Ident, SignalId>;
 
+/// Looks up the bit width of a signal that is a plain packed vector.
+///
+/// Used to size SystemVerilog constructs whose width comes from their
+/// assignment context (`'1`, `'x`, `'z`, `'{default: ...}`). Returns `None`
+/// when the width is unknown or the signal is not a plain packed vector (for
+/// example an unpacked array), in which case those constructs are reported as
+/// unsupported instead of being guessed.
+pub type WidthLookup<'a> = dyn Fn(SignalId) -> Option<u32> + 'a;
+
+/// Builds the E210 diagnostic for a member/hierarchical selection on a
+/// non-name base (`arr[2].valid`, `gen_blk[0].sig`, `inst[0].port`).
+fn error_member_select(member: &str, span: Span) -> aion_diagnostics::Diagnostic {
+    errors::error_unsupported(
+        &format!(
+            "member or hierarchical selection `.{member}` on an indexed or computed \
+             expression (e.g. `arr[2].valid`, `gen_blk[0].sig`)"
+        ),
+        span,
+    )
+}
+
 /// Lowers a Verilog AST expression to an IR expression.
 ///
 /// Identifiers are resolved through `sig_env`. Unknown identifiers produce
@@ -200,6 +221,10 @@ pub fn lower_verilog_expr(
             }
         }
         Expr::Paren { inner, .. } => lower_verilog_expr(inner, sig_env, source_db, interner, sink),
+        Expr::Member { member, span, .. } => {
+            sink.emit(error_member_select(interner.resolve(*member), *span));
+            poison(*span)
+        }
         Expr::Error(span) => poison(*span),
     }
 }
@@ -230,6 +255,18 @@ pub fn lower_sv_expr(
         Expr::TimeLiteral { span } => lower_sv_time_literal_value(*span, source_db, sink),
         Expr::StringLiteral { .. } => IrExpr::Literal(LogicVec::all_zero(1)),
         Expr::Unary { op, operand, span } => {
+            if op.is_incr_decr() {
+                // `++`/`--` have a side effect, which a pure IR expression
+                // cannot express. Procedural assignments hoist them into
+                // statements before reaching here (see `stmt::lower_sv_stmt`).
+                sink.emit(errors::error_unsupported(
+                    "`++`/`--` inside an expression; only the right-hand side \
+                     of a procedural assignment (outside `?:`, `&&` and `||`) \
+                     is supported",
+                    *span,
+                ));
+                return poison(*span);
+            }
             let ir_operand = lower_sv_expr(operand, sig_env, source_db, interner, sink);
             // Unary plus is the identity: lower to the operand itself.
             let Some(ir_op) = map_sv_unary_op(*op) else {
@@ -383,8 +420,255 @@ pub fn lower_sv_expr(
             }
         }
         Expr::Paren { inner, .. } => lower_sv_expr(inner, sig_env, source_db, interner, sink),
+        Expr::Member { member, span, .. } => {
+            sink.emit(error_member_select(interner.resolve(*member), *span));
+            poison(*span)
+        }
+        Expr::UnbasedUnsized { value, span } => lower_sv_fill(*value, None, *span, sink),
+        Expr::AssignmentPattern { span, .. } => {
+            sink.emit(errors::error_unsupported(
+                "assignment pattern outside an assignment to a packed vector",
+                *span,
+            ));
+            poison(*span)
+        }
         Expr::Error(span) => poison(*span),
     }
+}
+
+/// Lowers the right-hand side of an SV assignment whose target is `target`.
+///
+/// Unlike [`lower_sv_expr`], this sizes context-dependent constructs from the
+/// target width: unbased unsized literals (`'1`, `'x`, `'z`) and assignment
+/// patterns (`'{default: v}`, positional `'{b3, b2, b1, b0}`), including when
+/// they appear as a `?:` branch or inside parentheses. When the target width
+/// cannot be determined these constructs get an E210 diagnostic rather than a
+/// guessed width (`'0` is always correct as a 1-bit zero, which zero-extends).
+#[allow(clippy::too_many_arguments)]
+pub fn lower_sv_assign_value(
+    value: &aion_sv_parser::ast::Expr,
+    target: &SignalRef,
+    widths: &WidthLookup<'_>,
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrExpr {
+    let ctx_width = signal_ref_width(target, widths);
+    lower_sv_sized(value, ctx_width, sig_env, source_db, interner, sink)
+}
+
+/// Returns the bit width of an assignment target, if every part of it has a
+/// known width (see [`WidthLookup`]).
+///
+/// A slice counts only when its signal is itself a plain packed vector, since
+/// the IR flattens unpacked arrays and a constant select on one is not a bit
+/// slice. A `Const` target (an unresolved or unsupported target) has no width.
+pub fn signal_ref_width(target: &SignalRef, widths: &WidthLookup<'_>) -> Option<u32> {
+    match target {
+        SignalRef::Signal(sid) => widths(*sid),
+        SignalRef::Slice { signal, high, low } => {
+            widths(*signal)?;
+            Some(high.abs_diff(*low) + 1)
+        }
+        SignalRef::Concat(parts) => parts
+            .iter()
+            .try_fold(0u32, |acc, p| acc.checked_add(signal_ref_width(p, widths)?)),
+        SignalRef::Const(_) => None,
+    }
+}
+
+/// Lowers `expr` in a context of width `ctx_width` (see [`lower_sv_assign_value`]).
+fn lower_sv_sized(
+    expr: &aion_sv_parser::ast::Expr,
+    ctx_width: Option<u32>,
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrExpr {
+    use aion_sv_parser::ast::Expr;
+    match expr {
+        Expr::Paren { inner, .. } => {
+            lower_sv_sized(inner, ctx_width, sig_env, source_db, interner, sink)
+        }
+        // The branches of `?:` are context-determined, so they inherit the
+        // assignment width. (The condition is self-determined.)
+        Expr::Ternary {
+            condition,
+            then_expr,
+            else_expr,
+            span,
+        } => IrExpr::Ternary {
+            condition: Box::new(lower_sv_expr(condition, sig_env, source_db, interner, sink)),
+            true_val: Box::new(lower_sv_sized(
+                then_expr, ctx_width, sig_env, source_db, interner, sink,
+            )),
+            false_val: Box::new(lower_sv_sized(
+                else_expr, ctx_width, sig_env, source_db, interner, sink,
+            )),
+            ty: TypeId::from_raw(0),
+            span: *span,
+        },
+        Expr::UnbasedUnsized { value, span } => lower_sv_fill(*value, ctx_width, *span, sink),
+        Expr::AssignmentPattern { items, span } => {
+            lower_sv_assignment_pattern(items, ctx_width, *span, source_db, interner, sink)
+        }
+        _ => lower_sv_expr(expr, sig_env, source_db, interner, sink),
+    }
+}
+
+/// Maps an SV fill value to the 4-state logic value of each bit.
+fn fill_logic(value: aion_sv_parser::ast::FillValue) -> aion_common::Logic {
+    use aion_common::Logic;
+    use aion_sv_parser::ast::FillValue;
+    match value {
+        FillValue::Zero => Logic::Zero,
+        FillValue::One => Logic::One,
+        FillValue::X => Logic::X,
+        FillValue::Z => Logic::Z,
+    }
+}
+
+/// Builds a `width`-bit literal with every bit set to `bit`.
+fn filled_literal(bit: aion_common::Logic, width: u32) -> LogicVec {
+    let mut lv = LogicVec::all_zero(width.max(1));
+    for i in 0..lv.width() {
+        lv.set(i, bit);
+    }
+    lv
+}
+
+/// Lowers an unbased unsized literal (`'0`, `'1`, `'x`, `'z`).
+///
+/// With a known context width every bit is filled. Without one, `'0` lowers
+/// to a 1-bit zero (correct, since zero-extension fills the rest with 0s);
+/// `'1`/`'x`/`'z` get an E210 diagnostic, because a 1-bit literal would be
+/// zero-extended and silently produce the wrong value.
+fn lower_sv_fill(
+    value: aion_sv_parser::ast::FillValue,
+    ctx_width: Option<u32>,
+    span: Span,
+    sink: &DiagnosticSink,
+) -> IrExpr {
+    use aion_sv_parser::ast::FillValue;
+    match (ctx_width, value) {
+        (Some(w), _) => IrExpr::Literal(filled_literal(fill_logic(value), w)),
+        (None, FillValue::Zero) => IrExpr::Literal(LogicVec::all_zero(1)),
+        (None, _) => {
+            let text = match value {
+                FillValue::One => "'1",
+                FillValue::X => "'x",
+                _ => "'z",
+            };
+            sink.emit(errors::error_unsupported(
+                &format!(
+                    "`{text}` where its width cannot be determined; it is only \
+                     supported as the value (or a `?:` branch) of an assignment \
+                     to a packed vector"
+                ),
+                span,
+            ));
+            poison(span)
+        }
+    }
+}
+
+/// Evaluates an assignment pattern element value to the single bit it gives
+/// a packed-vector element (its least significant bit), if it is constant.
+fn sv_pattern_bit(
+    expr: &aion_sv_parser::ast::Expr,
+    source_db: &SourceDb,
+    interner: &Interner,
+) -> Option<aion_common::Logic> {
+    use aion_common::Logic;
+    use aion_sv_parser::ast::Expr;
+    match expr {
+        Expr::UnbasedUnsized { value, .. } => Some(fill_logic(*value)),
+        Expr::Paren { inner, .. } => sv_pattern_bit(inner, source_db, interner),
+        Expr::Literal { span } => {
+            // Sized literals may carry x/z digits: take the literal's LSB.
+            match lower_verilog_literal(*span, source_db) {
+                IrExpr::Literal(lv) if lv.width() > 0 => Some(lv.get(0)),
+                _ => None,
+            }
+        }
+        _ => {
+            // Constant expressions over parameters are not in scope here; a
+            // scratch sink keeps "non-constant" noise out of the user's report.
+            let scratch = DiagnosticSink::new();
+            let v =
+                const_eval::eval_sv_expr(expr, source_db, interner, &Default::default(), &scratch)
+                    .and_then(|v| const_eval::const_to_i64(&v))?;
+            Some(if v & 1 == 1 { Logic::One } else { Logic::Zero })
+        }
+    }
+}
+
+/// Lowers an assignment pattern assigned to a packed vector of `ctx_width` bits.
+///
+/// The elements of a one-dimensional packed vector are its bits, so
+/// `'{default: v}` fills every bit with `v`'s LSB and a positional pattern
+/// must list exactly one constant item per bit, MSB first. Keyed items,
+/// non-constant items, and targets of unknown width get an E210 diagnostic.
+fn lower_sv_assignment_pattern(
+    items: &[aion_sv_parser::ast::PatternItem],
+    ctx_width: Option<u32>,
+    span: Span,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrExpr {
+    use aion_sv_parser::ast::PatternItem;
+    let unsupported = |what: &str| {
+        sink.emit(errors::error_unsupported(what, span));
+        poison(span)
+    };
+    let Some(width) = ctx_width else {
+        return unsupported(
+            "assignment pattern whose target is not a packed vector of known width \
+             (unpacked arrays and structs are not supported yet)",
+        );
+    };
+    if items.iter().any(|i| matches!(i, PatternItem::Keyed { .. })) {
+        return unsupported("keyed assignment pattern items (`key: value`)");
+    }
+    if let [PatternItem::Default { value, .. }] = items {
+        return match sv_pattern_bit(value, source_db, interner) {
+            Some(bit) => IrExpr::Literal(filled_literal(bit, width)),
+            None => unsupported("`'{default: v}` with a non-constant `v`"),
+        };
+    }
+    let positional: Vec<_> = items
+        .iter()
+        .filter_map(|i| match i {
+            PatternItem::Positional(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    if positional.len() != items.len() {
+        // Mixed positional/default: already a parse error.
+        return poison(span);
+    }
+    if positional.len() != width as usize {
+        sink.emit(errors::error_type_mismatch(
+            &format!(
+                "assignment pattern has {} item(s) but the target has {width} bit(s)",
+                positional.len()
+            ),
+            span,
+        ));
+        return poison(span);
+    }
+    let mut lv = LogicVec::all_zero(width);
+    for (i, item) in positional.iter().enumerate() {
+        let Some(bit) = sv_pattern_bit(item, source_db, interner) else {
+            return unsupported("positional assignment pattern with non-constant items");
+        };
+        // Items are listed MSB first.
+        lv.set(width - 1 - i as u32, bit);
+    }
+    IrExpr::Literal(lv)
 }
 
 /// Lowers a VHDL AST expression to an IR expression.
@@ -562,6 +846,10 @@ pub fn lower_to_signal_ref(
                 .collect();
             SignalRef::Concat(parts)
         }
+        Expr::Member { member, span, .. } => {
+            sink.emit(error_member_select(interner.resolve(*member), *span));
+            SignalRef::Const(LogicVec::all_zero(1))
+        }
         _ => SignalRef::Const(LogicVec::all_zero(1)),
     }
 }
@@ -624,6 +912,23 @@ pub fn lower_sv_to_signal_ref(
                 .map(|e| lower_sv_to_signal_ref(e, sig_env, source_db, interner, sink))
                 .collect();
             SignalRef::Concat(parts)
+        }
+        Expr::Member { member, span, .. } => {
+            sink.emit(error_member_select(interner.resolve(*member), *span));
+            SignalRef::Const(LogicVec::all_zero(1))
+        }
+        // A port actual of `'0` is a zero constant at any width.
+        Expr::UnbasedUnsized {
+            value: aion_sv_parser::ast::FillValue::Zero,
+            ..
+        } => SignalRef::Const(LogicVec::all_zero(1)),
+        Expr::UnbasedUnsized { span, .. } | Expr::AssignmentPattern { span, .. } => {
+            sink.emit(errors::error_unsupported(
+                "`'1`/`'x`/`'z` or an assignment pattern as an assignment target or \
+                 port connection",
+                *span,
+            ));
+            SignalRef::Const(LogicVec::all_zero(1))
         }
         _ => SignalRef::Const(LogicVec::all_zero(1)),
     }
@@ -695,6 +1000,24 @@ pub fn lower_vhdl_to_signal_ref(
                 ));
                 SignalRef::Const(LogicVec::all_zero(1))
             }
+        }
+        // Positional aggregate target `(a, b) <= v;`: elements take the
+        // value's elements left to right, exactly like the concatenation
+        // `a & b`, so it lowers to a concat whose first part is the MSB.
+        Expr::Aggregate { elements, span } => {
+            if elements.iter().any(|e| !e.choices.is_empty()) {
+                sink.emit(errors::error_unsupported(
+                    "named association in an aggregate assignment target",
+                    *span,
+                ));
+                return SignalRef::Const(LogicVec::all_zero(1));
+            }
+            SignalRef::Concat(
+                elements
+                    .iter()
+                    .map(|e| lower_vhdl_to_signal_ref(&e.value, sig_env, interner, sink))
+                    .collect(),
+            )
         }
         _ => SignalRef::Const(LogicVec::all_zero(1)),
     }
@@ -1027,7 +1350,10 @@ fn map_verilog_binary_op(op: aion_verilog_parser::ast::BinaryOp) -> BinaryOp {
 /// Maps a SystemVerilog unary operator to an IR unary operator.
 ///
 /// Returns `None` for unary plus, which is the identity and must be lowered
-/// to its operand with no IR node.
+/// to its operand with no IR node. Also returns `None` for the side-effecting
+/// `++`/`--` operators, which have no pure IR equivalent; callers must handle
+/// those first (see [`aion_sv_parser::ast::UnaryOp::is_incr_decr`]), so that
+/// `None` after that check always means unary plus.
 fn map_sv_unary_op(op: aion_sv_parser::ast::UnaryOp) -> Option<UnaryOp> {
     use aion_sv_parser::ast::UnaryOp as S;
     Some(match op {
@@ -1038,7 +1364,7 @@ fn map_sv_unary_op(op: aion_sv_parser::ast::UnaryOp) -> Option<UnaryOp> {
         S::RedAnd | S::RedNand => UnaryOp::RedAnd,
         S::RedOr | S::RedNor => UnaryOp::RedOr,
         S::RedXor | S::RedXnor => UnaryOp::RedXor,
-        S::PreIncr | S::PreDecr => UnaryOp::Neg, // approximate
+        S::PreIncr | S::PreDecr | S::PostIncr | S::PostDecr => return None,
     })
 }
 
@@ -1393,6 +1719,85 @@ mod tests {
     }
 
     #[test]
+    fn signal_ref_width_known_targets() {
+        let widths = |sid: SignalId| (sid.as_raw() < 2).then_some(8);
+        let s0 = SignalId::from_raw(0);
+        let s1 = SignalId::from_raw(1);
+        assert_eq!(signal_ref_width(&SignalRef::Signal(s0), &widths), Some(8));
+        let slice = SignalRef::Slice {
+            signal: s1,
+            high: 3,
+            low: 0,
+        };
+        assert_eq!(signal_ref_width(&slice, &widths), Some(4));
+        let cat = SignalRef::Concat(vec![SignalRef::Signal(s0), slice]);
+        assert_eq!(signal_ref_width(&cat, &widths), Some(12));
+    }
+
+    #[test]
+    fn signal_ref_width_unknown_targets() {
+        // Signal 5 is not a plain packed vector (e.g. an unpacked array).
+        let widths = |sid: SignalId| (sid.as_raw() < 2).then_some(8);
+        let s5 = SignalId::from_raw(5);
+        assert_eq!(signal_ref_width(&SignalRef::Signal(s5), &widths), None);
+        let slice = SignalRef::Slice {
+            signal: s5,
+            high: 1,
+            low: 1,
+        };
+        assert_eq!(signal_ref_width(&slice, &widths), None);
+        let cat = SignalRef::Concat(vec![SignalRef::Signal(SignalId::from_raw(0)), slice]);
+        assert_eq!(signal_ref_width(&cat, &widths), None);
+        let poison = SignalRef::Const(LogicVec::all_zero(1));
+        assert_eq!(signal_ref_width(&poison, &widths), None);
+    }
+
+    #[test]
+    fn sv_assign_value_fills_known_width() {
+        let (sdb, interner, sink, env) = setup();
+        let fill = aion_sv_parser::ast::Expr::UnbasedUnsized {
+            value: aion_sv_parser::ast::FillValue::One,
+            span: Span::DUMMY,
+        };
+        let target = SignalRef::Signal(SignalId::from_raw(0));
+        let ir = lower_sv_assign_value(&fill, &target, &|_| Some(5), &env, &sdb, &interner, &sink);
+        assert!(matches!(ir, IrExpr::Literal(ref lv) if lv.width() == 5
+            && (0..5).all(|i| lv.get(i) == aion_common::Logic::One)));
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn sv_assign_value_unknown_width_is_diagnosed() {
+        let (sdb, interner, sink, env) = setup();
+        let fill = aion_sv_parser::ast::Expr::UnbasedUnsized {
+            value: aion_sv_parser::ast::FillValue::X,
+            span: Span::DUMMY,
+        };
+        let target = SignalRef::Signal(SignalId::from_raw(0));
+        lower_sv_assign_value(&fill, &target, &|_| None, &env, &sdb, &interner, &sink);
+        assert!(sink.has_errors());
+        assert_eq!(sink.diagnostics()[0].code, errors::E210);
+    }
+
+    #[test]
+    fn sv_incr_decr_in_plain_expression_is_not_negation() {
+        let (sdb, interner, sink, mut env) = setup();
+        let b = interner.get_or_intern("b");
+        env.insert(b, SignalId::from_raw(0));
+        let expr = aion_sv_parser::ast::Expr::Unary {
+            op: aion_sv_parser::ast::UnaryOp::PostIncr,
+            operand: Box::new(aion_sv_parser::ast::Expr::Identifier {
+                name: b,
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+        let ir = lower_sv_expr(&expr, &env, &sdb, &interner, &sink);
+        assert!(!matches!(ir, IrExpr::Unary { .. }), "{ir:?}");
+        assert_eq!(sink.diagnostics()[0].code, errors::E210);
+    }
+
+    #[test]
     fn signal_ref_unknown_emits_error() {
         let (sdb, interner, sink, env) = setup();
         let unknown = interner.get_or_intern("unknown");
@@ -1720,6 +2125,41 @@ mod tests {
             map_vhdl_unary_op(aion_vhdl_parser::ast::UnaryOp::Neg),
             Some((UnaryOp::Neg, false))
         );
+    }
+
+    #[test]
+    fn sv_incr_decr_map_to_no_ir_op_and_are_rejected_before_mapping() {
+        use aion_sv_parser::ast::UnaryOp as S;
+        // Both unary plus (#66) and `++`/`--` (#30) map to `None`; the
+        // lowering checks `is_incr_decr` first, so `None` there means plus.
+        for op in [S::PreIncr, S::PreDecr, S::PostIncr, S::PostDecr] {
+            assert!(op.is_incr_decr());
+            assert_eq!(map_sv_unary_op(op), None, "{op:?}");
+        }
+        assert!(!S::Plus.is_incr_decr());
+
+        let (sdb, interner, sink, mut env) = setup();
+        let b = interner.get_or_intern("b");
+        env.insert(b, SignalId::from_raw(0));
+        let ident = || aion_sv_parser::ast::Expr::Identifier {
+            name: b,
+            span: Span::DUMMY,
+        };
+        let unary = |op| aion_sv_parser::ast::Expr::Unary {
+            op,
+            operand: Box::new(ident()),
+            span: Span::DUMMY,
+        };
+        // `+b` lowers to `b` itself, with no diagnostic.
+        let plus = lower_sv_expr(&unary(S::Plus), &env, &sdb, &interner, &sink);
+        assert!(
+            matches!(plus, IrExpr::Signal(SignalRef::Signal(_))),
+            "{plus:?}"
+        );
+        assert!(!sink.has_errors());
+        // `b++` in a pure expression is reported, not lowered to `b`.
+        lower_sv_expr(&unary(S::PostIncr), &env, &sdb, &interner, &sink);
+        assert!(sink.has_errors());
     }
 
     #[test]

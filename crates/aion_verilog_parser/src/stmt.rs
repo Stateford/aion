@@ -662,6 +662,24 @@ mod tests {
     }
 
     #[test]
+    fn member_lvalue_on_index_keeps_member() {
+        // Issue #30: `inst[0].port <= d` used to lose `.port`.
+        let items = parse_module_items("always @(posedge clk) inst[0].port <= d;");
+        match get_always_body(&items) {
+            Statement::EventControl { body, .. } => match body.as_ref() {
+                Statement::NonBlocking { target, .. } => match target {
+                    Expr::Member { base, .. } => {
+                        assert!(matches!(**base, Expr::Index { .. }))
+                    }
+                    other => panic!("expected member target, got {other:?}"),
+                },
+                other => panic!("expected non-blocking, got {other:?}"),
+            },
+            other => panic!("expected event control, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn non_blocking_assignment() {
         let items = parse_module_items("always @(posedge clk) q <= d;");
         let body = get_always_body(&items);

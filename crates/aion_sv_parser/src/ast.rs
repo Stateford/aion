@@ -1302,8 +1302,79 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// A member or hierarchical selection on an arbitrary base expression
+    /// (e.g., `arr[2].valid`, `gen_blk[0].sig`, `inst[0].port`, `f(x).field`).
+    ///
+    /// Dotted names whose every prefix is a plain identifier (`a.b.c`) are
+    /// still parsed as [`Expr::HierarchicalName`]; `Member` is produced as soon
+    /// as the base is anything else, and chains nest (`a[1].b[2].c` is
+    /// `Member(Index(Member(Index(a, 1), b), 2), c)`).
+    Member {
+        /// The expression whose member is selected.
+        base: Box<Expr>,
+        /// The selected member, field, or hierarchical scope name.
+        member: Ident,
+        /// Source span covering the base and the member name.
+        span: Span,
+    },
+    /// An unbased unsized literal (`'0`, `'1`, `'x`/`'X`, `'z`/`'Z`).
+    ///
+    /// Every bit of the literal takes the given value, and its width is
+    /// determined by the context it appears in (e.g., the assignment target).
+    UnbasedUnsized {
+        /// The value every bit is filled with.
+        value: FillValue,
+        /// Source span.
+        span: Span,
+    },
+    /// An assignment pattern (e.g., `'{1, 2, 3}`, `'{a: 1, b: 2}`,
+    /// `'{default: 0}`).
+    AssignmentPattern {
+        /// The pattern items, in source order.
+        items: Vec<PatternItem>,
+        /// Source span covering `'{` through `}`.
+        span: Span,
+    },
     /// An error node produced during error recovery.
     Error(Span),
+}
+
+/// The bit value an unbased unsized literal (`'0`, `'1`, `'x`, `'z`) fills
+/// its context with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FillValue {
+    /// `'0` — every bit is logic 0.
+    Zero,
+    /// `'1` — every bit is logic 1.
+    One,
+    /// `'x` or `'X` — every bit is unknown.
+    X,
+    /// `'z` or `'Z` — every bit is high impedance.
+    Z,
+}
+
+/// One item of an assignment pattern `'{ ... }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PatternItem {
+    /// A positional item (`'{1, 2, 3}`), assigned to elements in order.
+    Positional(Expr),
+    /// A keyed item (`'{a: 1}` or `'{0: x}`): the key is a member name, an
+    /// index expression, or a type name.
+    Keyed {
+        /// The member name, index, or type key before the colon.
+        key: Expr,
+        /// The value assigned to the keyed element(s).
+        value: Expr,
+        /// Source span covering the key and the value.
+        span: Span,
+    },
+    /// A `default: value` item, applied to every element not otherwise named.
+    Default {
+        /// The default value.
+        value: Expr,
+        /// Source span covering `default` and the value.
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -1330,6 +1401,9 @@ impl Expr {
             | Expr::FuncCall { span, .. }
             | Expr::SystemCall { span, .. }
             | Expr::Paren { span, .. }
+            | Expr::Member { span, .. }
+            | Expr::UnbasedUnsized { span, .. }
+            | Expr::AssignmentPattern { span, .. }
             | Expr::Error(span) => *span,
         }
     }
@@ -1358,10 +1432,25 @@ pub enum UnaryOp {
     RedXor,
     /// `~^` or `^~` (reduction XNOR)
     RedXnor,
-    /// `++` (prefix increment)
+    /// `++` (prefix increment, `++i`): increments, then yields the new value.
     PreIncr,
-    /// `--` (prefix decrement)
+    /// `--` (prefix decrement, `--i`): decrements, then yields the new value.
     PreDecr,
+    /// `++` (postfix increment, `i++`): yields the old value, then increments.
+    PostIncr,
+    /// `--` (postfix decrement, `i--`): yields the old value, then decrements.
+    PostDecr,
+}
+
+impl UnaryOp {
+    /// Returns `true` for the side-effecting increment/decrement operators
+    /// (`++i`, `--i`, `i++`, `i--`).
+    pub fn is_incr_decr(self) -> bool {
+        matches!(
+            self,
+            UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
+        )
+    }
 }
 
 /// A binary operator.
@@ -1436,6 +1525,75 @@ mod tests {
         let json = serde_json::to_string(&expr).unwrap();
         let back: Expr = serde_json::from_str(&json).unwrap();
         assert_eq!(back.span(), dummy_span());
+    }
+
+    #[test]
+    fn serde_roundtrip_issue30_exprs() {
+        let lit = || Expr::Literal { span: dummy_span() };
+        let exprs = vec![
+            Expr::Member {
+                base: Box::new(Expr::Index {
+                    base: Box::new(Expr::Identifier {
+                        name: Ident::from_raw(1),
+                        span: dummy_span(),
+                    }),
+                    index: Box::new(lit()),
+                    span: dummy_span(),
+                }),
+                member: Ident::from_raw(2),
+                span: dummy_span(),
+            },
+            Expr::UnbasedUnsized {
+                value: FillValue::Z,
+                span: dummy_span(),
+            },
+            Expr::AssignmentPattern {
+                items: vec![
+                    PatternItem::Positional(lit()),
+                    PatternItem::Keyed {
+                        key: lit(),
+                        value: lit(),
+                        span: dummy_span(),
+                    },
+                    PatternItem::Default {
+                        value: lit(),
+                        span: dummy_span(),
+                    },
+                ],
+                span: dummy_span(),
+            },
+            Expr::Unary {
+                op: UnaryOp::PostDecr,
+                operand: Box::new(lit()),
+                span: dummy_span(),
+            },
+        ];
+        for expr in exprs {
+            let json = serde_json::to_string(&expr).unwrap();
+            let back: Expr = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.span(), dummy_span());
+            assert_eq!(json, serde_json::to_string(&back).unwrap());
+        }
+    }
+
+    #[test]
+    fn unary_op_is_incr_decr() {
+        for op in [
+            UnaryOp::PreIncr,
+            UnaryOp::PreDecr,
+            UnaryOp::PostIncr,
+            UnaryOp::PostDecr,
+        ] {
+            assert!(op.is_incr_decr(), "{op:?}");
+        }
+        for op in [
+            UnaryOp::Plus,
+            UnaryOp::Minus,
+            UnaryOp::BitNot,
+            UnaryOp::RedXor,
+        ] {
+            assert!(!op.is_incr_decr(), "{op:?}");
+        }
     }
 
     #[test]

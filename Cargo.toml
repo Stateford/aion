@@ -9,6 +9,7 @@ members = [
     "crates/aion_vhdl_parser",
     "crates/aion_verilog_parser",
     "crates/aion_sv_parser",
+    "crates/aion_vpp",
     "crates/aion_elaborate",
     "crates/aion_lint",
     "crates/aion_cache",
@@ -54,6 +55,7 @@ aion_ir = { path = "crates/aion_ir" }
 aion_vhdl_parser = { path = "crates/aion_vhdl_parser" }
 aion_verilog_parser = { path = "crates/aion_verilog_parser" }
 aion_sv_parser = { path = "crates/aion_sv_parser" }
+aion_vpp = { path = "crates/aion_vpp" }
 aion_elaborate = { path = "crates/aion_elaborate" }
 aion_lint = { path = "crates/aion_lint" }
 aion_cache = { path = "crates/aion_cache" }

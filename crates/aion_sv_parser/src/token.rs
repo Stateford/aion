@@ -204,6 +204,9 @@ pub enum SvToken {
     IntLiteral,
     /// Sized/based literal (e.g., `4'b1010`, `16'hFF`, `8'o77`)
     SizedLiteral,
+    /// Unbased unsized literal (`'0`, `'1`, `'x`, `'X`, `'z`, `'Z`) whose width
+    /// comes from its context.
+    UnbasedUnsizedLiteral,
     /// Real literal (e.g., `3.5`, `1.0e-3`)
     RealLiteral,
     /// Time literal: a number with a time unit (e.g., `10ns`, `1.5ps`,

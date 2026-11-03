@@ -1122,6 +1122,167 @@ mod tests {
         panic!("no always block found");
     }
 
+    // --- Issue #30: member lvalues, fill literals, postfix ++/-- values ---
+
+    /// Returns the first statement of an always body (unwrapping `begin`/`end`).
+    fn first_stmt(body: &Statement) -> &Statement {
+        match body {
+            Statement::Block { stmts, .. } => &stmts[0],
+            other => other,
+        }
+    }
+
+    #[test]
+    fn member_lvalue_on_index_keeps_member() {
+        let items = parse_module_items("always_comb begin arr[2].valid = 1'b1; end");
+        match first_stmt(get_always_body(&items)) {
+            Statement::Blocking { target, .. } => match target {
+                Expr::Member { base, .. } => assert!(matches!(**base, Expr::Index { .. })),
+                other => panic!("expected member target, got {other:?}"),
+            },
+            other => panic!("expected blocking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_lvalue_chain_and_nonblocking() {
+        let items = parse_module_items("always_ff @(posedge clk) inst[0].port[3].bit_q <= d;");
+        match get_always_body(&items) {
+            Statement::NonBlocking { target, .. } => match target {
+                Expr::Member { base, .. } => match &**base {
+                    Expr::Index { base, .. } => {
+                        assert!(matches!(**base, Expr::Member { .. }))
+                    }
+                    other => panic!("expected index, got {other:?}"),
+                },
+                other => panic!("expected member target, got {other:?}"),
+            },
+            other => panic!("expected non-blocking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_lvalue_after_scoped_name() {
+        let items = parse_module_items("always_comb begin pkg::cfg[1].en = 0; end");
+        match first_stmt(get_always_body(&items)) {
+            Statement::Blocking { target, .. } => {
+                assert!(matches!(target, Expr::Member { .. }))
+            }
+            other => panic!("expected blocking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unbased_unsized_reset_idiom() {
+        let items = parse_module_items("always_ff @(posedge clk) if (rst) q <= '0; else q <= '1;");
+        match get_always_body(&items) {
+            Statement::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                assert!(matches!(
+                    **then_stmt,
+                    Statement::NonBlocking {
+                        value: Expr::UnbasedUnsized {
+                            value: FillValue::Zero,
+                            ..
+                        },
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    else_stmt.as_deref(),
+                    Some(Statement::NonBlocking {
+                        value: Expr::UnbasedUnsized {
+                            value: FillValue::One,
+                            ..
+                        },
+                        ..
+                    })
+                ));
+            }
+            other => panic!("expected if, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assignment_pattern_statement() {
+        let items = parse_module_items("always_comb begin q = '{default: 1'b0}; end");
+        assert!(matches!(
+            first_stmt(get_always_body(&items)),
+            Statement::Blocking {
+                value: Expr::AssignmentPattern { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn postfix_and_prefix_values_differ() {
+        let items = parse_module_items("always_comb begin a = b++; c = ++d; end");
+        let Statement::Block { stmts, .. } = get_always_body(&items) else {
+            panic!("expected block")
+        };
+        assert!(matches!(
+            stmts[0],
+            Statement::Blocking {
+                value: Expr::Unary {
+                    op: UnaryOp::PostIncr,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            stmts[1],
+            Statement::Blocking {
+                value: Expr::Unary {
+                    op: UnaryOp::PreIncr,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn statement_incr_decr_still_works() {
+        let items = parse_module_items("always_comb begin i++; --j; end");
+        let Statement::Block { stmts, .. } = get_always_body(&items) else {
+            panic!("expected block")
+        };
+        assert!(matches!(
+            stmts[0],
+            Statement::IncrDecr {
+                increment: true,
+                prefix: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            stmts[1],
+            Statement::IncrDecr {
+                increment: false,
+                prefix: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unterminated_pattern_statement_recovers() {
+        let full = "module test; always_comb begin q = '{1, 2; r = 0; end endmodule";
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let tokens = lexer::lex(full, file, &sink);
+        let mut parser = SvParser::new(tokens, full, file, &interner, &sink);
+        let ast = parser.parse_source_file();
+        assert!(sink.has_errors());
+        assert!(matches!(ast.items[0], SvItem::Module(_)));
+    }
+
     #[test]
     fn blocking_assignment() {
         let items = parse_module_items("always_comb begin a = b; end");
