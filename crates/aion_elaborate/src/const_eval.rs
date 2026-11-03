@@ -58,8 +58,13 @@ pub(crate) fn parse_verilog_literal(text: &str) -> Option<i64> {
 ///
 /// For sized literals like `24'h000000`, returns `(Some(24), 0)`.
 /// For unsized literals like `42` or `'hFF`, returns `(None, value)`.
+/// Whitespace inside the token (`8 'h FF`, allowed by IEEE 1364-2005 §3.5.1)
+/// is ignored like underscores.
 pub(crate) fn parse_verilog_literal_with_width(text: &str) -> Option<(Option<u32>, i64)> {
-    let text = text.replace('_', "");
+    let text: String = text
+        .chars()
+        .filter(|c| *c != '_' && !c.is_whitespace())
+        .collect();
 
     if let Some(tick_pos) = text.find('\'') {
         // Extract the explicit width prefix (e.g., "24" from "24'h000000")
@@ -690,6 +695,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_literal_with_width_ignores_lrm_whitespace() {
+        assert_eq!(
+            parse_verilog_literal_with_width("8 'hFF"),
+            Some((Some(8), 255))
+        );
+        assert_eq!(
+            parse_verilog_literal_with_width("8'h FF"),
+            Some((Some(8), 255))
+        );
+        assert_eq!(
+            parse_verilog_literal_with_width("4 'sb\n1010"),
+            Some((Some(4), 10))
+        );
+    }
+
+    #[test]
+    fn parse_literal_with_width_rejects_invalid_digits() {
+        assert_eq!(parse_verilog_literal_with_width("4'b102"), None);
+        assert_eq!(parse_verilog_literal_with_width("4'b"), None);
+    }
+
     // ---- clog2 ----
 
     #[test]
@@ -1011,6 +1038,60 @@ mod tests {
         let result = eval_sv_expr(&expr, &db, &interner, &env, &sink);
         assert!(result.is_none());
         assert!(sink.has_errors());
+    }
+
+    // ---- operator precedence through the real parsers (issue #31) ----
+
+    /// Parses `text` with the Verilog parser and evaluates it as a constant.
+    fn eval_verilog_text(text: &str) -> Option<i64> {
+        let mut db = SourceDb::new();
+        let file = db.add_source("t.v", text.to_string());
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let tokens = aion_verilog_parser::lexer::lex(text, file, &sink);
+        let mut parser =
+            aion_verilog_parser::parser::VerilogParser::new(tokens, text, file, &interner, &sink);
+        let expr = parser.parse_expr();
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        let val = eval_verilog_expr(&expr, &db, &interner, &ConstEnv::new(), &sink)?;
+        const_to_i64(&val)
+    }
+
+    /// Parses `text` with the SystemVerilog parser and evaluates it as a constant.
+    fn eval_sv_text(text: &str) -> Option<i64> {
+        let mut db = SourceDb::new();
+        let file = db.add_source("t.sv", text.to_string());
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let tokens = aion_sv_parser::lexer::lex(text, file, &sink);
+        let mut parser =
+            aion_sv_parser::parser::SvParser::new(tokens, text, file, &interner, &sink);
+        let expr = parser.parse_expr();
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        let val = eval_sv_expr(&expr, &db, &interner, &ConstEnv::new(), &sink)?;
+        const_to_i64(&val)
+    }
+
+    #[test]
+    fn power_is_left_associative_in_parameters() {
+        // IEEE 1364-2005 §5.1.2 / IEEE 1800-2017 Table 11-2: `**` is
+        // left-associative, so 2 ** 3 ** 2 == (2 ** 3) ** 2 == 64 (not 512).
+        assert_eq!(eval_verilog_text("2 ** 3 ** 2"), Some(64));
+        assert_eq!(eval_sv_text("2 ** 3 ** 2"), Some(64));
+        // Parentheses still force right grouping.
+        assert_eq!(eval_verilog_text("2 ** (3 ** 2)"), Some(512));
+        assert_eq!(eval_sv_text("2 ** (3 ** 2)"), Some(512));
+    }
+
+    #[test]
+    fn unary_minus_binds_tighter_than_power_in_parameters() {
+        // Unary operators bind tighter than `**`: -2 ** 2 == (-2) ** 2 == 4.
+        assert_eq!(eval_verilog_text("-2 ** 2"), Some(4));
+        assert_eq!(eval_sv_text("-2 ** 2"), Some(4));
+        assert_eq!(eval_verilog_text("-(2 ** 2)"), Some(-4));
+        // `**` binds tighter than `*`: 3 * 2 ** 2 == 12.
+        assert_eq!(eval_verilog_text("3 * 2 ** 2"), Some(12));
+        assert_eq!(eval_sv_text("2 ** 2 * 3"), Some(12));
     }
 
     #[test]

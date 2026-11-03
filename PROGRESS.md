@@ -7,7 +7,7 @@
 
 ## 2026-11-02 — VHDL Parser: Lexer Correctness for Comments, Literals, Ticks and UTF-8 (Fixes #22)
 
-- **UTF-8 (VHDL-5):** a non-ASCII character outside literals and comments now gives one `Error` token whose span covers the whole character. The message names it (`'‘' (U+2018)`). Smart quotes, primes and typographic dashes get a help line pointing to `'`, `"` or `-`. NBSP and vertical tab count as separators. `TerminalRenderer` clamps offsets to char boundaries (with a manual `floor_char_boundary`), so a mid-character span can no longer panic. Carets are now placed by character column and limited to the first line of a span.
+- **UTF-8 (VHDL-5):** a non-ASCII character outside literals and comments now gives one `Error` token whose span covers the whole character. The message names it (`'‘' (U+2018)`). Smart quotes, primes and typographic dashes get a help line pointing to `'`, `"` or `-`. NBSP and vertical tab count as separators. The renderer side of the panic (clamping spans to char boundaries, character-based caret columns) landed separately in #59; this change adds smart-quote renderer tests on top of it.
 - **Delimited comments (VHDL-7):** a `/* … */` comment ends at the first `*/` (LRM §15.9), so it no longer nests. `/* see src/*.vhd */` now lexes cleanly.
 - **Bit strings (VHDL-15):** sized literals (`8UX"FF"`, `12SB"101"`, `16D"255"`) are now a single `BitStringLiteral` token. An unterminated bit string reports an error at a newline or at EOF. The new `aion_vhdl_parser::bit_string::expand_bit_string` implements LRM §15.8:
   - base digits are checked, and metavalues such as `Z`, `X` and `-` are replicated;
@@ -29,9 +29,19 @@
 - **Tests:**
   - `bit_string` ×11 and lexer ×31 new, plus `nested_block_comment` updated to assert LRM behaviour;
   - parser integration ×2 (one renders smart-quote diagnostics);
-  - renderer ×5 (mid-char span, out-of-range offset, multibyte caret alignment, multi-line span);
+  - renderer ×4 (smart-quote boundaries, mid-char and out-of-range lines, smart-quote spans, caret alignment after multibyte text);
   - elaborator ×9 (sized, signed, `D` and >64-bit values, metavalues, E213, default-value end-to-end).
 - **Known gaps:** `%` as a replacement for `"` is not supported. `aion_source::SourceFile::snippet` still slices bytes directly; the lexer no longer produces non-boundary spans, so this is safe today. Based literals are validated but the elaborator still evaluates only decimal integers.
+## 2026-11-02 — VHDL Parser: Preserve Attribute Ranges in Discrete Ranges (Fixes #21)
+
+- **AST:** `DiscreteRange` gains `Attribute(RangeAttributeName)` (with `prefix: Name`, `kind: RangeAttributeKind::{Range, ReverseRange}`, an optional `dimension` expression for `m'range(2)`, and `span`) and `Error(Span)`. A new `DiscreteRange::span()` helper is added. `v'range`, `T'reverse_range` and `rec.f(1)'range` no longer collapse to a bare type mark (VHDL-4).
+- **Parser:** `parse_discrete_range` accepts only explicit ranges, range attribute names and plain type marks. Anything else, such as `a + 1`, `8`, `v(3)` or `v'length`, now gets an error at the expression's span and becomes `DiscreteRange::Error`. Before, these were silently dropped or turned into `<error>`. `expr_to_selected_name` is replaced by `expr_as_type_mark`, which returns `None` when dropping a suffix would lose information.
+- **Elaborator:** the new `aion_elaborate::ranges` module adds `ResolvedRange` (`indices()` honours direction, `reversed()` implements `'reverse_range`) and a `RangeEnv`. The env records the declared index ranges of generics, ports, signals, constants, variables, arrays/subtypes and scalar subtypes. Process-local entries stay scoped to their process, and loop parameters shadow outer names. `resolve_vhdl_discrete_range` uses this env:
+  - `std_logic_vector(a'range)` (and `signed`/`unsigned`) is sized from the prefix.
+  - Each `for` loop and `for … generate` range is resolved.
+  - A prefix that is unknown, not an array, has a non-constant range, has a bad dimension or is compound gets the new **E212** error. The range is never guessed.
+- **Tests:** 16 parser tests (`types.rs`); 13 `ranges.rs` tests (index order for `'range`/`'reverse_range` of for-loops and for-generates, types, dimensions, every E212 path); 5 VHDL elaboration tests; 1 errors test.
+- **Known gaps:** the VHDL elaborator still does not unroll `for` loops or expand `for … generate` bodies. Ranges are resolved and checked, but they do not yet drive iteration. Range attributes inside range constraints (`integer range v'range`) and slices (`x(v'range)`) are out of scope.
 ## 2026-11-02 — VHDL Parser: Expression Precedence and Associativity per LRM 9.2 (Fixes #20)
 
 - **New binding powers** (`aion_vhdl_parser/src/expr.rs`): logical (1,2), relational (3,4), shift (5,6), adding (7,8), **sign prefix 9**, multiplying (10,11), `**` (12,13), and `not`/`abs`/`??`/reductions at prefix 14. A sign now covers a whole term, so `-7 mod 3` is `-(7 mod 3)` (VHDL-3). Before, every unary operator was at 11.

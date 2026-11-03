@@ -15,10 +15,16 @@
 //! | (15,16)  | `<<` `>>` `<<<` `>>>` |
 //! | (17,18)  | `+` `-` |
 //! | (19,20)  | `*` `/` `%` |
-//! | (22,21)  | `**` (right-assoc) |
+//! | (21,22)  | `**` (left-assoc, like every binary operator) |
 //! | prefix 23 | `+` `-` `!` `~` `&` `~&` `|` `~|` `^` `~^` `++` `--` |
 //!
 //! Ternary `? :` is handled as a special case at min_bp=0 (right-associative).
+//!
+//! Postfix selects (`[...]`, `.`) bind tighter than every prefix operator,
+//! and prefix operators bind tighter than `**`, so `-a ** b` is
+//! `(-a) ** b` and `~a[0]` is `~(a[0])`. Inside `[...]` the index is a full
+//! expression; a `+` or `-` directly followed by `:` ends it, which is how
+//! the `+:` / `-:` indexed part-select operators are recognised.
 
 use crate::ast::*;
 use crate::parser::SvParser;
@@ -42,7 +48,9 @@ fn infix_binding_power(op: &BinaryOp) -> (u8, u8) {
         BinaryOp::Shl | BinaryOp::Shr | BinaryOp::AShl | BinaryOp::AShr => (15, 16),
         BinaryOp::Add | BinaryOp::Sub => (17, 18),
         BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => (19, 20),
-        BinaryOp::Pow => (22, 21), // right-associative
+        // Left-associative per IEEE 1364-2005 §5.1.2 / IEEE 1800-2017 Table 11-2:
+        // `a ** b ** c` is `(a ** b) ** c`.
+        BinaryOp::Pow => (21, 22),
     }
 }
 
@@ -156,67 +164,6 @@ impl SvParser<'_> {
             }
 
             self.advance(); // consume operator token
-
-            let rhs = self.parse_expr_bp(r_bp);
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                left: Box::new(lhs),
-                op,
-                right: Box::new(rhs),
-                span,
-            };
-        }
-
-        lhs
-    }
-
-    /// Continues Pratt parsing from an existing LHS expression.
-    ///
-    /// Used when we parsed an expression with restricted binding power and need
-    /// to continue parsing the rest with a different binding power.
-    fn continue_expr_bp(&mut self, mut lhs: Expr, min_bp: u8) -> Expr {
-        loop {
-            if self.at_eof() {
-                break;
-            }
-
-            if self.at(SvToken::Question) && min_bp == 0 {
-                let op_span = self.current_span();
-                self.advance();
-                let then_expr = self.parse_expr_bp(0);
-                self.expect(SvToken::Colon);
-                let else_expr = self.parse_expr_bp(0);
-                let span = lhs.span().merge(else_expr.span()).merge(op_span);
-                lhs = Expr::Ternary {
-                    condition: Box::new(lhs),
-                    then_expr: Box::new(then_expr),
-                    else_expr: Box::new(else_expr),
-                    span,
-                };
-                continue;
-            }
-
-            if self.at(SvToken::LeftBracket) {
-                lhs = self.parse_postfix_index(lhs);
-                continue;
-            }
-
-            if self.at(SvToken::Dot) {
-                lhs = self.parse_dot_suffix(lhs);
-                continue;
-            }
-
-            let op = match self.current_as_binary_op() {
-                Some(op) => op,
-                None => break,
-            };
-
-            let (l_bp, r_bp) = infix_binding_power(&op);
-            if l_bp < min_bp {
-                break;
-            }
-
-            self.advance();
 
             let rhs = self.parse_expr_bp(r_bp);
             let span = lhs.span().merge(rhs.span());
@@ -410,16 +357,26 @@ impl SvParser<'_> {
         Expr::Concat { elements, span }
     }
 
-    /// Parses postfix index/range/part-select.
+    /// Parses a postfix select: bit/element index `expr[i]`, range select
+    /// `expr[m:l]`, or indexed part-select `expr[b+:w]` / `expr[b-:w]`.
+    ///
+    /// The first expression inside the brackets is parsed as a full expression
+    /// (binding power 0), so every operator — shifts, bitwise, relational,
+    /// equality, logical and the conditional operator — is allowed in an index
+    /// or range bound. The `+:` / `-:` part-select operators are recognised
+    /// because the binary-operator loop treats a `+` or `-` that is immediately
+    /// followed by `:` as a terminator (see `at_part_select_op`), so
+    /// `d[8*i+7 -: 8]` yields base `8*i+7` and width `8`.
     pub(crate) fn parse_postfix_index(&mut self, base: Expr) -> Expr {
         let start = base.span();
         self.expect(SvToken::LeftBracket);
 
-        let first = self.parse_expr_bp(18);
+        let first = self.parse_expr();
 
-        // Check for part-select: [expr +: width] or [expr -: width]
-        if self.at(SvToken::Plus) && self.peek_is(SvToken::Colon) {
-            self.advance(); // eat +
+        if self.at_part_select_op() {
+            // Indexed part-select: [base +: width] or [base -: width]
+            let ascending = self.at(SvToken::Plus);
+            self.advance(); // eat + or -
             self.advance(); // eat :
             let width = self.parse_expr();
             self.expect(SvToken::RightBracket);
@@ -427,47 +384,12 @@ impl SvParser<'_> {
             Expr::PartSelect {
                 base: Box::new(base),
                 index: Box::new(first),
-                ascending: true,
+                ascending,
                 width: Box::new(width),
                 span,
             }
-        } else if self.at(SvToken::Minus) && self.peek_is(SvToken::Colon) {
-            self.advance(); // eat -
-            self.advance(); // eat :
-            let width = self.parse_expr();
-            self.expect(SvToken::RightBracket);
-            let span = start.merge(self.prev_span());
-            Expr::PartSelect {
-                base: Box::new(base),
-                index: Box::new(first),
-                ascending: false,
-                width: Box::new(width),
-                span,
-            }
-        } else if self.at(SvToken::Plus) || self.at(SvToken::Minus) {
-            let full_first = self.continue_expr_bp(first, 0);
-            if self.at(SvToken::Colon) {
-                self.advance();
-                let second = self.parse_expr();
-                self.expect(SvToken::RightBracket);
-                let span = start.merge(self.prev_span());
-                Expr::RangeSelect {
-                    base: Box::new(base),
-                    msb: Box::new(full_first),
-                    lsb: Box::new(second),
-                    span,
-                }
-            } else {
-                self.expect(SvToken::RightBracket);
-                let span = start.merge(self.prev_span());
-                Expr::Index {
-                    base: Box::new(base),
-                    index: Box::new(full_first),
-                    span,
-                }
-            }
-        } else if self.at(SvToken::Colon) {
-            self.advance();
+        } else if self.eat(SvToken::Colon) {
+            // Range select: [msb : lsb]
             let second = self.parse_expr();
             self.expect(SvToken::RightBracket);
             let span = start.merge(self.prev_span());
@@ -486,6 +408,16 @@ impl SvParser<'_> {
                 span,
             }
         }
+    }
+
+    /// Returns `true` if the parser is at the `+:` or `-:` indexed part-select
+    /// operator, i.e. a `+`/`-` token immediately followed by `:`.
+    ///
+    /// No expression can start with `:`, so a `+`/`-` in this position can
+    /// never be a binary operator; the expression parser stops there and
+    /// leaves the part-select operator for [`Self::parse_postfix_index`].
+    fn at_part_select_op(&self) -> bool {
+        (self.at(SvToken::Plus) || self.at(SvToken::Minus)) && self.peek_is(SvToken::Colon)
     }
 
     /// Parses a dot suffix for hierarchical names.
@@ -525,6 +457,10 @@ impl SvParser<'_> {
 
     /// Maps the current token to a binary operator, if applicable.
     fn current_as_binary_op(&self) -> Option<BinaryOp> {
+        if self.at_part_select_op() {
+            // `+:` / `-:` terminate the index expression of a part-select.
+            return None;
+        }
         match self.current() {
             SvToken::DoublePipe => Some(BinaryOp::LogOr),
             SvToken::DoubleAmpersand => Some(BinaryOp::LogAnd),
@@ -830,22 +766,46 @@ mod tests {
     }
 
     #[test]
-    fn power_right_associative() {
+    fn power_left_associative() {
+        // IEEE 1364-2005 §5.1.2 / IEEE 1800-2017 Table 11-2: `**` is
+        // left-associative, so `a ** b ** c` is `(a ** b) ** c`.
         let expr = parse_expr_str("a ** b ** c");
         match expr {
             Expr::Binary {
                 op: BinaryOp::Pow,
+                left,
                 right,
                 ..
             } => {
                 assert!(matches!(
-                    *right,
+                    *left,
                     Expr::Binary {
                         op: BinaryOp::Pow,
                         ..
                     }
                 ));
+                assert!(matches!(*right, Expr::Identifier { .. }));
             }
+            _ => panic!("expected pow at top"),
+        }
+    }
+
+    #[test]
+    fn unary_minus_binds_tighter_than_power() {
+        // Unary operators are above `**` in the LRM table: `-a ** b` is `(-a) ** b`.
+        let expr = parse_expr_str("-a ** b");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::Pow,
+                left,
+                ..
+            } => assert!(matches!(
+                *left,
+                Expr::Unary {
+                    op: UnaryOp::Minus,
+                    ..
+                }
+            )),
             _ => panic!("expected pow at top"),
         }
     }
@@ -872,5 +832,560 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+/// Table-driven operator-precedence regression tests.
+///
+/// Each case parses an expression and renders the AST as a compact
+/// S-expression, which is compared against the grouping required by the
+/// operator precedence table of IEEE 1800-2017 Table 11-2 (§11.3.2). From
+/// highest to lowest: postfix selects, unary operators (including `++`/`--`),
+/// `**`, `* / %`, binary `+ -`, shifts, relational and `inside`, equality
+/// (including `==?`/`!=?`), binary `&`, binary `^ ~^ ^~`, binary `|`, `&&`,
+/// `||`, `?:`. Every binary operator is left-associative; `?:` is
+/// right-associative.
+///
+/// Rendering: `(op lhs rhs)` for binary operators, `(op operand)` for unary
+/// operators, `(? c t e)` for the conditional operator, `(idx b i)` for a
+/// bit-select, `(range b msb lsb)` for a range select, `(+: b i w)` /
+/// `(-: b i w)` for indexed part-selects and `(paren e)` for parentheses.
+#[cfg(test)]
+mod precedence_matrix {
+    use crate::lexer;
+    use crate::parser::SvParser;
+    use aion_common::Interner;
+    use aion_diagnostics::DiagnosticSink;
+    use aion_source::FileId;
+
+    use crate::ast::*;
+
+    fn bin_sym(op: BinaryOp) -> &'static str {
+        match op {
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+            BinaryOp::Mod => "%",
+            BinaryOp::Pow => "**",
+            BinaryOp::Eq => "==",
+            BinaryOp::Neq => "!=",
+            BinaryOp::CaseEq => "===",
+            BinaryOp::CaseNeq => "!==",
+            BinaryOp::WildEq => "==?",
+            BinaryOp::WildNeq => "!=?",
+            BinaryOp::Lt => "<",
+            BinaryOp::Le => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::Ge => ">=",
+            BinaryOp::LogAnd => "&&",
+            BinaryOp::LogOr => "||",
+            BinaryOp::BitAnd => "&",
+            BinaryOp::BitOr => "|",
+            BinaryOp::BitXor => "^",
+            BinaryOp::BitXnor => "~^",
+            BinaryOp::Shl => "<<",
+            BinaryOp::Shr => ">>",
+            BinaryOp::AShl => "<<<",
+            BinaryOp::AShr => ">>>",
+        }
+    }
+
+    fn un_sym(op: UnaryOp) -> &'static str {
+        match op {
+            UnaryOp::Plus => "+",
+            UnaryOp::Minus => "-",
+            UnaryOp::LogNot => "!",
+            UnaryOp::BitNot => "~",
+            UnaryOp::RedAnd => "&",
+            UnaryOp::RedNand => "~&",
+            UnaryOp::RedOr => "|",
+            UnaryOp::RedNor => "~|",
+            UnaryOp::RedXor => "^",
+            UnaryOp::RedXnor => "~^",
+            UnaryOp::PreIncr => "++",
+            UnaryOp::PreDecr => "--",
+        }
+    }
+
+    fn list(head: &str, items: &[&Expr], src: &str, interner: &Interner) -> String {
+        let mut out = format!("({head}");
+        for item in items {
+            out.push(' ');
+            out.push_str(&sexpr(item, src, interner));
+        }
+        out.push(')');
+        out
+    }
+
+    /// Renders an expression as an S-expression for structural comparison.
+    fn sexpr(expr: &Expr, src: &str, interner: &Interner) -> String {
+        let text =
+            |span: aion_source::Span| src[span.start as usize..span.end as usize].to_string();
+        match expr {
+            Expr::Identifier { name, .. } => interner.resolve(*name).to_string(),
+            Expr::HierarchicalName { parts, .. } => parts
+                .iter()
+                .map(|p| interner.resolve(*p))
+                .collect::<Vec<_>>()
+                .join("."),
+            Expr::ScopedIdent { scope, name, .. } => {
+                format!("{}::{}", interner.resolve(*scope), interner.resolve(*name))
+            }
+            Expr::Literal { span } | Expr::RealLiteral { span } | Expr::StringLiteral { span } => {
+                text(*span)
+            }
+            Expr::Index { base, index, .. } => list("idx", &[base, index], src, interner),
+            Expr::RangeSelect { base, msb, lsb, .. } => {
+                list("range", &[base, msb, lsb], src, interner)
+            }
+            Expr::PartSelect {
+                base,
+                index,
+                ascending,
+                width,
+                ..
+            } => list(
+                if *ascending { "+:" } else { "-:" },
+                &[base, index, width],
+                src,
+                interner,
+            ),
+            Expr::Concat { elements, .. } => list(
+                "concat",
+                &elements.iter().collect::<Vec<_>>(),
+                src,
+                interner,
+            ),
+            Expr::Repeat {
+                count, elements, ..
+            } => {
+                let mut items: Vec<&Expr> = vec![count];
+                items.extend(elements.iter());
+                list("repeat", &items, src, interner)
+            }
+            Expr::Unary { op, operand, .. } => list(un_sym(*op), &[operand], src, interner),
+            Expr::Binary {
+                left, op, right, ..
+            } => list(bin_sym(*op), &[left, right], src, interner),
+            Expr::Ternary {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => list("?", &[condition, then_expr, else_expr], src, interner),
+            Expr::Inside { expr, ranges, .. } => {
+                let mut items: Vec<&Expr> = vec![expr];
+                items.extend(ranges.iter());
+                list("inside", &items, src, interner)
+            }
+            Expr::Cast {
+                cast_type, expr, ..
+            } => list("cast", &[cast_type, expr], src, interner),
+            Expr::FuncCall { name, args, .. } => {
+                let mut items: Vec<&Expr> = vec![name];
+                items.extend(args.iter());
+                list("call", &items, src, interner)
+            }
+            Expr::SystemCall { name, args, .. } => list(
+                interner.resolve(*name),
+                &args.iter().collect::<Vec<_>>(),
+                src,
+                interner,
+            ),
+            Expr::Paren { inner, .. } => list("paren", &[inner], src, interner),
+            Expr::Error(_) => "<error>".to_string(),
+        }
+    }
+
+    /// Parses `src` as one expression. Returns the S-expression and whether
+    /// the parse was clean (no diagnostics and every token consumed).
+    fn parse(src: &str) -> (String, bool) {
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let tokens = lexer::lex(src, file, &sink);
+        let mut parser = SvParser::new(tokens, src, file, &interner, &sink);
+        let expr = parser.parse_expr();
+        let clean = !sink.has_errors() && parser.at_eof();
+        (sexpr(&expr, src, &interner), clean)
+    }
+
+    fn check_table(table: &[(&str, &str)]) {
+        let mut failures = Vec::new();
+        for (src, want) in table {
+            let (got, clean) = parse(src);
+            if !clean || got != *want {
+                failures.push(format!(
+                    "  {src:<28} want {want}\n  {:<28} got  {got} (clean: {clean})",
+                    ""
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "precedence mismatches:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Asserts that `src` is rejected (diagnostic or unconsumed tokens)
+    /// without panicking.
+    fn check_rejected(src: &str) {
+        let (got, clean) = parse(src);
+        assert!(!clean, "expected `{src}` to be rejected, parsed as {got}");
+    }
+
+    #[test]
+    fn power_and_unary() {
+        check_table(&[
+            // `**` is left-associative (IEEE 1800-2017 Table 11-2).
+            ("a ** b ** c", "(** (** a b) c)"),
+            ("2 ** 3 ** 2", "(** (** 2 3) 2)"),
+            // Unary operators bind tighter than `**`.
+            ("-a ** b", "(** (- a) b)"),
+            ("+a ** b", "(** (+ a) b)"),
+            ("~a ** b", "(** (~ a) b)"),
+            ("!a ** b", "(** (! a) b)"),
+            ("a ** -b", "(** a (- b))"),
+            ("-a ** -b ** c", "(** (** (- a) (- b)) c)"),
+            // `**` binds tighter than `* / %`.
+            ("a * b ** c", "(* a (** b c))"),
+            ("a ** b * c", "(* (** a b) c)"),
+            ("a / b ** c", "(/ a (** b c))"),
+            ("a ** b % c", "(% (** a b) c)"),
+        ]);
+    }
+
+    #[test]
+    fn arithmetic() {
+        check_table(&[
+            ("a * b / c % d", "(% (/ (* a b) c) d)"),
+            ("a + b * c", "(+ a (* b c))"),
+            ("a * b + c", "(+ (* a b) c)"),
+            ("a - b / c", "(- a (/ b c))"),
+            ("a % b - c", "(- (% a b) c)"),
+            ("a - b - c", "(- (- a b) c)"),
+            ("a - b + c", "(+ (- a b) c)"),
+            ("-a + b", "(+ (- a) b)"),
+            ("a - -b", "(- a (- b))"),
+            ("(a + b) * c", "(* (paren (+ a b)) c)"),
+        ]);
+    }
+
+    #[test]
+    fn shifts() {
+        check_table(&[
+            ("a << b + c", "(<< a (+ b c))"),
+            ("a + b >> c", "(>> (+ a b) c)"),
+            ("a <<< b - c", "(<<< a (- b c))"),
+            ("a * b >>> c", "(>>> (* a b) c)"),
+            ("a << b >> c", "(>> (<< a b) c)"),
+            ("a >>> b <<< c", "(<<< (>>> a b) c)"),
+        ]);
+    }
+
+    #[test]
+    fn relational_and_equality() {
+        check_table(&[
+            ("a < b << c", "(< a (<< b c))"),
+            ("a >> b >= c", "(>= (>> a b) c)"),
+            ("a <= b + c", "(<= a (+ b c))"),
+            ("a > b <<< 1", "(> a (<<< b 1))"),
+            ("a < b > c", "(> (< a b) c)"),
+            ("a == b < c", "(== a (< b c))"),
+            ("a <= b != c", "(!= (<= a b) c)"),
+            ("a === b >= c", "(=== a (>= b c))"),
+            ("a > b !== c", "(!== (> a b) c)"),
+            ("a == b != c", "(!= (== a b) c)"),
+            ("a === b !== c", "(!== (=== a b) c)"),
+            // Wildcard equality shares the equality level.
+            ("a ==? b < c", "(==? a (< b c))"),
+            ("a !=? b == c", "(== (!=? a b) c)"),
+            ("a & b ==? c", "(& a (==? b c))"),
+            ("a ==? b && c !=? d", "(&& (==? a b) (!=? c d))"),
+            // `inside` is at the relational level.
+            ("a == b inside {c}", "(== a (inside b c))"),
+            ("a + b inside {c, d}", "(inside (+ a b) c d)"),
+            ("a < b inside {c}", "(inside (< a b) c)"),
+            ("a inside {b} && c", "(&& (inside a b) c)"),
+        ]);
+    }
+
+    #[test]
+    fn bitwise() {
+        check_table(&[
+            ("a & b == c", "(& a (== b c))"),
+            ("a !== b & c", "(& (!== a b) c)"),
+            ("a ^ b & c", "(^ a (& b c))"),
+            ("a & b ^ c", "(^ (& a b) c)"),
+            ("a ~^ b & c", "(~^ a (& b c))"),
+            ("a ^~ b & c", "(~^ a (& b c))"),
+            ("a ^ b ~^ c", "(~^ (^ a b) c)"),
+            ("a | b ^ c", "(| a (^ b c))"),
+            ("a ~^ b | c", "(| (~^ a b) c)"),
+            ("a | b | c", "(| (| a b) c)"),
+            // `~&` / `~|` are unary reductions only (no binary form in 1800-2017).
+            ("a & ~&b", "(& a (~& b))"),
+            ("a | ~|b", "(| a (~| b))"),
+            ("a ^ ~^b", "(^ a (~^ b))"),
+            ("~&a | b", "(| (~& a) b)"),
+            ("a & &b", "(& a (& b))"),
+            ("a | |b", "(| a (| b))"),
+        ]);
+        check_rejected("a ~& b");
+        check_rejected("a ~| b");
+    }
+
+    #[test]
+    fn logical_and_conditional() {
+        check_table(&[
+            ("a && b | c", "(&& a (| b c))"),
+            ("a | b && c", "(&& (| a b) c)"),
+            ("a || b && c", "(|| a (&& b c))"),
+            ("a && b || c", "(|| (&& a b) c)"),
+            ("!a && b", "(&& (! a) b)"),
+            ("a || b ? c : d", "(? (|| a b) c d)"),
+            ("a ? b || c : d && e", "(? a (|| b c) (&& d e))"),
+            // `?:` is right-associative.
+            ("a ? b : c ? d : e", "(? a b (? c d e))"),
+            ("a ? b ? c : d : e", "(? a (? b c d) e)"),
+            ("a ? b : c ? d : e ? f : g", "(? a b (? c d (? e f g)))"),
+            ("a + b ? c : d", "(? (+ a b) c d)"),
+            ("-s ? a : b", "(? (- s) a b)"),
+        ]);
+        check_rejected("a ? b");
+    }
+
+    #[test]
+    fn postfix_binds_tightest() {
+        check_table(&[
+            ("~a[0]", "(~ (idx a 0))"),
+            ("-a[3:0]", "(- (range a 3 0))"),
+            ("&a[i +: 4]", "(& (+: a i 4))"),
+            ("a[1] ** 2", "(** (idx a 1) 2)"),
+            ("m[i][j]", "(idx (idx m i) j)"),
+            ("m[i][j +: 2]", "(+: (idx m i) j 2)"),
+        ]);
+    }
+
+    /// PAR-6: every operator class must be allowed inside `[...]`.
+    #[test]
+    fn every_operator_inside_index() {
+        check_table(&[
+            ("x[i ** 2]", "(idx x (** i 2))"),
+            ("x[i * 2]", "(idx x (* i 2))"),
+            ("x[i / 2]", "(idx x (/ i 2))"),
+            ("x[i % 2]", "(idx x (% i 2))"),
+            ("x[i + 1]", "(idx x (+ i 1))"),
+            ("x[i - 1]", "(idx x (- i 1))"),
+            ("x[i << 2]", "(idx x (<< i 2))"),
+            ("x[i >> 2]", "(idx x (>> i 2))"),
+            ("x[i <<< 2]", "(idx x (<<< i 2))"),
+            ("x[i >>> 2]", "(idx x (>>> i 2))"),
+            ("x[i < 3]", "(idx x (< i 3))"),
+            ("x[i <= 3]", "(idx x (<= i 3))"),
+            ("x[i > 3]", "(idx x (> i 3))"),
+            ("x[i >= 3]", "(idx x (>= i 3))"),
+            ("x[i == 0]", "(idx x (== i 0))"),
+            ("x[i != 0]", "(idx x (!= i 0))"),
+            ("x[i === 0]", "(idx x (=== i 0))"),
+            ("x[i !== 0]", "(idx x (!== i 0))"),
+            ("x[i & 3]", "(idx x (& i 3))"),
+            ("x[i ^ j]", "(idx x (^ i j))"),
+            ("x[i ~^ j]", "(idx x (~^ i j))"),
+            ("x[i | j]", "(idx x (| i j))"),
+            ("x[a && b]", "(idx x (&& a b))"),
+            ("x[a || b]", "(idx x (|| a b))"),
+            ("x[s ? 1 : 0]", "(idx x (? s 1 0))"),
+            ("x[s ? a : t ? b : c]", "(idx x (? s a (? t b c)))"),
+            ("x[-i]", "(idx x (- i))"),
+            ("x[~i]", "(idx x (~ i))"),
+            ("x[&i]", "(idx x (& i))"),
+            ("x[i ==? 0]", "(idx x (==? i 0))"),
+            ("x[i !=? 0]", "(idx x (!=? i 0))"),
+            ("x[i inside {1, 2}]", "(idx x (inside i 1 2))"),
+            ("x[p::W - 1]", "(idx x (- p::W 1))"),
+            ("x[i + j * 2 << 1]", "(idx x (<< (+ i (* j 2)) 1))"),
+            ("x[y[i + 1] - 1]", "(idx x (- (idx y (+ i 1)) 1))"),
+            ("x[{a, b} | c]", "(idx x (| (concat a b) c))"),
+        ]);
+    }
+
+    #[test]
+    fn range_selects() {
+        check_table(&[
+            ("x[7:0]", "(range x 7 0)"),
+            ("x[W - 1 : 0]", "(range x (- W 1) 0)"),
+            ("x[i + 7 : i]", "(range x (+ i 7) i)"),
+            ("x[a << 1 : b & 3]", "(range x (<< a 1) (& b 3))"),
+            ("x[s ? 7 : 3 : 0]", "(range x (? s 7 3) 0)"),
+            ("x[7 : s ? 1 : 0]", "(range x 7 (? s 1 0))"),
+        ]);
+    }
+
+    /// PAR-6: `+:` / `-:` with arithmetic (and other) base expressions.
+    #[test]
+    fn indexed_part_selects() {
+        check_table(&[
+            ("d[i +: 8]", "(+: d i 8)"),
+            ("d[i -: 8]", "(-: d i 8)"),
+            ("d[i+:4]", "(+: d i 4)"),
+            ("d[i-:4]", "(-: d i 4)"),
+            ("d[8*i+7 -: 8]", "(-: d (+ (* 8 i) 7) 8)"),
+            ("d[8*i+7 +: 8]", "(+: d (+ (* 8 i) 7) 8)"),
+            ("d[i+1 +: 8]", "(+: d (+ i 1) 8)"),
+            ("d[i+1 -: 8]", "(-: d (+ i 1) 8)"),
+            ("d[i-1 +: 8]", "(+: d (- i 1) 8)"),
+            ("d[i-1 -: W+1]", "(-: d (- i 1) (+ W 1))"),
+            ("d[i - -1 +: 2]", "(+: d (- i (- 1)) 2)"),
+            ("d[i*W +: W]", "(+: d (* i W) W)"),
+            ("d[i ** 2 -: 4]", "(-: d (** i 2) 4)"),
+            ("d[i << 3 +: 8]", "(+: d (<< i 3) 8)"),
+            ("d[i >> 1 -: 8]", "(-: d (>> i 1) 8)"),
+            ("d[i & 3 +: 2]", "(+: d (& i 3) 2)"),
+            ("d[i | j -: 2]", "(-: d (| i j) 2)"),
+            ("d[a == b +: 1]", "(+: d (== a b) 1)"),
+            ("d[a && b -: 1]", "(-: d (&& a b) 1)"),
+            ("d[p::W * i +: p::W]", "(+: d (* p::W i) p::W)"),
+            ("d[i ==? 1 +: 1]", "(+: d (==? i 1) 1)"),
+            // The whole conditional is the base; `+:` follows the else arm.
+            ("d[s ? a : b +: 4]", "(+: d (? s a b) 4)"),
+            ("d[s ? a : b -: 4]", "(-: d (? s a b) 4)"),
+            ("d[i +: s ? 4 : 8]", "(+: d i (? s 4 8))"),
+            ("d[(i + 1) * 8 -: 8]", "(-: d (* (paren (+ i 1)) 8) 8)"),
+            ("d[i +: 2] + e[j -: 2]", "(+ (+: d i 2) (-: e j 2))"),
+            (
+                "{d[i +: 4], e[j - 1 -: 4]}",
+                "(concat (+: d i 4) (-: e (- j 1) 4))",
+            ),
+            ("{W - 1 {d[i -: 2]}}", "(repeat (- W 1) (-: d i 2))"),
+            (
+                "f(d[i+1 +: 8], x[i & 3])",
+                "(call f (+: d (+ i 1) 8) (idx x (& i 3)))",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn malformed_selects_are_rejected() {
+        // `s ? a` is not an expression, so it cannot be a part-select base.
+        check_rejected("d[s ? a +: b]");
+        check_rejected("d[i +: ]");
+        check_rejected("d[i +: 2 +: 3]");
+        check_rejected("d[i + ]");
+        // Outside brackets `+:` is never valid; the `+` is not taken as
+        // a binary operator, so the expression ends before it.
+        check_rejected("a + : b");
+    }
+
+    /// Parses `body` inside a module and returns its items, asserting that no
+    /// diagnostics were emitted.
+    fn parse_module(body: &str) -> (Vec<ModuleItem>, String, Interner) {
+        let src = format!("module m; {body} endmodule");
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let tokens = lexer::lex(&src, file, &sink);
+        let mut parser = SvParser::new(tokens, &src, file, &interner, &sink);
+        let ast = parser.parse_source_file();
+        assert!(
+            !sink.has_errors(),
+            "unexpected errors for `{body}`: {:?}",
+            sink.diagnostics()
+        );
+        let items = match ast.items.into_iter().next() {
+            Some(SvItem::Module(m)) => m.items,
+            other => panic!("expected module, got {other:?}"),
+        };
+        (items, src, interner)
+    }
+
+    fn initial_body(items: &[ModuleItem]) -> &Statement {
+        items
+            .iter()
+            .find_map(|i| match i {
+                ModuleItem::InitialBlock(b) => Some(&b.body),
+                _ => None,
+            })
+            .expect("initial block")
+    }
+
+    /// `<=` is a comparison inside an `if` condition and on the right-hand
+    /// side, but a non-blocking assignment after the statement target.
+    #[test]
+    fn le_comparison_vs_nonblocking_assignment() {
+        let (items, src, interner) = parse_module("initial if (a <= b) q <= c <= d;");
+        match initial_body(&items) {
+            Statement::If {
+                condition,
+                then_stmt,
+                ..
+            } => {
+                assert_eq!(sexpr(condition, &src, &interner), "(<= a b)");
+                match then_stmt.as_ref() {
+                    Statement::NonBlocking { target, value, .. } => {
+                        assert_eq!(sexpr(target, &src, &interner), "q");
+                        assert_eq!(sexpr(value, &src, &interner), "(<= c d)");
+                    }
+                    other => panic!("expected non-blocking assignment, got {other:?}"),
+                }
+            }
+            other => panic!("expected if, got {other:?}"),
+        }
+    }
+
+    /// Statement targets go through `parse_name_or_lvalue`, which shares
+    /// `parse_postfix_index` with expressions.
+    #[test]
+    fn lvalue_selects() {
+        let (items, src, interner) = parse_module(
+            "initial begin x[i << 2] <= a; d[8*i+7 -: 8] = b; d[i+1 +: 8] <= c; x[s ? 1 : 0] = e; end",
+        );
+        let stmts = match initial_body(&items) {
+            Statement::Block { stmts, .. } => stmts,
+            other => panic!("expected block, got {other:?}"),
+        };
+        let targets: Vec<String> = stmts
+            .iter()
+            .map(|s| match s {
+                Statement::Blocking { target, .. } | Statement::NonBlocking { target, .. } => {
+                    sexpr(target, &src, &interner)
+                }
+                other => panic!("expected assignment, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "(idx x (<< i 2))",
+                "(-: d (+ (* 8 i) 7) 8)",
+                "(+: d (+ i 1) 8)",
+                "(idx x (? s 1 0))",
+            ]
+        );
+    }
+
+    /// Continuous-assign targets, declaration ranges and port connections
+    /// accept the same select forms.
+    #[test]
+    fn selects_in_other_contexts() {
+        let (items, src, interner) = parse_module(
+            "wire [(W << 1) - 1 : 0] w; wire [W*2-1:0] v; \
+             assign w[i & 3] = v[8*i+7 -: 8]; \
+             sub u (.p(x[i | j]), .q(d[i+1 +: 8]));",
+        );
+        let assign = items
+            .iter()
+            .find_map(|i| match i {
+                ModuleItem::ContinuousAssign(a) => Some(a),
+                _ => None,
+            })
+            .expect("continuous assign");
+        assert_eq!(sexpr(&assign.target, &src, &interner), "(idx w (& i 3))");
+        assert_eq!(
+            sexpr(&assign.value, &src, &interner),
+            "(-: v (+ (* 8 i) 7) 8)"
+        );
     }
 }

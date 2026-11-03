@@ -1,0 +1,21 @@
+## 2026-11-02 — Verilog/SV Lexer: UTF-8, Literal and Escaped-Identifier Fixes (Fixes #34)
+
+- **UTF-8 errors (PAR-4):** an unrecognized multi-byte character is now one `Error` token spanning the whole character. Its single diagnostic names the real character and code point (`unrecognized character '’' (U+2019)`, `unrecognized character U+00A0`) and adds a help line, e.g. use an ASCII apostrophe.
+- **String escape at EOF (PAR-5):** `lex_string` skips a backslash plus one whole character and never runs past EOF. A `debug_assert!` in `lex_all` checks that every token span is in bounds and on a char boundary.
+- **Escaped identifiers (PAR-19):** `expect_ident` drops the leading `\` before interning, so `\cpu3 ` and `cpu3` are the same `Ident`. The token span still includes the backslash. `expect_ident` is the only place identifier text gets interned.
+- **Literals (PAR-20):**
+  - Whitespace is allowed between the size and `'`, and between the base and the digits (`8 'hFF`, `8'h FF`). The tick, `s` and base letter must still touch. `8 '(` is not treated as a literal.
+  - New errors: missing based digits (`4'b;`), `invalid digit '2' for binary literal` (`4'b102` stays one token), a real exponent with no digits (`1e`), and `'s` with no base.
+  - `'dx`/`'dz`/`'d?` are accepted, and `$` is now an identifier character.
+  - The elaborator's `parse_verilog_literal_with_width` ignores whitespace inside the token.
+- **Renderer backstop:** `TerminalRenderer` clamps the primary span to the file and snaps it to char boundaries before resolving or slicing. Caret count and padding are counted in characters, so ASCII output is unchanged.
+- **Tests:**
+  - lexer ×16 (Verilog) and ×13 (SV);
+  - escaped-identifier parser tests ×2 per parser;
+  - renderer ×6 (mid-char, out-of-bounds and inverted spans);
+  - const_eval ×2;
+  - `aion_conformance/tests/lexer_robustness.rs` (8 end-to-end tests), which parses the repro inputs with both front ends and renders every diagnostic.
+- **Known gaps:**
+  - SV time literals are tracked in #35.
+  - `-->` columns are still byte-based (`SourceFile::line_col`).
+  - An unparsable literal still lowers to a 32-bit zero, so `4'b102` also triggers width lint warnings after its lexer error.
