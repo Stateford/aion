@@ -33,23 +33,78 @@ use aion_common::Interner;
 use aion_diagnostics::DiagnosticSink;
 use aion_source::{FileId, SourceDb};
 
+/// Preprocessor options (predefined macros, include directories) accepted by
+/// [`parse_file_with_options`].
+pub use aion_vpp::PreprocessOptions;
+
 /// Parses a Verilog source file into an AST.
 ///
-/// Lexes the source text and parses it into a [`VerilogSourceFile`]. Errors are
-/// reported to the diagnostic sink and represented as `Error` variants in the AST
-/// for downstream processing.
+/// The file is run through the shared preprocessor ([`aion_vpp`]) first, so
+/// `` `define `` / `` `ifdef `` / `` `timescale `` and friends are handled.
+/// Because `source_db` is read-only here, `` `include `` is reported as an
+/// error; use [`parse_file_with_options`] to enable it. Errors are reported
+/// to the diagnostic sink and represented as `Error` variants in the AST for
+/// downstream processing.
 pub fn parse_file(
     file_id: FileId,
     source_db: &SourceDb,
     interner: &Interner,
     sink: &DiagnosticSink,
 ) -> VerilogSourceFile {
-    let file = source_db.get_file(file_id);
-    let source = &file.content;
-    let tokens = lexer::lex(source, file_id, sink);
-    let mut parser = parser::VerilogParser::new(tokens, source, file_id, interner, sink);
+    let pp = aion_vpp::preprocess_readonly(file_id, source_db, &PreprocessOptions::default(), sink);
+    let (tokens, ranges) = aion_vpp::lex_mapped(
+        &pp,
+        None,
+        sink,
+        |text, lex_sink| lexer::lex(text, file_id, lex_sink),
+        |t| &mut t.span,
+    );
+    parse_tokens(tokens, ranges, &pp, file_id, interner, sink)
+}
+
+/// Parses a Verilog source file into an AST with full preprocessing.
+///
+/// Like [`parse_file`], but with the given predefined macros and include
+/// directories, and with `` `include `` support: included files are loaded
+/// into `source_db` under their own `FileId`, and tokens they contribute keep
+/// their real spans. Tokens produced by macro expansion keep the span of their
+/// text in the macro definition (or macro argument); text that exists in no
+/// file, such as a token pasted with `` `` ``, gets a span in a
+/// `<preprocessed>` view file added to `source_db`.
+pub fn parse_file_with_options(
+    file_id: FileId,
+    source_db: &mut SourceDb,
+    options: &PreprocessOptions,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> VerilogSourceFile {
+    let pp = aion_vpp::preprocess(file_id, source_db, options, sink);
+    let (tokens, ranges) = aion_vpp::lex_mapped(
+        &pp,
+        Some(source_db),
+        sink,
+        |text, lex_sink| lexer::lex(text, file_id, lex_sink),
+        |t| &mut t.span,
+    );
+    parse_tokens(tokens, ranges, &pp, file_id, interner, sink)
+}
+
+/// Runs the parser over tokens lexed from preprocessed text.
+fn parse_tokens(
+    tokens: Vec<Token>,
+    ranges: Vec<(u32, u32)>,
+    pp: &aion_vpp::Preprocessed,
+    file_id: FileId,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> VerilogSourceFile {
+    let mut parser =
+        parser::VerilogParser::with_text_ranges(tokens, ranges, pp.text(), file_id, interner, sink);
     parser.parse_source_file()
 }
+
+#[cfg(test)]
+mod preprocess_tests;
 
 #[cfg(test)]
 mod tests {

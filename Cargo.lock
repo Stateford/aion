@@ -79,6 +79,7 @@ dependencies = [
  "aion_tui",
  "aion_verilog_parser",
  "aion_vhdl_parser",
+ "aion_vpp",
  "clap",
  "serde_json",
  "tempfile",
@@ -220,8 +221,10 @@ dependencies = [
  "aion_common",
  "aion_diagnostics",
  "aion_source",
+ "aion_vpp",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -274,8 +277,10 @@ dependencies = [
  "aion_common",
  "aion_diagnostics",
  "aion_source",
+ "aion_vpp",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -287,6 +292,15 @@ dependencies = [
  "aion_source",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "aion_vpp"
+version = "0.1.0"
+dependencies = [
+ "aion_diagnostics",
+ "aion_source",
+ "tempfile",
 ]
 
 [[package]]

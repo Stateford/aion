@@ -790,10 +790,9 @@ impl Lexer<'_> {
                     self.pos += 1;
                     VhdlToken::ConditionOp
                 }
-                _ => {
-                    self.error("unexpected character after '?'", self.span_from(start));
-                    VhdlToken::Error
-                }
+                // A lone `?` is the VHDL-2008 matching marker in
+                // `select?` and `case?`; the parser decides where it is legal.
+                _ => VhdlToken::Question,
             },
             _ => {
                 // Only ASCII reaches here; non-ASCII is handled by lex_non_ascii.
@@ -1088,6 +1087,27 @@ mod tests {
         assert_eq!(k[4], VhdlToken::MatchGreater);
         assert_eq!(k[5], VhdlToken::MatchGreaterEquals);
         assert_eq!(k[6], VhdlToken::ConditionOp);
+    }
+
+    #[test]
+    fn lone_question_mark() {
+        // `select?` (no space) and `select ?` both lex as Select, Question.
+        let tokens = lex_tokens("select? select ? ??");
+        let k = kinds(&tokens);
+        assert_eq!(k[0], VhdlToken::Select);
+        assert_eq!(k[1], VhdlToken::Question);
+        assert_eq!(k[2], VhdlToken::Select);
+        assert_eq!(k[3], VhdlToken::Question);
+        assert_eq!(k[4], VhdlToken::ConditionOp);
+        assert_eq!(k[5], VhdlToken::Eof);
+    }
+
+    #[test]
+    fn question_slash_without_equals_is_error() {
+        let sink = DiagnosticSink::new();
+        let tokens = lex("?/x", FileId::from_raw(0), &sink);
+        assert_eq!(tokens[0].kind, VhdlToken::Error);
+        assert!(sink.has_errors());
     }
 
     #[test]

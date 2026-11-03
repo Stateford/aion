@@ -159,7 +159,9 @@ pub fn parse_duration(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
 /// Parses all source files into a `ParsedDesign`, loading them into the source DB.
 ///
 /// Each file is loaded into `source_db`, lexed/parsed with the appropriate parser,
-/// and the resulting AST is collected into the returned `ParsedDesign`.
+/// and the resulting AST is collected into the returned `ParsedDesign`. Verilog
+/// and SystemVerilog files are preprocessed first; files they `` `include `` are
+/// loaded into `source_db` as well.
 pub fn parse_all_files(
     source_files: &[(PathBuf, SourceLanguage)],
     source_db: &mut SourceDb,
@@ -169,17 +171,33 @@ pub fn parse_all_files(
     let mut verilog_files = Vec::new();
     let mut sv_files = Vec::new();
     let mut vhdl_files = Vec::new();
+    // Verilog/SV files are preprocessed with `include support (resolved
+    // relative to the including file). The project config has no defines or
+    // include-dir settings yet, so the defaults are used.
+    let pp_options = aion_vpp::PreprocessOptions::default();
 
     for (path, lang) in source_files {
         let file_id = source_db.load_file(path)?;
 
         match lang {
             SourceLanguage::Verilog => {
-                let ast = aion_verilog_parser::parse_file(file_id, source_db, interner, sink);
+                let ast = aion_verilog_parser::parse_file_with_options(
+                    file_id,
+                    source_db,
+                    &pp_options,
+                    interner,
+                    sink,
+                );
                 verilog_files.push(ast);
             }
             SourceLanguage::SystemVerilog => {
-                let ast = aion_sv_parser::parse_file(file_id, source_db, interner, sink);
+                let ast = aion_sv_parser::parse_file_with_options(
+                    file_id,
+                    source_db,
+                    &pp_options,
+                    interner,
+                    sink,
+                );
                 sv_files.push(ast);
             }
             SourceLanguage::Vhdl => {
@@ -451,5 +469,58 @@ mod tests {
         };
         let root = resolve_project_root(&global).unwrap();
         assert_eq!(root, tmp.path());
+    }
+
+    // -- parse_all_files preprocessing tests --
+
+    #[test]
+    fn parse_all_files_resolves_includes_and_macros() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("defs.vh"), "`define W 8\n").unwrap();
+        fs::write(
+            src.join("top.v"),
+            "`timescale 1ns/1ps\n`include \"defs.vh\"\nmodule top(output [`W-1:0] y);\n  assign y = 0;\nendmodule\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("sub.sv"),
+            "`include \"defs.vh\"\nmodule sub(output logic [`W-1:0] q);\n  assign q = 8'd0;\nendmodule\n",
+        )
+        .unwrap();
+        let files = vec![
+            (src.join("top.v"), SourceLanguage::Verilog),
+            (src.join("sub.sv"), SourceLanguage::SystemVerilog),
+        ];
+        let mut db = SourceDb::new();
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let parsed = parse_all_files(&files, &mut db, &interner, &sink).unwrap();
+        let diags = sink.take_all();
+        assert!(
+            diags.is_empty(),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert_eq!(parsed.verilog_files.len(), 1);
+        assert_eq!(parsed.sv_files.len(), 1);
+    }
+
+    #[test]
+    fn parse_all_files_reports_missing_include() {
+        let tmp = TempDir::new().unwrap();
+        let top = tmp.path().join("top.v");
+        fs::write(&top, "`include \"missing.vh\"\nmodule top; endmodule\n").unwrap();
+        let mut db = SourceDb::new();
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let parsed =
+            parse_all_files(&[(top, SourceLanguage::Verilog)], &mut db, &interner, &sink).unwrap();
+        assert_eq!(parsed.verilog_files.len(), 1);
+        // Rendering slices the source by span, so this also checks the span.
+        assert_eq!(render_diagnostics(&sink, &db, false), 1);
+        let diags = sink.take_all();
+        assert!(diags[0].message.contains("missing.vh"));
     }
 }

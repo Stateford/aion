@@ -29,6 +29,15 @@
 use crate::ast::*;
 use crate::parser::SvParser;
 use crate::token::SvToken;
+use aion_diagnostics::code::{Category, DiagnosticCode};
+use aion_diagnostics::Diagnostic;
+use aion_source::Span;
+
+/// Binding power of the postfix operators `++` and `--`.
+///
+/// Higher than every prefix and infix binding power, so `-a++` parses as
+/// `-(a++)` and `a + b++` as `a + (b++)`.
+const POSTFIX_BP: u8 = 25;
 
 /// Binding power for binary operators. Returns (left_bp, right_bp).
 fn infix_binding_power(op: &BinaryOp) -> (u8, u8) {
@@ -100,15 +109,19 @@ impl SvParser<'_> {
 
             // Postfix: ++ and --
             if self.at(SvToken::PlusPlus) || self.at(SvToken::MinusMinus) {
+                if POSTFIX_BP < min_bp {
+                    break;
+                }
                 let increment = self.at(SvToken::PlusPlus);
                 let op_span = self.current_span();
                 self.advance();
+                self.check_incr_decr_operand(&lhs, op_span);
                 let span = lhs.span().merge(op_span);
                 lhs = Expr::Unary {
                     op: if increment {
-                        UnaryOp::PreIncr
+                        UnaryOp::PostIncr
                     } else {
-                        UnaryOp::PreDecr
+                        UnaryOp::PostDecr
                     },
                     operand: Box::new(lhs),
                     span,
@@ -186,6 +199,7 @@ impl SvParser<'_> {
         if self.at(SvToken::PlusPlus) {
             self.advance();
             let operand = self.parse_expr_bp(23);
+            self.check_incr_decr_operand(&operand, start);
             let span = start.merge(operand.span());
             return Expr::Unary {
                 op: UnaryOp::PreIncr,
@@ -196,6 +210,7 @@ impl SvParser<'_> {
         if self.at(SvToken::MinusMinus) {
             self.advance();
             let operand = self.parse_expr_bp(23);
+            self.check_incr_decr_operand(&operand, start);
             let span = start.merge(operand.span());
             return Expr::Unary {
                 op: UnaryOp::PreDecr,
@@ -223,6 +238,22 @@ impl SvParser<'_> {
                 self.advance();
                 Expr::Literal { span }
             }
+            // Unbased unsized literal: '0, '1, 'x, 'z
+            SvToken::UnbasedUnsizedLiteral => {
+                let span = self.current_span();
+                let value = match self.current_text().as_bytes().get(1) {
+                    Some(b'1') => FillValue::One,
+                    Some(b'x' | b'X') => FillValue::X,
+                    Some(b'z' | b'Z') => FillValue::Z,
+                    _ => FillValue::Zero,
+                };
+                self.advance();
+                Expr::UnbasedUnsized { value, span }
+            }
+            // Assignment pattern: '{ ... }
+            SvToken::Tick if self.peek_is(SvToken::LeftBrace) => self.parse_assignment_pattern(),
+            // A tick that starts neither a fill literal nor a pattern (e.g. `'q`)
+            SvToken::Tick => self.recover_bad_tick(),
             // Real literal
             SvToken::RealLiteral => {
                 let span = self.current_span();
@@ -426,7 +457,12 @@ impl SvParser<'_> {
         (self.at(SvToken::Plus) || self.at(SvToken::Minus)) && self.peek_is(SvToken::Colon)
     }
 
-    /// Parses a dot suffix for hierarchical names.
+    /// Parses a dot suffix: a hierarchical name or a member selection.
+    ///
+    /// A plain identifier or hierarchical name base absorbs every following
+    /// `.ident` into one [`Expr::HierarchicalName`]. Any other base (index,
+    /// range select, scoped name, call, ...) gets a single [`Expr::Member`]
+    /// for one `.ident`; callers loop, so chains such as `a[1].b[2].c` nest.
     pub(crate) fn parse_dot_suffix(&mut self, base: Expr) -> Expr {
         let start = base.span();
         let mut parts = match base {
@@ -434,8 +470,13 @@ impl SvParser<'_> {
             Expr::HierarchicalName { parts, .. } => parts,
             _ => {
                 self.advance(); // eat .
-                let _ = self.expect_ident();
-                return base;
+                let member = self.expect_ident();
+                let span = start.merge(self.prev_span());
+                return Expr::Member {
+                    base: Box::new(base),
+                    member,
+                    span,
+                };
             }
         };
 
@@ -445,6 +486,126 @@ impl SvParser<'_> {
 
         let span = start.merge(self.prev_span());
         Expr::HierarchicalName { parts, span }
+    }
+
+    /// Parses an assignment pattern `'{ item {, item} }`.
+    ///
+    /// Items are positional (`expr`), keyed (`key: expr`), or `default: expr`.
+    /// Mixing positional items with keyed or `default` items, a repeated
+    /// `default`, and an empty pattern are reported as errors; parsing then
+    /// continues after the closing brace.
+    fn parse_assignment_pattern(&mut self) -> Expr {
+        let start = self.current_span();
+        self.advance(); // eat '
+        self.advance(); // eat {
+
+        if self.at(SvToken::RightBrace) {
+            self.advance();
+            let span = start.merge(self.prev_span());
+            self.error_at("empty assignment pattern", span);
+            return Expr::Error(span);
+        }
+
+        let mut items = Vec::new();
+        let mut has_positional = false;
+        let mut has_named = false;
+        let mut has_default = false;
+        loop {
+            let item_start = self.current_span();
+            if self.at(SvToken::Default) && self.peek_is(SvToken::Colon) {
+                self.advance(); // eat default
+                self.advance(); // eat :
+                let value = self.parse_expr();
+                let span = item_start.merge(self.prev_span());
+                if has_default {
+                    self.error_at("duplicate `default` in assignment pattern", span);
+                }
+                has_default = true;
+                has_named = true;
+                items.push(PatternItem::Default { value, span });
+            } else {
+                let first = self.parse_expr();
+                if self.eat(SvToken::Colon) {
+                    let value = self.parse_expr();
+                    let span = item_start.merge(self.prev_span());
+                    has_named = true;
+                    items.push(PatternItem::Keyed {
+                        key: first,
+                        value,
+                        span,
+                    });
+                } else {
+                    has_positional = true;
+                    items.push(PatternItem::Positional(first));
+                }
+            }
+            if !self.eat(SvToken::Comma) || self.at_eof() {
+                break;
+            }
+        }
+        self.expect(SvToken::RightBrace);
+        let span = start.merge(self.prev_span());
+        if has_positional && has_named {
+            self.error_at(
+                "assignment pattern cannot mix positional items with keyed or `default` items",
+                span,
+            );
+        }
+        Expr::AssignmentPattern { items, span }
+    }
+
+    /// Recovers from a tick that starts neither an unbased unsized literal
+    /// nor an assignment pattern (e.g. `'q`, `'10`).
+    ///
+    /// Reports an error and consumes the tick plus a directly adjacent
+    /// identifier or number, so the rest of the statement still parses.
+    fn recover_bad_tick(&mut self) -> Expr {
+        let start = self.current_span();
+        self.advance(); // eat '
+        let adjacent = self.current_span().start == start.end
+            && matches!(
+                self.current(),
+                SvToken::Identifier | SvToken::IntLiteral | SvToken::RealLiteral
+            );
+        if adjacent {
+            self.advance();
+        }
+        let span = start.merge(self.prev_span());
+        self.error_at(
+            "invalid literal after `'`: expected `'0`, `'1`, `'x`, `'z`, or an assignment pattern `'{...}`",
+            span,
+        );
+        Expr::Error(span)
+    }
+
+    /// Reports an error if the operand of `++`/`--` is not a variable reference.
+    fn check_incr_decr_operand(&self, operand: &Expr, op_span: Span) {
+        let ok = matches!(
+            operand,
+            Expr::Identifier { .. }
+                | Expr::HierarchicalName { .. }
+                | Expr::ScopedIdent { .. }
+                | Expr::Index { .. }
+                | Expr::RangeSelect { .. }
+                | Expr::PartSelect { .. }
+                | Expr::Member { .. }
+                | Expr::Error(_)
+        );
+        if !ok {
+            self.error_at(
+                "operand of `++`/`--` must be a variable",
+                op_span.merge(operand.span()),
+            );
+        }
+    }
+
+    /// Emits a parse error (E101) at an explicit span.
+    fn error_at(&self, msg: &str, span: Span) {
+        self.sink.emit(Diagnostic::error(
+            DiagnosticCode::new(Category::Error, 101),
+            msg,
+            span,
+        ));
     }
 
     /// Parses function/task call arguments: `( expr {, expr} )`.
@@ -796,6 +957,289 @@ mod tests {
         }
     }
 
+    // --- Issue #30: member selection, fill literals, patterns, postfix ++/-- ---
+
+    /// Parses `source` as an expression and returns it with all diagnostics.
+    fn parse_expr_diags(source: &str) -> (Expr, Vec<aion_diagnostics::Diagnostic>, Interner) {
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let tokens = lexer::lex(source, file, &sink);
+        let mut parser = SvParser::new(tokens, source, file, &interner, &sink);
+        let expr = parser.parse_expr();
+        (expr, sink.diagnostics(), interner)
+    }
+
+    /// Returns the member name of a `Member` node, or panics.
+    fn member_name(expr: &Expr, interner: &Interner) -> String {
+        match expr {
+            Expr::Member { member, .. } => interner.resolve(*member).to_string(),
+            other => panic!("expected member, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_on_index_keeps_member() {
+        let (expr, diags, interner) = parse_expr_diags("arr[2].valid");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(member_name(&expr, &interner), "valid");
+        match expr {
+            Expr::Member { base, .. } => assert!(matches!(*base, Expr::Index { .. })),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn member_on_range_select_and_call() {
+        let (expr, diags, interner) = parse_expr_diags("v[3:0].x");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(member_name(&expr, &interner), "x");
+        let (expr, diags, interner) = parse_expr_diags("f(a).field");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(member_name(&expr, &interner), "field");
+        let (expr, diags, interner) = parse_expr_diags("pkg::cfg.mode");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(member_name(&expr, &interner), "mode");
+    }
+
+    #[test]
+    fn member_chain_nests() {
+        // a[1].b[2].c == Member(Index(Member(Index(a, 1), b), 2), c)
+        let (expr, diags, interner) = parse_expr_diags("a[1].b[2].c");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(member_name(&expr, &interner), "c");
+        let Expr::Member { base, .. } = expr else {
+            unreachable!()
+        };
+        let Expr::Index { base: inner, .. } = *base else {
+            panic!("expected index")
+        };
+        assert_eq!(member_name(&inner, &interner), "b");
+        let Expr::Member { base: inner2, .. } = *inner else {
+            unreachable!()
+        };
+        assert!(matches!(*inner2, Expr::Index { .. }));
+    }
+
+    #[test]
+    fn member_after_hierarchical_index() {
+        let (expr, diags, interner) = parse_expr_diags("gen_blk[0].u.sig");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(member_name(&expr, &interner), "sig");
+    }
+
+    #[test]
+    fn member_missing_name_reports_error() {
+        let (_, diags, _) = parse_expr_diags("arr[0].");
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn postfix_increment_is_post() {
+        let expr = parse_expr_str("b++");
+        assert!(matches!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::PostIncr,
+                ..
+            }
+        ));
+        let expr = parse_expr_str("b--");
+        assert!(matches!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::PostDecr,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn postfix_binds_tighter_than_prefix_and_infix() {
+        // -b++ is -(b++)
+        match parse_expr_str("-b++") {
+            Expr::Unary {
+                op: UnaryOp::Minus,
+                operand,
+                ..
+            } => assert!(matches!(
+                *operand,
+                Expr::Unary {
+                    op: UnaryOp::PostIncr,
+                    ..
+                }
+            )),
+            other => panic!("expected minus, got {other:?}"),
+        }
+        // a + b++ is a + (b++)
+        match parse_expr_str("a + b++") {
+            Expr::Binary {
+                op: BinaryOp::Add,
+                right,
+                ..
+            } => assert!(matches!(
+                *right,
+                Expr::Unary {
+                    op: UnaryOp::PostIncr,
+                    ..
+                }
+            )),
+            other => panic!("expected add, got {other:?}"),
+        }
+        // arr[i]++ applies to the select
+        match parse_expr_str("arr[i]++") {
+            Expr::Unary {
+                op: UnaryOp::PostIncr,
+                operand,
+                ..
+            } => assert!(matches!(*operand, Expr::Index { .. })),
+            other => panic!("expected post-incr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incr_decr_on_non_variable_is_error() {
+        let (_, diags, _) = parse_expr_diags("3++");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        let (_, diags, _) = parse_expr_diags("--(a + b)");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+    }
+
+    #[test]
+    fn unbased_unsized_values() {
+        for (src, want) in [
+            ("'0", FillValue::Zero),
+            ("'1", FillValue::One),
+            ("'x", FillValue::X),
+            ("'X", FillValue::X),
+            ("'z", FillValue::Z),
+            ("'Z", FillValue::Z),
+        ] {
+            match parse_expr_str(src) {
+                Expr::UnbasedUnsized { value, .. } => assert_eq!(value, want, "{src}"),
+                other => panic!("{src}: expected fill literal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unbased_unsized_in_expressions() {
+        match parse_expr_str("a == '1") {
+            Expr::Binary { right, .. } => assert!(matches!(
+                *right,
+                Expr::UnbasedUnsized {
+                    value: FillValue::One,
+                    ..
+                }
+            )),
+            other => panic!("expected binary, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_expr_str("rst ? '0 : d"),
+            Expr::Ternary { .. }
+        ));
+    }
+
+    #[test]
+    fn bad_tick_literal_is_error_and_recovers() {
+        for src in ["'q", "'10"] {
+            let (expr, diags, _) = parse_expr_diags(src);
+            assert!(matches!(expr, Expr::Error(_)), "{src}: {expr:?}");
+            assert_eq!(diags.len(), 1, "{src}: {diags:?}");
+            assert!(diags[0].message.contains("'{...}"), "{src}: {diags:?}");
+        }
+        // The adjacent identifier is consumed, so `'q + 1` reports only one error.
+        let (expr, diags, _) = parse_expr_diags("'q + 1");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(matches!(expr, Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn assignment_pattern_positional() {
+        match parse_expr_str("'{1, 2, 3}") {
+            Expr::AssignmentPattern { items, .. } => {
+                assert_eq!(items.len(), 3);
+                assert!(items
+                    .iter()
+                    .all(|i| matches!(i, PatternItem::Positional(_))));
+            }
+            other => panic!("expected pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assignment_pattern_named_and_default() {
+        match parse_expr_str("'{a: 1, b: 2}") {
+            Expr::AssignmentPattern { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert!(items.iter().all(|i| matches!(i, PatternItem::Keyed { .. })));
+            }
+            other => panic!("expected pattern, got {other:?}"),
+        }
+        match parse_expr_str("'{default: 0}") {
+            Expr::AssignmentPattern { items, .. } => {
+                assert!(matches!(items[..], [PatternItem::Default { .. }]));
+            }
+            other => panic!("expected pattern, got {other:?}"),
+        }
+        match parse_expr_str("'{a: '1, default: '0}") {
+            Expr::AssignmentPattern { items, .. } => {
+                assert!(matches!(items[0], PatternItem::Keyed { .. }));
+                assert!(matches!(
+                    items[1],
+                    PatternItem::Default {
+                        value: Expr::UnbasedUnsized { .. },
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assignment_pattern_nested() {
+        match parse_expr_str("'{'{1, 2}, '{3, sel ? a : b}}") {
+            Expr::AssignmentPattern { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(
+                    items[1],
+                    PatternItem::Positional(Expr::AssignmentPattern { .. })
+                ));
+            }
+            other => panic!("expected pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assignment_pattern_unterminated_is_error() {
+        let (expr, diags, _) = parse_expr_diags("'{1, 2");
+        assert!(matches!(expr, Expr::AssignmentPattern { .. }));
+        assert!(!diags.is_empty());
+        let (_, diags, _) = parse_expr_diags("'{a: ");
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn assignment_pattern_invalid_shapes_are_errors() {
+        let (expr, diags, _) = parse_expr_diags("'{}");
+        assert!(matches!(expr, Expr::Error(_)));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        let (_, diags, _) = parse_expr_diags("'{1, default: 0}");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("mix"));
+        let (_, diags, _) = parse_expr_diags("'{default: 0, default: 1}");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("duplicate"));
+    }
+
+    #[test]
+    fn casts_still_parse_after_tick_changes() {
+        assert!(matches!(parse_expr_str("8'(x)"), Expr::Cast { .. }));
+        assert!(matches!(parse_expr_str("WIDTH'(a + b)"), Expr::Cast { .. }));
+        assert!(matches!(parse_expr_str("'hFF"), Expr::Literal { .. }));
+    }
+
     #[test]
     fn unary_minus_binds_tighter_than_power() {
         // Unary operators are above `**` in the LRM table: `-a ** b` is `(-a) ** b`.
@@ -911,6 +1355,8 @@ mod precedence_matrix {
             UnaryOp::RedXnor => "~^",
             UnaryOp::PreIncr => "++",
             UnaryOp::PreDecr => "--",
+            UnaryOp::PostIncr => "post++",
+            UnaryOp::PostDecr => "post--",
         }
     }
 
@@ -1001,6 +1447,31 @@ mod precedence_matrix {
             ),
             Expr::Paren { inner, .. } => list("paren", &[inner], src, interner),
             Expr::TimeLiteral { span } => text(*span),
+            Expr::Member { base, member, .. } => {
+                format!(
+                    "(. {} {})",
+                    sexpr(base, src, interner),
+                    interner.resolve(*member)
+                )
+            }
+            Expr::UnbasedUnsized { span, .. } => text(*span),
+            Expr::AssignmentPattern { items, .. } => {
+                let mut out = String::from("(pattern");
+                for item in items {
+                    out.push(' ');
+                    out.push_str(&match item {
+                        PatternItem::Positional(e) => sexpr(e, src, interner),
+                        PatternItem::Keyed { key, value, .. } => {
+                            list(":", &[key, value], src, interner)
+                        }
+                        PatternItem::Default { value, .. } => {
+                            list("default", &[value], src, interner)
+                        }
+                    });
+                }
+                out.push(')');
+                out
+            }
             Expr::Error(_) => "<error>".to_string(),
         }
     }
@@ -1184,6 +1655,24 @@ mod precedence_matrix {
             ("t + 10ns", "(+ t 10ns)"),
             ("2.5ps * n", "(* 2.5ps n)"),
             ("d[i] > 1step", "(> (idx d i) 1step)"),
+        ]);
+    }
+
+    /// PAR-2/10/11 (#30) combined with PAR-6 (#31): member selects, fill
+    /// literals, assignment patterns and postfix `++` compose with full
+    /// index and part-select expressions.
+    #[test]
+    fn member_fill_pattern_postfix_with_index_ops() {
+        check_table(&[
+            ("arr[i << 2].valid", "(. (idx arr (<< i 2)) valid)"),
+            ("d[8*i+7 -: 8].f", "(. (-: d (+ (* 8 i) 7) 8) f)"),
+            ("a[1].b[2].c", "(. (idx (. (idx a 1) b) 2) c)"),
+            ("x[i] + '1", "(+ (idx x i) '1)"),
+            (
+                "'{a: x[i+1 -: 2], default: 0}",
+                "(pattern (: a (-: x (+ i 1) 2)) (default 0))",
+            ),
+            ("a + b++ * c", "(+ a (* (post++ b) c))"),
         ]);
     }
 
