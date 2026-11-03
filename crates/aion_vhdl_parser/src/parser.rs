@@ -256,6 +256,23 @@ impl<'src> VhdlParser<'src> {
         self.note_error();
     }
 
+    /// Emits an error diagnostic at an explicit span (e.g. a whole expression
+    /// that turned out to be invalid in its context).
+    ///
+    /// Counts toward the no-progress backstop like [`Self::error`], and is
+    /// suppressed after the backstop has aborted the parse.
+    pub(crate) fn error_at(&self, msg: &str, span: Span) {
+        if self.aborted.get() {
+            return;
+        }
+        self.sink.emit(Diagnostic::error(
+            DiagnosticCode::new(Category::Error, 101),
+            msg,
+            span,
+        ));
+        self.note_error();
+    }
+
     /// Records that an error was emitted at the current position and fires
     /// the no-progress backstop if too many errors piled up at one token.
     ///

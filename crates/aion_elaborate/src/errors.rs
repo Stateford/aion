@@ -1,7 +1,8 @@
 //! Diagnostic codes and helper functions for elaboration errors and warnings.
 //!
-//! Error codes `E200`--`E211` cover elaboration failures (unknown modules,
-//! duplicate signals, type mismatches, etc.). Warning codes `W200`--`W204`
+//! Error codes `E200`--`E212` cover elaboration failures (unknown modules,
+//! duplicate signals, type mismatches, unresolvable VHDL range attributes,
+//! etc.). Warning codes `W200`--`W204`
 //! cover non-fatal issues (width mismatches, unconnected ports, `forever`
 //! loops and `always` blocks with no timing control, VHDL defaults that
 //! cannot be evaluated).
@@ -79,6 +80,13 @@ pub const E210: DiagnosticCode = DiagnosticCode {
 pub const E211: DiagnosticCode = DiagnosticCode {
     category: Category::Error,
     number: 211,
+};
+
+/// VHDL range attribute (`x'range`, `x'reverse_range`) whose range cannot
+/// be resolved.
+pub const E212: DiagnosticCode = DiagnosticCode {
+    category: Category::Error,
+    number: 212,
 };
 
 /// Width mismatch in assignment or connection.
@@ -185,6 +193,28 @@ pub fn error_no_architecture(entity_name: &str, span: Span) -> Diagnostic {
         E211,
         format!("no architecture found for entity `{entity_name}`"),
         span,
+    )
+}
+
+/// Creates an `E212` diagnostic for a VHDL range attribute
+/// (`prefix'attr`) whose range cannot be resolved, explaining `reason`.
+///
+/// The elaborator never guesses a range in this case: iterating or sizing
+/// with the wrong bounds would silently build the wrong hardware.
+pub fn error_unresolved_range_attribute(
+    attr: &str,
+    prefix: &str,
+    reason: &str,
+    span: Span,
+) -> Diagnostic {
+    Diagnostic::error(
+        E212,
+        format!("cannot resolve the range of `{prefix}'{attr}`: {reason}"),
+        span,
+    )
+    .with_help(
+        "use an explicit range (e.g. `7 downto 0`) or the name of a declared array signal, \
+         port, constant, variable or array type with constant bounds",
     )
 }
 
@@ -300,6 +330,16 @@ mod tests {
     fn param_not_const_diagnostic() {
         let d = error_param_not_const("non-constant expression", Span::DUMMY);
         assert_eq!(d.code, E209);
+    }
+
+    #[test]
+    fn unresolved_range_attribute_diagnostic() {
+        let d = error_unresolved_range_attribute("reverse_range", "v", "not an array", Span::DUMMY);
+        assert_eq!(d.code, E212);
+        assert_eq!(format!("{E212}"), "E212");
+        assert!(d.message.contains("`v'reverse_range`"), "{}", d.message);
+        assert!(d.message.contains("not an array"), "{}", d.message);
+        assert!(!d.help.is_empty());
     }
 
     #[test]
