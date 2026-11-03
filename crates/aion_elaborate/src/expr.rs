@@ -710,13 +710,24 @@ pub fn lower_vhdl_expr(
             }
         }
         Expr::Unary { op, operand, span } => {
-            let ir_op = map_vhdl_unary_op(*op);
+            let (ir_op, complement) = map_vhdl_unary_op(*op);
             let ir_operand = lower_vhdl_expr(operand, sig_env, source_db, interner, sink);
-            IrExpr::Unary {
+            let reduced = IrExpr::Unary {
                 op: ir_op,
                 operand: Box::new(ir_operand),
                 ty: TypeId::from_raw(0),
                 span: *span,
+            };
+            if complement {
+                // `nand v` / `nor v` / `xnor v` = not (and/or/xor v)
+                IrExpr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(reduced),
+                    ty: TypeId::from_raw(0),
+                    span: *span,
+                }
+            } else {
+                reduced
             }
         }
         Expr::Paren { inner, .. } => lower_vhdl_expr(inner, sig_env, source_db, interner, sink),
@@ -1316,14 +1327,26 @@ fn map_vhdl_binary_op(op: aion_vhdl_parser::ast::BinaryOp) -> BinaryOp {
 }
 
 /// Maps a VHDL unary operator to an IR unary operator.
-fn map_vhdl_unary_op(op: aion_vhdl_parser::ast::UnaryOp) -> UnaryOp {
+///
+/// Returns the IR operator plus a flag that is `true` when the result must be
+/// complemented with an outer `Not`: the IR has no NAND/NOR/XNOR reductions,
+/// so the VHDL-2008 `nand v`, `nor v` and `xnor v` reductions lower to
+/// `not (and v)`, `not (or v)` and `not (xor v)`.
+fn map_vhdl_unary_op(op: aion_vhdl_parser::ast::UnaryOp) -> (UnaryOp, bool) {
     use aion_vhdl_parser::ast::UnaryOp as V;
     match op {
-        V::Not => UnaryOp::Not,
-        V::Abs => UnaryOp::Neg, // approximate
-        V::Pos => UnaryOp::Neg, // identity
-        V::Neg => UnaryOp::Neg,
-        V::Condition => UnaryOp::Not, // VHDL-2008 condition operator (??) treated as boolean test
+        V::Not => (UnaryOp::Not, false),
+        V::Abs => (UnaryOp::Neg, false), // approximate
+        V::Pos => (UnaryOp::Neg, false), // identity
+        V::Neg => (UnaryOp::Neg, false),
+        // VHDL-2008 condition operator (??) treated as boolean test
+        V::Condition => (UnaryOp::Not, false),
+        V::RedAnd => (UnaryOp::RedAnd, false),
+        V::RedOr => (UnaryOp::RedOr, false),
+        V::RedXor => (UnaryOp::RedXor, false),
+        V::RedNand => (UnaryOp::RedAnd, true),
+        V::RedNor => (UnaryOp::RedOr, true),
+        V::RedXnor => (UnaryOp::RedXor, true),
     }
 }
 
@@ -1961,6 +1984,89 @@ mod tests {
         });
         let _ = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
         assert!(sink.has_errors(), "unknown name should still emit E204");
+    }
+
+    /// Lowers `<op> v` for a VHDL unary operator applied to signal `v`.
+    fn lower_vhdl_unary(op: aion_vhdl_parser::ast::UnaryOp) -> (IrExpr, SignalId, bool) {
+        let (sdb, interner, sink, mut env) = setup();
+        let v = interner.get_or_intern("v");
+        let sid = SignalId::from_raw(3);
+        env.insert(v, sid);
+        let ast_expr = aion_vhdl_parser::ast::Expr::Unary {
+            op,
+            operand: Box::new(aion_vhdl_parser::ast::Expr::Name(
+                aion_vhdl_parser::ast::Name {
+                    primary: v,
+                    parts: vec![],
+                    span: Span::DUMMY,
+                },
+            )),
+            span: Span::DUMMY,
+        };
+        let ir = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
+        (ir, sid, sink.has_errors())
+    }
+
+    /// Returns `true` if `e` is `Unary { op, Signal(sid) }`.
+    fn is_unary_of_signal(e: &IrExpr, op: UnaryOp, sid: SignalId) -> bool {
+        match e {
+            IrExpr::Unary {
+                op: got, operand, ..
+            } => {
+                *got == op && matches!(**operand, IrExpr::Signal(SignalRef::Signal(s)) if s == sid)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn vhdl_reductions_lower_to_ir_reductions() {
+        use aion_vhdl_parser::ast::UnaryOp as V;
+        for (op, ir_op) in [
+            (V::RedAnd, UnaryOp::RedAnd),
+            (V::RedOr, UnaryOp::RedOr),
+            (V::RedXor, UnaryOp::RedXor),
+        ] {
+            let (ir, sid, errs) = lower_vhdl_unary(op);
+            assert!(!errs, "{op:?} should lower without errors");
+            assert!(
+                is_unary_of_signal(&ir, ir_op, sid),
+                "{op:?} lowered to {ir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vhdl_complemented_reductions_lower_to_not_of_reduction() {
+        use aion_vhdl_parser::ast::UnaryOp as V;
+        for (op, inner_op) in [
+            (V::RedNand, UnaryOp::RedAnd),
+            (V::RedNor, UnaryOp::RedOr),
+            (V::RedXnor, UnaryOp::RedXor),
+        ] {
+            let (ir, sid, errs) = lower_vhdl_unary(op);
+            assert!(!errs, "{op:?} should lower without errors");
+            match &ir {
+                IrExpr::Unary {
+                    op: UnaryOp::Not,
+                    operand,
+                    ..
+                } => assert!(
+                    is_unary_of_signal(operand, inner_op, sid),
+                    "{op:?} inner lowered to {operand:?}"
+                ),
+                other => panic!("{op:?} should lower to Not(..), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn vhdl_non_reduction_unary_ops_not_complemented() {
+        use aion_vhdl_parser::ast::UnaryOp as V;
+        assert_eq!(map_vhdl_unary_op(V::Not), (UnaryOp::Not, false));
+        assert_eq!(map_vhdl_unary_op(V::Neg), (UnaryOp::Neg, false));
+        let (ir, sid, _) = lower_vhdl_unary(V::Not);
+        assert!(is_unary_of_signal(&ir, UnaryOp::Not, sid));
     }
 
     #[test]
