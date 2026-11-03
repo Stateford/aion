@@ -34,6 +34,7 @@
 
 #![warn(missing_docs)]
 
+mod arith;
 pub mod error;
 pub mod evaluator;
 pub mod fst;

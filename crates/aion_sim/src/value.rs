@@ -83,8 +83,13 @@ pub struct SimSignalState {
     pub drivers: Vec<Driver>,
     /// Hierarchical name for display and VCD output.
     pub name: String,
-    /// Bit width of this signal.
+    /// Bit width of this signal. The stored [`value`](Self::value) always
+    /// has exactly this width: every write is resized to it.
     pub width: u32,
+    /// Whether the signal was declared signed (e.g. `reg signed [7:0]`,
+    /// `int`, `integer`), which makes expressions that read it use signed
+    /// arithmetic, comparison and sign extension.
+    pub signed: bool,
 }
 
 impl SimSignalState {
@@ -97,7 +102,14 @@ impl SimSignalState {
             drivers: Vec::new(),
             name,
             width,
+            signed: false,
         }
+    }
+
+    /// Returns this signal state marked as signed (`true`) or unsigned.
+    pub fn with_signed(mut self, signed: bool) -> Self {
+        self.signed = signed;
+        self
     }
 
     /// Creates a new signal state initialized to all-X (unknown).
@@ -113,6 +125,7 @@ impl SimSignalState {
             drivers: Vec::new(),
             name,
             width,
+            signed: false,
         }
     }
 }
@@ -210,6 +223,14 @@ mod tests {
         assert_eq!(s.previous_value, v);
         assert_eq!(s.width, 4);
         assert_eq!(s.name, "top.clk");
+        assert!(!s.signed, "signals default to unsigned");
+    }
+
+    #[test]
+    fn signal_state_with_signed() {
+        let s = SimSignalState::new_unknown("top.s".into(), 8).with_signed(true);
+        assert!(s.signed);
+        assert!(!s.with_signed(false).signed);
     }
 
     #[test]

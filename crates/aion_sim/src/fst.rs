@@ -34,7 +34,7 @@ use aion_common::{Logic, LogicVec};
 
 use crate::error::SimError;
 use crate::value::SimSignalId;
-use crate::waveform::WaveformRecorder;
+use crate::waveform::{bit_or_x, WaveformRecorder};
 
 /// FST block type identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,7 +219,7 @@ impl<W: Write + Seek> FstRecorder<W> {
             if let Some(val) = init_val {
                 // Write MSB first
                 for bit_idx in (0..width).rev() {
-                    bits.push(match val.get(bit_idx) {
+                    bits.push(match bit_or_x(val, bit_idx) {
                         Logic::Zero => b'0',
                         Logic::One => b'1',
                         Logic::X => b'x',
@@ -280,7 +280,7 @@ impl<W: Write + Seek> FstRecorder<W> {
 
                 if width == 1 {
                     // 1-bit encoding: (time_delta << 2 | (value << 1)) for 0/1
-                    let bit = value.get(0);
+                    let bit = bit_or_x(value, 0);
                     match bit {
                         Logic::Zero => {
                             write_varint(&mut sig_data, time_delta << 2);
@@ -301,7 +301,7 @@ impl<W: Write + Seek> FstRecorder<W> {
                     write_varint(&mut sig_data, (time_delta << 1) | 1);
                     // Write value as ASCII bits (MSB first)
                     for bit_idx in (0..width).rev() {
-                        sig_data.push(match value.get(bit_idx) {
+                        sig_data.push(match bit_or_x(value, bit_idx) {
                             Logic::Zero => b'0',
                             Logic::One => b'1',
                             Logic::X => b'x',
@@ -1062,6 +1062,29 @@ mod tests {
         rec.finalize().unwrap();
         let data = rec.writer.into_inner();
         assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn fst_finalize_narrow_value_does_not_panic() {
+        // A value narrower than the registered width (initial and later
+        // change) is written with the missing bits as x, not a panic.
+        let mut rec = make_recorder();
+        rec.begin_scope("top").unwrap();
+        rec.register_signal(SimSignalId::from_raw(0), "data", 8)
+            .unwrap();
+        rec.register_signal(SimSignalId::from_raw(1), "bit", 1)
+            .unwrap();
+        rec.end_scope().unwrap();
+        rec.record_change(0, SimSignalId::from_raw(0), &LogicVec::from_u64(1, 4))
+            .unwrap();
+        rec.record_change(0, SimSignalId::from_raw(1), &LogicVec::new(0))
+            .unwrap();
+        rec.record_change(10, SimSignalId::from_raw(0), &LogicVec::from_u64(2, 2))
+            .unwrap();
+        rec.record_change(10, SimSignalId::from_raw(1), &LogicVec::new(0))
+            .unwrap();
+        rec.finalize().unwrap();
+        assert!(!rec.writer.into_inner().is_empty());
     }
 
     #[test]

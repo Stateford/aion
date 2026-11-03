@@ -11,6 +11,20 @@ use aion_common::{Logic, LogicVec};
 use crate::error::SimError;
 use crate::value::SimSignalId;
 
+/// Returns bit `i` of `value`, or `X` if `value` is narrower than `i + 1`.
+///
+/// The kernel keeps every signal at its declared width, so this only
+/// matters for a recorder fed a value of the wrong width (for example
+/// through the public [`WaveformRecorder`] API): the dump then shows the
+/// missing bits as `x` instead of panicking.
+pub(crate) fn bit_or_x(value: &LogicVec, i: u32) -> Logic {
+    if i < value.width() {
+        value.get(i)
+    } else {
+        Logic::X
+    }
+}
+
 /// Trait for recording simulation waveforms.
 ///
 /// Implementations write signal changes to a particular format (VCD, FST, etc.).
@@ -96,7 +110,7 @@ impl<W: Write> VcdRecorder<W> {
     /// Formats a LogicVec as a VCD value string.
     fn format_value(value: &LogicVec, width: u32) -> String {
         if width == 1 {
-            match value.get(0) {
+            match bit_or_x(value, 0) {
                 Logic::Zero => "0".into(),
                 Logic::One => "1".into(),
                 Logic::X => "x".into(),
@@ -106,7 +120,7 @@ impl<W: Write> VcdRecorder<W> {
             let mut s = String::with_capacity(width as usize + 1);
             s.push('b');
             for i in (0..width).rev() {
-                s.push(match value.get(i) {
+                s.push(match bit_or_x(value, i) {
                     Logic::Zero => '0',
                     Logic::One => '1',
                     Logic::X => 'x',
@@ -306,6 +320,17 @@ mod tests {
         assert_eq!(
             VcdRecorder::<Vec<u8>>::format_value(&LogicVec::from_bool(true), 1),
             "1"
+        );
+    }
+
+    #[test]
+    fn format_value_narrow_value_pads_with_x() {
+        // A value narrower than the registered width must not panic.
+        let v = LogicVec::from_u64(0b10, 2);
+        assert_eq!(VcdRecorder::<Vec<u8>>::format_value(&v, 4), "bxx10");
+        assert_eq!(
+            VcdRecorder::<Vec<u8>>::format_value(&LogicVec::new(0), 1),
+            "x"
         );
     }
 
