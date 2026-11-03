@@ -158,6 +158,35 @@ begin
 end architecture sim;
 "#;
 
+/// A package and architecture exercising aggregate choice lists, named
+/// association in calls, unconstrained (`range <>`) arrays, VHDL-2008
+/// multi-level and `(open)` constraints, and resolution indications.
+const SAMPLE_AGGREGATES: &str = r#"
+package agg_pkg is
+    type mem_t is array (natural range <>) of std_logic_vector;
+    subtype mem4_t is mem_t(0 to 3)(7 downto 0);
+    subtype memx_t is mem_t(open)(15 downto 0);
+    subtype rsl is resolved std_ulogic;
+    subtype rslv is (resolved) std_ulogic_vector;
+end package agg_pkg;
+
+architecture rtl of agg is
+begin
+    process (all)
+        variable v : std_logic_vector(7 downto 0);
+        variable u : unsigned(15 downto 0);
+    begin
+        v := (1 | 3 => '1', 7 downto 6 => d, others => '0');
+        u := resize(arg => to_unsigned(arg => 3, size => 8), new_size => 16);
+        write(l, value => v, justified => open);
+        case sel is
+            when 0 | 2 to 3 => v := ('1', others => '0');
+            when others => null;
+        end case;
+    end process;
+end architecture rtl;
+"#;
+
 /// Every reserved word the lexer recognizes as a keyword.
 const KEYWORDS: &[&str] = &[
     "abs",
@@ -269,6 +298,7 @@ const KEYWORDS: &[&str] = &[
 /// terminators, injected alongside the keywords.
 const PUNCTUATION: &[&str] = &[
     ";", ":", ",", "(", ")", ":=", "=>", "<=", "'", "|", ".", "<<", ">>", "??", "**", "&", "=",
+    "<>",
 ];
 
 /// Non-keyword lexemes used to fill out the random token soup.
@@ -387,9 +417,14 @@ fn run_corpus(name: &str, cases: Vec<String>) {
     worker.join().expect("corpus worker panicked");
 }
 
-/// Returns the three sample sources used to derive mutated cases.
-fn samples() -> [&'static str; 3] {
-    [SAMPLE_COUNTER, SAMPLE_PACKAGE, SAMPLE_GENERATE]
+/// Returns the sample sources used to derive mutated cases.
+fn samples() -> [&'static str; 4] {
+    [
+        SAMPLE_COUNTER,
+        SAMPLE_PACKAGE,
+        SAMPLE_GENERATE,
+        SAMPLE_AGGREGATES,
+    ]
 }
 
 /// Returns `src` with `insert` placed before token `at` (or at the end when

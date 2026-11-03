@@ -427,88 +427,61 @@ impl VhdlParser<'_> {
             };
         }
 
-        // Parse first element
-        let first_expr = self.parse_expr();
+        // Parse the first element: either a lone expression (a parenthesized
+        // expression or the first positional element) or `choices => value`.
+        let first = self.parse_aggregate_element();
 
-        // If we see `=>`, this is an aggregate with named associations
-        if self.at(VhdlToken::Arrow) {
-            return self.parse_aggregate_after_first_choice(start, first_expr);
-        }
-
-        // If we see a comma, this could be an aggregate with positional elements
-        if self.at(VhdlToken::Comma) {
-            return self.parse_aggregate_positional(start, first_expr);
-        }
-
-        // Otherwise it's a parenthesized expression
-        self.expect(VhdlToken::RightParen);
-        let span = start.merge(self.prev_span());
-        Expr::Paren {
-            inner: Box::new(first_expr),
-            span,
-        }
-    }
-
-    /// Finishes parsing an aggregate after seeing the first choice and `=>`.
-    fn parse_aggregate_after_first_choice(&mut self, start: Span, first_choice: Expr) -> Expr {
-        let mut elements = Vec::new();
-
-        // First element: first_choice => value
-        self.expect(VhdlToken::Arrow);
-        let value = self.parse_expr();
-        let elem_span = first_choice.span().merge(value.span());
-        let choices = vec![self.expr_to_choice(first_choice)];
-        elements.push(AggregateElement {
-            choices,
-            value,
-            span: elem_span,
-        });
-
-        // Remaining elements
-        while self.eat(VhdlToken::Comma) {
-            let elem = self.parse_aggregate_element();
-            elements.push(elem);
-        }
-
-        self.expect(VhdlToken::RightParen);
-        let span = start.merge(self.prev_span());
-        Expr::Aggregate { elements, span }
-    }
-
-    /// Parses a positional aggregate (no `=>` associations).
-    fn parse_aggregate_positional(&mut self, start: Span, first_expr: Expr) -> Expr {
-        let mut elements = Vec::new();
-        let first_span = first_expr.span();
-        elements.push(AggregateElement {
-            choices: Vec::new(),
-            value: first_expr,
-            span: first_span,
-        });
-
-        while self.eat(VhdlToken::Comma) {
-            let value = self.parse_expr();
-            let span = value.span();
-            elements.push(AggregateElement {
-                choices: Vec::new(),
-                value,
+        if first.choices.is_empty() && !self.at(VhdlToken::Comma) {
+            // A parenthesized expression
+            self.expect(VhdlToken::RightParen);
+            let span = start.merge(self.prev_span());
+            return Expr::Paren {
+                inner: Box::new(first.value),
                 span,
-            });
+            };
+        }
+
+        let mut elements = vec![first];
+        while self.eat(VhdlToken::Comma) {
+            elements.push(self.parse_aggregate_element());
         }
 
         self.expect(VhdlToken::RightParen);
+        self.check_aggregate_element_order(&elements);
         let span = start.merge(self.prev_span());
         Expr::Aggregate { elements, span }
     }
 
-    /// Parses a single aggregate element (choices => value or just value).
+    /// Parses a single aggregate element: `choices => value` or a positional
+    /// `value`.
+    ///
+    /// ```text
+    /// element_association ::= [ choices => ] expression
+    /// ```
+    ///
+    /// The element starts with an expression; if it is followed by `|`,
+    /// `to`/`downto` or `=>`, that expression was the first choice and the
+    /// rest of the choice list is parsed by [`Self::finish_choices`].
     fn parse_aggregate_element(&mut self) -> AggregateElement {
         let expr = self.parse_expr();
 
-        if self.at(VhdlToken::Arrow) {
-            self.advance();
-            let value = self.parse_expr();
-            let span = expr.span().merge(value.span());
-            let choices = vec![self.expr_to_choice(expr)];
+        if self.at(VhdlToken::Arrow)
+            || self.at(VhdlToken::Bar)
+            || self.at(VhdlToken::To)
+            || self.at(VhdlToken::Downto)
+        {
+            let start = expr.span();
+            let first = self.finish_choice(expr);
+            let choices = self.finish_choices(first);
+            let value = if self.eat(VhdlToken::Arrow) {
+                self.parse_expr()
+            } else {
+                // `(7 downto 0)` with no `=>`: report once and leave the
+                // closing `)` for the caller instead of cascading.
+                self.expected("`=>` after aggregate choices");
+                Expr::Error(self.prev_span())
+            };
+            let span = start.merge(value.span());
             AggregateElement {
                 choices,
                 value,
@@ -524,11 +497,158 @@ impl VhdlParser<'_> {
         }
     }
 
+    /// Reports aggregate element orderings the LRM forbids (§9.3.3.1): a
+    /// positional element after a named one, and an `others` choice in any
+    /// element but the last.
+    fn check_aggregate_element_order(&self, elements: &[AggregateElement]) {
+        let mut seen_named = false;
+        for (i, elem) in elements.iter().enumerate() {
+            if elem.choices.is_empty() {
+                if seen_named {
+                    self.error_at(
+                        "positional element cannot follow a named element in an aggregate; \
+                         put positional elements first",
+                        elem.span,
+                    );
+                }
+            } else {
+                seen_named = true;
+            }
+            if i + 1 < elements.len() && elem.choices.iter().any(|c| matches!(c, Choice::Others(_)))
+            {
+                self.error_at(
+                    "the choice `others` is only allowed in the last element of an aggregate",
+                    elem.span,
+                );
+            }
+        }
+    }
+
+    /// Parses a choice list `choice { | choice }`, as used by aggregates,
+    /// case alternatives and selected assignments (LRM §9.3.3.1, §10.9).
+    ///
+    /// ```text
+    /// choices ::= choice { | choice }
+    /// choice  ::= simple_expression | discrete_range | others
+    /// ```
+    pub(crate) fn parse_choices(&mut self) -> Vec<Choice> {
+        let first = self.parse_choice();
+        self.finish_choices(first)
+    }
+
+    /// Parses the `{ | choice }` tail of a choice list whose first choice has
+    /// already been parsed, and reports `others` combined with other
+    /// choices (it must be the only choice of its element or alternative).
+    fn finish_choices(&mut self, first: Choice) -> Vec<Choice> {
+        let mut choices = vec![first];
+        // Progress: each iteration consumes a `|`.
+        while self.eat(VhdlToken::Bar) {
+            choices.push(self.parse_choice());
+        }
+        if choices.len() > 1 {
+            for choice in &choices {
+                if let Choice::Others(span) = choice {
+                    self.error_at(
+                        "the choice `others` cannot be combined with other choices",
+                        *span,
+                    );
+                }
+            }
+        }
+        choices
+    }
+
+    /// Parses a single choice: `others`, a range `L to R` / `L downto R`, or
+    /// an expression.
+    pub(crate) fn parse_choice(&mut self) -> Choice {
+        if self.at(VhdlToken::Others) {
+            let span = self.current_span();
+            self.advance();
+            Choice::Others(span)
+        } else if self.at(VhdlToken::Arrow)
+            || self.at(VhdlToken::Bar)
+            || self.at(VhdlToken::Comma)
+            || self.at(VhdlToken::RightParen)
+        {
+            // A missing choice (`1 | => x`): report it without consuming the
+            // delimiter, so the rest of the list still parses.
+            let span = self.current_span();
+            self.expected("choice");
+            Choice::Expr(Expr::Error(span))
+        } else {
+            let expr = self.parse_expr();
+            self.finish_choice(expr)
+        }
+    }
+
+    /// Turns an already parsed expression into a choice, consuming a
+    /// following `to`/`downto` bound when the choice is a range.
+    fn finish_choice(&mut self, expr: Expr) -> Choice {
+        if self.at(VhdlToken::To) || self.at(VhdlToken::Downto) {
+            let direction = if self.eat(VhdlToken::To) {
+                RangeDirection::To
+            } else {
+                self.advance();
+                RangeDirection::Downto
+            };
+            let right = self.parse_expr();
+            let span = expr.span().merge(right.span());
+            Choice::Range(RangeConstraint {
+                left: Box::new(expr),
+                direction,
+                right: Box::new(right),
+                span,
+            })
+        } else {
+            self.expr_to_choice(expr)
+        }
+    }
+
     /// Converts an expression to a choice (for aggregates/case statements).
     pub(crate) fn expr_to_choice(&self, expr: Expr) -> Choice {
         match &expr {
             Expr::Others { span } => Choice::Others(*span),
             _ => Choice::Expr(expr),
+        }
+    }
+
+    /// Completes an association element whose first expression has already
+    /// been parsed: `formal => actual` if `=>` follows, otherwise a
+    /// positional element whose actual is `expr`. The actual may be `open`.
+    pub(crate) fn finish_association_element(&mut self, expr: Expr) -> AssociationElement {
+        if self.eat(VhdlToken::Arrow) {
+            let actual = self.parse_expr();
+            let span = expr.span().merge(actual.span());
+            AssociationElement {
+                formal: Some(expr),
+                actual,
+                span,
+            }
+        } else {
+            let span = expr.span();
+            AssociationElement {
+                formal: None,
+                actual: expr,
+                span,
+            }
+        }
+    }
+
+    /// Reports positional association elements that follow a named one,
+    /// which the LRM forbids (§6.5.7.1): positional associations must come
+    /// first.
+    pub(crate) fn check_association_order(&self, elements: &[AssociationElement]) {
+        let mut seen_named = false;
+        for elem in elements {
+            if elem.formal.is_some() {
+                seen_named = true;
+            } else if seen_named {
+                self.error_at(
+                    "positional association cannot follow a named association; \
+                     put positional associations first",
+                    elem.span,
+                );
+            }
         }
     }
 
@@ -588,6 +708,7 @@ impl VhdlParser<'_> {
                 }
                 // Parenthesized: name(args) — could be index, slice, or function call
                 VhdlToken::LeftParen => {
+                    let paren_start = self.current_span();
                     self.advance(); // eat (
 
                     // Try to detect slice: expr direction expr
@@ -610,20 +731,28 @@ impl VhdlParser<'_> {
                             span,
                         };
                         parts.push(NameSuffix::Slice(range, span));
-                    } else if self.at(VhdlToken::Comma) {
-                        // Multiple indices
-                        let mut args = vec![first];
+                    } else {
+                        // Association list: indices, or call / conversion
+                        // arguments, each `actual` or `formal => actual`.
+                        let mut elements = vec![self.finish_association_element(first)];
+                        // Progress: each iteration consumes a `,`.
                         while self.eat(VhdlToken::Comma) {
-                            args.push(self.parse_expr());
+                            let expr = self.parse_expr();
+                            elements.push(self.finish_association_element(expr));
                         }
                         self.expect(VhdlToken::RightParen);
                         let span = start.merge(self.prev_span());
-                        parts.push(NameSuffix::Index(args, span));
-                    } else {
-                        // Single index
-                        self.expect(VhdlToken::RightParen);
-                        let span = start.merge(self.prev_span());
-                        parts.push(NameSuffix::Index(vec![first], span));
+                        if elements.iter().all(|e| e.formal.is_none()) {
+                            let args = elements.into_iter().map(|e| e.actual).collect();
+                            parts.push(NameSuffix::Index(args, span));
+                        } else {
+                            self.check_association_order(&elements);
+                            let list = AssociationList {
+                                elements,
+                                span: paren_start.merge(self.prev_span()),
+                            };
+                            parts.push(NameSuffix::Call(list, span));
+                        }
                     }
                 }
                 _ => break,
@@ -1110,6 +1239,175 @@ mod tests {
         assert_eq!(ast.units.len(), 2);
         let msgs: Vec<_> = sink.take_all().into_iter().map(|d| d.message).collect();
         assert_eq!(msgs.len(), 2, "{msgs:?}");
+    }
+
+    // ---- aggregates and association lists ----
+
+    /// Parses `src` as one expression; returns the tree, the source and the
+    /// diagnostic messages.
+    fn parse_tree(src: &str) -> (Expr, Vec<String>) {
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let tokens = lexer::lex(src, file, &sink);
+        let mut parser = VhdlParser::new(tokens, src, file, &interner, &sink);
+        let expr = parser.parse_expr();
+        assert!(parser.at_eof(), "trailing tokens after `{src}`");
+        let msgs = sink.take_all().into_iter().map(|d| d.message).collect();
+        (expr, msgs)
+    }
+
+    /// Parses a legal aggregate and returns its elements.
+    fn aggregate(src: &str) -> Vec<AggregateElement> {
+        let (expr, msgs) = parse_tree(src);
+        assert!(msgs.is_empty(), "unexpected errors for `{src}`: {msgs:?}");
+        match expr {
+            Expr::Aggregate { elements, .. } => elements,
+            other => panic!("expected aggregate for `{src}`, got {other:?}"),
+        }
+    }
+
+    /// Parses a legal name expression and returns its suffixes.
+    fn name_parts(src: &str) -> Vec<NameSuffix> {
+        let (expr, msgs) = parse_tree(src);
+        assert!(msgs.is_empty(), "unexpected errors for `{src}`: {msgs:?}");
+        match expr {
+            Expr::Name(name) => name.parts,
+            other => panic!("expected name for `{src}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_choice_lists() {
+        let elems = aggregate("(1 | 3 => '1', others => '0')");
+        assert_eq!(elems.len(), 2);
+        assert!(matches!(
+            elems[0].choices[..],
+            [Choice::Expr(_), Choice::Expr(_)]
+        ));
+        assert!(matches!(elems[1].choices[..], [Choice::Others(_)]));
+
+        let elems = aggregate("(7 downto 4 => '1', 3 | 1 to 2 => x, others => '0')");
+        assert!(
+            matches!(&elems[0].choices[..], [Choice::Range(r)] if r.direction == RangeDirection::Downto)
+        );
+        assert!(matches!(
+            &elems[1].choices[..],
+            [Choice::Expr(_), Choice::Range(r)] if r.direction == RangeDirection::To
+        ));
+        // The element span covers the choices and the value.
+        assert_eq!(elems[0].span.start, 1);
+    }
+
+    #[test]
+    fn aggregate_positional_then_named_and_parens() {
+        let elems = aggregate("('1', '0', others => '1')");
+        assert_eq!(elems.len(), 3);
+        assert!(elems[0].choices.is_empty() && elems[1].choices.is_empty());
+        assert!(matches!(elems[2].choices[..], [Choice::Others(_)]));
+
+        // A single named element is still an aggregate; a lone expression is
+        // a parenthesized expression.
+        assert_eq!(aggregate("(0 => x)").len(), 1);
+        let (expr, msgs) = parse_tree("(a + b)");
+        assert!(msgs.is_empty());
+        assert!(matches!(expr, Expr::Paren { .. }));
+    }
+
+    #[test]
+    fn aggregate_choice_errors() {
+        let (_, msgs) = parse_tree("(others => '0', 1 => '1')");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("last element"));
+
+        let (_, msgs) = parse_tree("(1 | others => '0')");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("cannot be combined"));
+
+        let (_, msgs) = parse_tree("(0 => '1', '0')");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("positional element"));
+
+        // A choice list with no `=>` is one error and still yields a tree.
+        let (expr, msgs) = parse_tree("(3 | 4)");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(matches!(expr, Expr::Aggregate { .. }));
+
+        // A dangling `|` reports the missing choice without panicking.
+        let (expr, msgs) = parse_tree("(1 | => '0')");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("expected choice"), "{msgs:?}");
+        let Expr::Aggregate { elements, .. } = expr else {
+            panic!("expected aggregate");
+        };
+        assert_eq!(elements[0].choices.len(), 2);
+    }
+
+    #[test]
+    fn named_association_in_name_suffix() {
+        let parts = name_parts("to_unsigned(arg => 3, size => 8)");
+        let [NameSuffix::Call(list, span)] = &parts[..] else {
+            panic!("expected call suffix, got {parts:?}");
+        };
+        assert_eq!(list.elements.len(), 2);
+        assert!(list.elements.iter().all(|e| e.formal.is_some()));
+        // The suffix span starts at the name; the list span at `(`.
+        assert_eq!(span.start, 0);
+        assert_eq!(list.span.start, 11);
+        assert_eq!(list.span.end, span.end);
+
+        let parts = name_parts("resize(v, new_size => 16)");
+        let [NameSuffix::Call(list, _)] = &parts[..] else {
+            panic!("expected call suffix, got {parts:?}");
+        };
+        assert!(list.elements[0].formal.is_none());
+        assert!(list.elements[1].formal.is_some());
+
+        let parts = name_parts("f(a => open)");
+        let [NameSuffix::Call(list, _)] = &parts[..] else {
+            panic!("expected call suffix");
+        };
+        assert!(matches!(list.elements[0].actual, Expr::Open { .. }));
+    }
+
+    #[test]
+    fn positional_suffixes_are_unchanged() {
+        assert!(matches!(
+            &name_parts("f(a, b)")[..],
+            [NameSuffix::Index(args, _)] if args.len() == 2
+        ));
+        assert!(matches!(
+            &name_parts("v(7 downto 0)")[..],
+            [NameSuffix::Slice(..)]
+        ));
+        // Further suffixes after a call still apply.
+        assert!(matches!(
+            &name_parts("f(x => 1)(3)")[..],
+            [NameSuffix::Call(..), NameSuffix::Index(..)]
+        ));
+    }
+
+    #[test]
+    fn positional_after_named_in_call_is_rejected() {
+        let (expr, msgs) = parse_tree("f(a => 1, 2)");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("positional association"));
+        // The call is still built.
+        let Expr::Name(name) = expr else {
+            panic!("expected name");
+        };
+        assert!(matches!(name.parts[..], [NameSuffix::Call(..)]));
+    }
+
+    #[test]
+    fn call_suffix_serde_roundtrip() {
+        let (expr, _) = parse_tree("resize(arg => v, new_size => 16)");
+        let json = serde_json::to_string(&expr).unwrap();
+        let back: Expr = serde_json::from_str(&json).unwrap();
+        let Expr::Name(name) = back else {
+            panic!("expected name");
+        };
+        assert!(matches!(&name.parts[..], [NameSuffix::Call(l, _)] if l.elements.len() == 2));
     }
 
     #[test]

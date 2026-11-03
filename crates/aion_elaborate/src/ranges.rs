@@ -234,6 +234,17 @@ impl RangeEnv {
             Some(Constraint::Index(indices, _)) => {
                 self.array_ranges(indices, const_env, source_db, interner)
             }
+            // `mem_t(0 to 3)(7 downto 0)`: the outer index constraint gives
+            // this object's own index ranges; the element constraint only
+            // shapes its elements.
+            Some(Constraint::Array { index, .. }) => match index.as_ref() {
+                Constraint::Index(indices, _) => {
+                    self.array_ranges(indices, const_env, source_db, interner)
+                }
+                _ => DeclaredRange::Unknown,
+            },
+            // `(open)` leaves the index range to be inferred later.
+            Some(Constraint::Open(_)) => DeclaredRange::Unknown,
             Some(Constraint::Range(rc)) => {
                 DeclaredRange::NotArray(eval_quiet(rc, const_env, source_db, interner))
             }
@@ -319,6 +330,8 @@ pub fn eval_range_constraint(
 ///   unsupported prefix form) as `E212`. A dimension expression the constant
 ///   evaluator rejects keeps the evaluator's `E209`; if the evaluator fails
 ///   without a diagnostic, `E212` is reported instead.
+/// - An unconstrained index `T range <>` ([`DiscreteRange::Unconstrained`])
+///   has no bounds and returns `None` silently.
 /// - An [`DiscreteRange::Error`] node returns `None` silently; the parser
 ///   already reported it.
 pub fn resolve_vhdl_discrete_range(
@@ -335,7 +348,7 @@ pub fn resolve_vhdl_discrete_range(
             Some(Constraint::Range(rc)) => {
                 eval_range_constraint(rc, const_env, source_db, interner, sink)
             }
-            Some(Constraint::Index(..)) => None,
+            Some(Constraint::Index(..) | Constraint::Open(_) | Constraint::Array { .. }) => None,
             None => match ranges.get(*ti.type_mark.parts.last()?) {
                 Some(DeclaredRange::NotArray(Some(r))) => Some(*r),
                 _ => None,
@@ -344,6 +357,10 @@ pub fn resolve_vhdl_discrete_range(
         DiscreteRange::Attribute(attr) => {
             resolve_range_attribute(attr, ranges, const_env, source_db, interner, sink)
         }
+        // `natural range <>` has no bounds of its own: an unconstrained
+        // array type's index range is only known from a later subtype or
+        // object declaration.
+        DiscreteRange::Unconstrained { .. } => None,
         DiscreteRange::Error(_) => None,
     }
 }

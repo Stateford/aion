@@ -208,19 +208,49 @@ impl VhdlParser<'_> {
         TypeDef::Enumeration { literals, span }
     }
 
-    /// Parses an array type definition.
+    /// Parses an array type definition, constrained or unbounded.
+    ///
+    /// ```text
+    /// constrained_array_definition ::= array index_constraint of element_subtype_indication
+    /// unbounded_array_definition   ::= array ( index_subtype_definition {, index_subtype_definition} )
+    ///                                    of element_subtype_indication
+    /// ```
+    ///
+    /// Unconstrained indices (`natural range <>`) become
+    /// [`DiscreteRange::Unconstrained`]. Mixing them with constrained
+    /// indices in one definition is reported.
     fn parse_array_type_def(&mut self) -> TypeDef {
         let start = self.current_span();
         self.expect(VhdlToken::Array);
         self.expect(VhdlToken::LeftParen);
 
         let mut indices = Vec::new();
-        indices.push(self.parse_discrete_range());
+        indices.push(self.parse_array_index());
         while self.eat(VhdlToken::Comma) {
-            indices.push(self.parse_discrete_range());
+            indices.push(self.parse_array_index());
         }
 
         self.expect(VhdlToken::RightParen);
+        let unconstrained = indices
+            .iter()
+            .filter(|i| matches!(i, DiscreteRange::Unconstrained { .. }))
+            .count();
+        let constrained = indices
+            .iter()
+            .filter(|i| {
+                !matches!(
+                    i,
+                    DiscreteRange::Unconstrained { .. } | DiscreteRange::Error(_)
+                )
+            })
+            .count();
+        if unconstrained > 0 && constrained > 0 {
+            self.error_at(
+                "an array type definition cannot mix unconstrained (`range <>`) and \
+                 constrained index ranges",
+                start.merge(self.prev_span()),
+            );
+        }
         self.expect(VhdlToken::Of);
         let element_type = self.parse_type_indication();
 

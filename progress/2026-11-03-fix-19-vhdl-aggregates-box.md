@@ -1,0 +1,30 @@
+## 2026-11-03 — VHDL Parser: Aggregate Choices, Named Association, Box (Fixes #19)
+
+- **VHDL-11, aggregates:** aggregate elements now use the same choice-list parser as case alternatives and selected assignments. `parse_choices`/`parse_choice` moved from `stmt.rs` to `expr.rs` and are shared. `(1 | 3 => '1', others => '0')`, `(7 downto 4 => '1', others => '0')` and `('1', others => '0')` parse. New errors:
+  - a positional element after a named one;
+  - `others` anywhere but the last element;
+  - `others` combined with other choices (this one applies to `case` and `select` too);
+  - a missing choice (`1 | => x`), reported without eating the `=>`;
+  - choices with no `=>`.
+- **VHDL-11, named association:** a name's `(` suffix is parsed as an association list (`actual`, `formal => actual`, `open`). A list with only positional elements is still `NameSuffix::Index`, so existing consumers see no change. A list with at least one named element becomes the new `NameSuffix::Call(AssociationList, Span)`. Positional after named is an error. This applies to calls, type conversions and procedure-call statements (`write(l, value => x);`), and the same check now covers port and generic maps.
+- **VHDL-12, box:** the lexer emits a new `VhdlToken::Box` for an adjacent `<>`. In array type definitions, `type_mark range <>` gives the new `DiscreteRange::Unconstrained { type_mark, span }` (the new pub `parse_array_index`). Errors:
+  - `range <>` anywhere else (index constraints, loop ranges);
+  - a bare `<>`;
+  - a non-type-mark before `range <>`;
+  - an array definition that mixes constrained and unconstrained indices.
+- **VHDL-2008 array constraints:** `mem_t(0 to 3)(7 downto 0)` parses to the new `Constraint::Array { index, element, span }` (nesting allowed), and `(open)` to `Constraint::Open`. `(open, ...)` is reported. The new `Constraint::span()` helper is added.
+- **Resolution indications:** `TypeIndication` gains `resolution: Option<ResolutionIndication>`. It holds a function (`resolved std_ulogic`, `ieee.pkg.resolved t`), an element resolution (`(resolved) std_ulogic_vector`, `((resolved)) mat_t`) or a record resolution (`(a resolved, b (wired_or)) rec_t`). A record element name that is not a simple name is reported.
+- **Elaborator (`aion_elaborate`):**
+  - Named calls to IEEE built-ins (`to_unsigned`, `resize`, `shift_left/right`, `to_integer`, `rising_edge`/`falling_edge`, ...) are put back into positional order by formal name (`order_vhdl_builtin_actuals`), so they lower exactly like the positional form. `rising_edge(s => clk)` is detected as a clock edge.
+  - E210 is reported for: unknown or repeated formals, gaps, `open` actuals, named association on type conversions, and named calls to user functions.
+  - `Unconstrained`, `Open` and `Array` constraints resolve to "unknown range" / `Type::Error`, never a guessed width. The outer index of `mem_t(0 to 3)(7 downto 0)` gives the object's `'range`.
+  - Aggregate rvalues with `|` or range choices give E210. The elaborator lowers aggregates as plain concatenations and ignores choices, so lowering these newly parseable forms would build the wrong bit layout.
+- **Tests:**
+  - parser +34: lexer 2, expr 7, types 8, stmt 4, and the new integration file `tests/aggregates_and_box.rs` with 13 tests built from the issue repros;
+  - the adversarial corpus gains an aggregates/box sample and `<>` punctuation;
+  - elaborator +9: named-call ordering, errors and lowering, the aggregate guard, an end-to-end `rising_edge(s => clk)` test, unconstrained array subtype ranges, and `(open)`/`resolved` types.
+- **Known gaps / decisions:**
+  - VHDL-2008 interface type and subprogram generics (`generic (type T; function f ... is <>)`) are not parsed. The interface grammar has no hook for them. The `Box` token exists, but nothing in interface lists uses it yet.
+  - Record constraints (`rec_t(f(7 downto 0))`) are not parsed.
+  - The elaborator still ignores named choices in aggregates it already accepted before this change (`(0 => '1', others => '0')` lowers as a concat). This is pre-existing, out of scope here, and recorded as a follow-up.
+- **Phase:** Phase 3 — Bitstream & Integration (unchanged).

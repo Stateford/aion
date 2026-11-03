@@ -269,6 +269,9 @@ pub enum VhdlToken {
     SlashEquals,
     /// `<`
     LessThan,
+    /// `<>` (box): an unconstrained index range in `type_mark range <>`, and
+    /// a VHDL-2008 interface default such as `function f ... is <>`.
+    Box,
     /// `>`
     GreaterThan,
     /// `>=`
