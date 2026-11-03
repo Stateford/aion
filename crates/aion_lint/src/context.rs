@@ -166,6 +166,24 @@ impl<'a> LintContext<'a> {
         file.content.get(..span.start as usize)
     }
 
+    /// Returns true if `span` lies in a VHDL source file (extension `.vhd` or
+    /// `.vhdl`, in any letter case).
+    ///
+    /// VHDL identifiers are case-insensitive while Verilog and SystemVerilog
+    /// identifiers are case-sensitive, so rules that compare names read from
+    /// source text must know which language the text is in. Returns `false`
+    /// for a dummy span or an unknown file.
+    pub fn is_vhdl_source(&self, span: Span) -> bool {
+        if span.is_dummy() {
+            return false;
+        }
+        self.source_db
+            .try_get_file(span.file)
+            .and_then(|f| f.path.extension())
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("vhd") || e.eq_ignore_ascii_case("vhdl"))
+    }
+
     /// Returns `ident` as the user spelled it in the source text of `span`.
     ///
     /// VHDL folds basic identifiers to lowercase when interning them, so the
@@ -365,6 +383,23 @@ mod tests {
         assert_eq!(ctx.file_text_before(Span::new(f, 7, 10)), Some("module "));
         assert_eq!(ctx.file_text_before(Span::DUMMY), None);
         assert_eq!(ctx.file_text_before(Span::new(f, 900, 901)), None);
+    }
+
+    #[test]
+    fn is_vhdl_source_by_extension() {
+        let interner = Interner::new();
+        let mut db = SourceDb::new();
+        let vhd = db.add_source("a.vhd", "x".to_string());
+        let vhdl = db.add_source("b.VHDL", "x".to_string());
+        let v = db.add_source("c.v", "x".to_string());
+        let none = db.add_source("noext", "x".to_string());
+        let ctx = LintContext::new(&interner, &db);
+        assert!(ctx.is_vhdl_source(Span::new(vhd, 0, 1)));
+        assert!(ctx.is_vhdl_source(Span::new(vhdl, 0, 1)));
+        assert!(!ctx.is_vhdl_source(Span::new(v, 0, 1)));
+        assert!(!ctx.is_vhdl_source(Span::new(none, 0, 1)));
+        assert!(!ctx.is_vhdl_source(Span::DUMMY));
+        assert!(!ctx.is_vhdl_source(Span::new(aion_source::FileId::from_raw(99), 0, 1)));
     }
 
     #[test]

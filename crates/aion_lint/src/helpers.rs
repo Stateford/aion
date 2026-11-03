@@ -416,8 +416,8 @@ pub(crate) fn is_duplicate_specialization(module: &Module, design: &Design) -> b
         .is_some_and(|first| !std::ptr::eq(first, module))
 }
 
-/// Returns the lowercased identifiers that appear inside an index on the
-/// left-hand side of an assignment whose IR target lost that index.
+/// Returns the identifiers that appear inside an index on the left-hand side
+/// of an assignment whose IR target lost that index.
 ///
 /// AionIR has no dynamic-index target: elaboration lowers `mem[addr] <= d`
 /// (Verilog) or `mem(addr) <= d` (VHDL) to a whole-signal target, so `addr`
@@ -425,10 +425,21 @@ pub(crate) fn is_duplicate_specialization(module: &Module, design: &Design) -> b
 /// assignment whose target contains a whole-signal reference, this inspects
 /// the source text of the statement, takes the part before the assignment
 /// operator, and collects the identifiers written inside `[...]` or `(...)`.
+/// Concatenation braces `{...}` are *not* index brackets: the signals listed
+/// in `{carry, s} = a + b` are written, not read, and must stay eligible for
+/// W101.
+///
+/// Names are compared the way the source language does: identifiers from
+/// VHDL files are folded to lowercase (matching the interned VHDL names),
+/// while Verilog/SystemVerilog identifiers are kept exactly as written, since
+/// `Addr` and `addr` are different signals there.
 ///
 /// The result is only used to *suppress* unused-signal warnings (W101), so
-/// an over-approximation (e.g. a function name inside the index) is harmless.
-/// Assignments without source text contribute nothing.
+/// every name it returns hides a potential warning. It therefore only takes
+/// identifiers that really are read: those inside an index or part-select
+/// bracket. Extra names that are not signals (a function or parameter used
+/// inside the index) match nothing and are harmless. Assignments without
+/// source text contribute nothing.
 pub(crate) fn dynamic_index_reads(module: &Module, ctx: &LintContext<'_>) -> HashSet<String> {
     let mut names = HashSet::new();
     for assign in &module.assignments {
@@ -502,6 +513,7 @@ fn add_dynamic_index_reads(
     let Some(text) = ctx.source_text(span) else {
         return;
     };
+    let fold_case = ctx.is_vhdl_source(span);
     let lhs = assignment_lhs(text);
     let bytes = lhs.as_bytes();
     let mut depth = 0usize;
@@ -509,8 +521,8 @@ fn add_dynamic_index_reads(
     while i < bytes.len() {
         let b = bytes[i];
         match b {
-            b'[' | b'(' | b'{' => depth += 1,
-            b']' | b')' | b'}' => depth = depth.saturating_sub(1),
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth = depth.saturating_sub(1),
             _ => {}
         }
         if depth > 0 && is_ident_start(b) && (i == 0 || !is_ident_byte(bytes[i - 1])) {
@@ -518,7 +530,12 @@ fn add_dynamic_index_reads(
             while i < bytes.len() && is_ident_byte(bytes[i]) {
                 i += 1;
             }
-            names.insert(lhs[start..i].to_ascii_lowercase());
+            let ident = &lhs[start..i];
+            names.insert(if fold_case {
+                ident.to_ascii_lowercase()
+            } else {
+                ident.to_string()
+            });
             continue;
         }
         i += 1;
@@ -1511,7 +1528,7 @@ mod tests {
 
         let interner = Interner::new();
         let mut db = SourceDb::new();
-        let text = "mem[Addr + off] <= d;  q[3] <= e;  mem <= x[sel];";
+        let text = "mem[Addr + off] <= d;  q[3] <= e;  mem <= x[sel];  {carry, s} <= a + b;  {mem[k], q} <= z;";
         let fid = db.add_source("t.v", text.to_string());
         let span_of = |s: &str| {
             let start = text.find(s).unwrap() as u32;
@@ -1548,6 +1565,20 @@ mod tests {
                     kind: AssignKind::NonBlocking,
                     span: span_of("mem <= x[sel];"),
                 },
+                // Concatenation target: its members are written, not read.
+                Statement::Assign {
+                    target: SignalRef::Concat(vec![SignalRef::Signal(mem), SignalRef::Signal(q)]),
+                    value: Expr::Literal(LogicVec::all_zero(1)),
+                    kind: AssignKind::NonBlocking,
+                    span: span_of("{carry, s} <= a + b;"),
+                },
+                // A dynamic index inside a concatenation is still a read.
+                Statement::Assign {
+                    target: SignalRef::Concat(vec![SignalRef::Signal(mem), SignalRef::Signal(q)]),
+                    value: Expr::Literal(LogicVec::all_zero(1)),
+                    kind: AssignKind::NonBlocking,
+                    span: span_of("{mem[k], q} <= z;"),
+                },
                 // No source text: ignored.
                 Statement::Assign {
                     target: SignalRef::Signal(mem),
@@ -1564,7 +1595,36 @@ mod tests {
         let names = dynamic_index_reads(&module, &ctx);
         let mut sorted: Vec<_> = names.into_iter().collect();
         sorted.sort();
-        assert_eq!(sorted, vec!["addr".to_string(), "off".to_string()]);
+        // Verilog is case-sensitive: `Addr` is kept as written, so it cannot
+        // be confused with a different signal named `addr`.
+        assert_eq!(
+            sorted,
+            vec!["Addr".to_string(), "k".to_string(), "off".to_string()]
+        );
+    }
+
+    #[test]
+    fn dynamic_index_reads_fold_case_for_vhdl() {
+        use aion_common::Interner;
+        use aion_source::SourceDb;
+
+        let interner = Interner::new();
+        let mut db = SourceDb::new();
+        let text = "mem(Addr) <= d;";
+        let fid = db.add_source("t.vhd", text.to_string());
+        let mut module = mk_module();
+        let mem = add_wire(&mut module, 0);
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(mem),
+            value: Expr::Literal(LogicVec::all_zero(1)),
+            span: Span::new(fid, 0, text.len() as u32),
+        });
+        let ctx = LintContext::new(&interner, &db);
+        let names = dynamic_index_reads(&module, &ctx);
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["addr".to_string()]
+        );
     }
 
     #[test]

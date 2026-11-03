@@ -685,6 +685,20 @@ endmodule
         "{msgs:#?}"
     );
     assert_eq!(msgs.len(), 3, "{msgs:#?}");
+    // The note quotes the exact aion.toml spelling, not the display label.
+    let param = result
+        .diagnostics
+        .iter()
+        .find(|d| d.code.number == 201 && d.message.contains("`width`"))
+        .expect("parameter violation");
+    assert!(
+        param
+            .notes
+            .iter()
+            .any(|n| n.contains("`parameter = \"upper_snake_case\"`")),
+        "{:#?}",
+        param.notes
+    );
 }
 
 #[test]
@@ -771,6 +785,21 @@ end architecture;
     let result = full_pipeline_vhdl(src, "blink");
     let has_c202 = result.diagnostics.iter().any(|d| d.code.number == 202);
     assert!(!has_c202, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn trailing_block_comment_after_code_is_not_doc_c202() {
+    // `endmodule /* end */` ends with `*/` but is code, not a header comment
+    // for the module declared on the next line.
+    let src = "// Pass-through.\nmodule sub(input a, output y);\n    assign y = a; endmodule /* end */\nmodule top(input a, output y);\n    sub u(.a(a), .y(y));\nendmodule\n";
+    let result = full_pipeline_verilog(src, "top");
+    let c202: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 202)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(c202, vec!["module `top` has no documentation comment"]);
 }
 
 #[test]
@@ -870,6 +899,65 @@ endmodule
         .filter(|d| d.code.number == 101)
         .collect();
     assert!(w101.is_empty(), "addr is read as an index: {w101:#?}");
+}
+
+/// Returns the W101 messages in `result`.
+fn w101_messages(result: &aion_conformance::PipelineResult) -> Vec<&str> {
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 101)
+        .map(|d| d.message.as_str())
+        .collect()
+}
+
+#[test]
+fn unused_concat_target_still_w101() {
+    // Regression: the dynamic-index fallback must not treat `{...}` on the
+    // left-hand side as an index, or an unused carry-out goes unreported.
+    let src = r#"
+module top (input [3:0] a, input [3:0] b, output [3:0] y);
+    wire carry;
+    wire [3:0] s;
+    assign {carry, s} = a + b;
+    assign y = s;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    assert_eq!(w101_messages(&result), vec!["unused signal `carry`"]);
+}
+
+#[test]
+fn unused_procedural_concat_target_still_w101() {
+    let src = r#"
+module top (input clk, input [3:0] a, input [3:0] b, output reg [3:0] y);
+    reg carry;
+    reg [3:0] s;
+    always @(posedge clk) begin
+        {carry, s} <= a + b;
+        y <= s;
+    end
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    assert_eq!(w101_messages(&result), vec!["unused signal `carry`"]);
+}
+
+#[test]
+fn dynamic_index_read_is_case_sensitive_in_verilog() {
+    // `Addr` is read by the index; `addr` is a different, unused signal.
+    let src = r#"
+module top (input clk, input [2:0] sel, input d, output [7:0] q);
+    reg [7:0] mem;
+    wire [2:0] Addr;
+    wire [2:0] addr;
+    assign Addr = sel;
+    always @(posedge clk) mem[Addr] <= d;
+    assign q = mem;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    assert_eq!(w101_messages(&result), vec!["unused signal `addr`"]);
 }
 
 #[test]

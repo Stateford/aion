@@ -28,13 +28,28 @@ impl Case {
         }
     }
 
-    /// The spelling used for this convention in `aion.toml`.
+    /// The conventional, human-readable name of this convention, written in
+    /// the style it describes (`camelCase`, `UPPER_SNAKE_CASE`, ...).
+    ///
+    /// This is *not* the value accepted by `aion.toml`; see
+    /// [`Case::config_value`] for that.
     fn label(self) -> &'static str {
         match self {
             Case::Snake => "snake_case",
             Case::Camel => "camelCase",
             Case::UpperSnake => "UPPER_SNAKE_CASE",
             Case::Pascal => "PascalCase",
+        }
+    }
+
+    /// The value that selects this convention under `[lint.naming]` in
+    /// `aion.toml` (the `serde` spelling of [`NamingConvention`]).
+    fn config_value(self) -> &'static str {
+        match self {
+            Case::Snake => "snake_case",
+            Case::Camel => "camel_case",
+            Case::UpperSnake => "upper_snake_case",
+            Case::Pascal => "pascal_case",
         }
     }
 
@@ -168,6 +183,10 @@ impl NamingViolation {
 
     /// Checks `name` (a `kind` such as "signal") against `case` and reports
     /// a violation at `span`.
+    ///
+    /// `kind` doubles as the `[lint.naming]` key that configures `case`
+    /// (`module`, `signal`, `parameter` or `constant`), so the note can quote
+    /// the exact line a user would write in `aion.toml`.
     fn check_name(
         &self,
         kind: &str,
@@ -201,7 +220,8 @@ impl NamingViolation {
             format!("expected a {} name", case.label()),
         ))
         .with_note(format!(
-            "the {kind} naming convention is set by `[lint.naming]` in aion.toml"
+            "the {kind} naming convention is set by `{kind} = \"{}\"` under `[lint.naming]` in aion.toml",
+            case.config_value()
         ));
         if suggestion != name && case.matches(suggestion.trim_start_matches('_')) {
             diag = diag.with_help(format!("rename it to `{suggestion}`"));
@@ -490,6 +510,52 @@ mod tests {
             .help
             .iter()
             .any(|h| h == "rename it to `MAX_COUNT`"));
+    }
+
+    #[test]
+    fn note_quotes_a_config_line_that_parses() {
+        let diags = run(all_snake_upper(), |i, m| {
+            m.params.push(Parameter {
+                name: i.get_or_intern("width"),
+                ty: TypeId::from_raw(0),
+                value: ConstValue::Int(8),
+                span: Span::DUMMY,
+            });
+        });
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert!(
+            diags[0].notes.iter().any(|n| n
+                == "the parameter naming convention is set by `parameter = \"upper_snake_case\"` under `[lint.naming]` in aion.toml"),
+            "{:?}",
+            diags[0].notes
+        );
+    }
+
+    #[test]
+    fn config_values_round_trip_through_aion_toml() {
+        for case in [Case::Snake, Case::Camel, Case::UpperSnake, Case::Pascal] {
+            let toml = format!(
+                "[project]\nname = \"t\"\nversion = \"0.1.0\"\ntop = \"top\"\n\n[lint.naming]\nsignal = \"{}\"\n",
+                case.config_value()
+            );
+            let config = aion_config::load_config_from_str(&toml)
+                .unwrap_or_else(|e| panic!("{} rejected: {e}", case.config_value()));
+            let convention = config
+                .lint
+                .naming
+                .and_then(|n| n.signal)
+                .expect("signal set");
+            assert_eq!(Case::from_config(&convention), case);
+        }
+    }
+
+    #[test]
+    fn display_labels_are_not_config_values() {
+        // The message labels are written in their own style and would be
+        // rejected by aion.toml; only `snake_case` happens to coincide.
+        assert_eq!(Case::UpperSnake.label(), "UPPER_SNAKE_CASE");
+        let toml = "[project]\nname = \"t\"\nversion = \"0.1.0\"\ntop = \"top\"\n\n[lint.naming]\nparameter = \"UPPER_SNAKE_CASE\"\n";
+        assert!(aion_config::load_config_from_str(toml).is_err());
     }
 
     #[test]

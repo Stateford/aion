@@ -60,7 +60,7 @@ impl LintRule for UnusedSignal {
             }
 
             let index_reads = index_reads.get_or_insert_with(|| dynamic_index_reads(module, ctx));
-            if index_reads.contains(&base.to_ascii_lowercase()) {
+            if index_reads.contains(base) {
                 continue;
             }
 
@@ -314,5 +314,75 @@ mod tests {
         let diags = run_with(module, &interner, &db);
         let msgs: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(msgs, vec!["unused signal `mem`"], "{diags:#?}");
+    }
+
+    /// Builds a module with one sequential process whose body is a single
+    /// assignment of `target` spanning all of `text` (stored as `file`).
+    fn run_single_assign(
+        file: &str,
+        text: &str,
+        names: &[&str],
+        target: impl Fn(&[SignalId]) -> SignalRef,
+    ) -> Vec<String> {
+        let interner = Interner::new();
+        let mut db = SourceDb::new();
+        let fid = db.add_source(file, text.to_string());
+        let mut module = mk_module();
+        let ids: Vec<SignalId> = names
+            .iter()
+            .map(|n| add_named(&mut module, &interner, n))
+            .collect();
+        module.processes.alloc(Process {
+            id: ProcessId::from_raw(0),
+            name: None,
+            kind: ProcessKind::Sequential,
+            body: Statement::Assign {
+                target: target(&ids),
+                value: Expr::Literal(aion_common::LogicVec::all_zero(1)),
+                kind: AssignKind::NonBlocking,
+                span: Span::new(fid, 0, text.len() as u32),
+            },
+            sensitivity: Sensitivity::All,
+            span: Span::DUMMY,
+        });
+        run_with(module, &interner, &db)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn concat_target_members_are_still_unused() {
+        // `{carry, s} <= a + b;` writes both; neither is read anywhere.
+        let msgs = run_single_assign("t.v", "{carry, s} <= a + b;", &["carry", "s"], |ids| {
+            SignalRef::Concat(vec![SignalRef::Signal(ids[0]), SignalRef::Signal(ids[1])])
+        });
+        assert_eq!(msgs, vec!["unused signal `carry`", "unused signal `s`"]);
+    }
+
+    #[test]
+    fn dynamic_index_inside_concat_target_counts_as_read() {
+        let msgs = run_single_assign("t.v", "{mem[k], c} <= z;", &["mem", "k", "c"], |ids| {
+            SignalRef::Concat(vec![SignalRef::Signal(ids[0]), SignalRef::Signal(ids[2])])
+        });
+        assert_eq!(msgs, vec!["unused signal `mem`", "unused signal `c`"]);
+    }
+
+    #[test]
+    fn verilog_index_match_is_case_sensitive() {
+        // `Addr` is read by the index; the distinct signal `addr` is not.
+        let msgs = run_single_assign("t.v", "mem[Addr] <= d;", &["mem", "Addr", "addr"], |ids| {
+            SignalRef::Signal(ids[0])
+        });
+        assert_eq!(msgs, vec!["unused signal `mem`", "unused signal `addr`"]);
+    }
+
+    #[test]
+    fn vhdl_index_match_ignores_case() {
+        // VHDL interns `addr`; the source may spell it `Addr`.
+        let msgs = run_single_assign("t.vhd", "mem(Addr) <= d;", &["mem", "addr"], |ids| {
+            SignalRef::Signal(ids[0])
+        });
+        assert_eq!(msgs, vec!["unused signal `mem`"]);
     }
 }

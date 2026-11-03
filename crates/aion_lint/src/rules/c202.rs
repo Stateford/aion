@@ -14,7 +14,8 @@ use crate::{LintContext, LintRule};
 /// convention — Verilog compiler directives (`` `timescale ``), attribute
 /// instances (`(* keep *)`) and VHDL context clauses (`library` / `use` /
 /// `context`). The module counts as documented if the first remaining line is
-/// a comment: a `//` or `--` line, or the end of a `/* ... */` block.
+/// a comment: a `//` or `--` line, or the end of a `/* ... */` block that
+/// starts on a line of its own (a trailing comment after code does not count).
 ///
 /// Modules whose name starts with `_` are treated as internal and are not
 /// flagged, and modules without source text (e.g. synthesized ones) are
@@ -57,13 +58,7 @@ impl LintRule for MissingDoc {
             return;
         }
 
-        let is_vhdl = ctx
-            .source_db()
-            .try_get_file(module.span.file)
-            .and_then(|f| f.path.extension())
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("vhd") || e.eq_ignore_ascii_case("vhdl"));
-        let (kind, comment) = if is_vhdl {
+        let (kind, comment) = if ctx.is_vhdl_source(module.span) {
             ("entity", "--")
         } else {
             ("module", "//")
@@ -89,21 +84,39 @@ impl LintRule for MissingDoc {
 /// Returns true if the text preceding a declaration ends with a comment,
 /// ignoring blank lines, compiler directives, attribute instances and VHDL
 /// context clauses in between.
+///
+/// A line ending in `*/` only counts when the `/* ... */` block it closes
+/// starts on a line of its own: `endmodule /* end */` is code with a
+/// trailing comment, not documentation for whatever follows it.
 fn has_preceding_doc_comment(before: &str) -> bool {
-    for line in before.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with("//") || line.starts_with("--") || line.ends_with("*/") {
+    let mut rest = before;
+    loop {
+        let line_start = rest.rfind('\n').map_or(0, |p| p + 1);
+        let raw = &rest[line_start..];
+        let line = raw.trim();
+        if line.starts_with("//") || line.starts_with("--") {
             return true;
         }
-        if is_transparent_line(line) {
-            continue;
+        if line.ends_with("*/") {
+            // `rest` is a prefix of `before`, so offsets into it are shared.
+            let close = line_start + raw.trim_end().len() - 2;
+            return block_comment_starts_line(before, close);
         }
-        return false;
+        if (!line.is_empty() && !is_transparent_line(line)) || line_start == 0 {
+            return false;
+        }
+        rest = &rest[..line_start - 1];
     }
-    false
+}
+
+/// Returns true if the `/* ... */` block whose closing `*/` starts at byte
+/// `close` of `text` opens with nothing but whitespace before it on its line.
+fn block_comment_starts_line(text: &str, close: usize) -> bool {
+    let Some(open) = text[..close].rfind("/*") else {
+        return false;
+    };
+    let line_start = text[..open].rfind('\n').map_or(0, |p| p + 1);
+    text[line_start..open].trim().is_empty()
 }
 
 /// Returns true for lines conventionally placed between a module's header
@@ -265,6 +278,30 @@ mod tests {
         assert!(!has_preceding_doc_comment(""));
         assert!(!has_preceding_doc_comment("endmodule\n"));
         assert!(!has_preceding_doc_comment("`timescale 1ns/1ps\n"));
+        assert!(has_preceding_doc_comment("/* doc */\n"));
+        assert!(has_preceding_doc_comment("  /* multi\n   line */\r\n\n"));
+        assert!(!has_preceding_doc_comment(
+            "assign y = a; endmodule /* end */\n"
+        ));
+        assert!(!has_preceding_doc_comment("x = 1; /* starts\n here */\n"));
+        assert!(!has_preceding_doc_comment("stray */\n"));
+    }
+
+    #[test]
+    fn trailing_block_comment_on_code_line_is_not_documentation() {
+        let src = "// A buffer.\nmodule a(input a, output y);\n  assign y = a; endmodule /* end */\nmodule top; endmodule\n";
+        let diags = lint_source("top.v", src, "module top", "top");
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert_eq!(
+            diags[0].message,
+            "module `top` has no documentation comment"
+        );
+    }
+
+    #[test]
+    fn block_comment_on_its_own_line_after_code_documents_module() {
+        let src = "module a; endmodule\n/* The top level. */\nmodule top; endmodule\n";
+        assert!(lint_source("top.v", src, "module top", "top").is_empty());
     }
 
     #[test]
