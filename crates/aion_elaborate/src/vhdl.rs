@@ -396,12 +396,7 @@ fn eval_vhdl_default(
         }
         vhdl_ast::Expr::BitStringLiteral { span } => {
             let text = ctx.source_db.snippet(*span);
-            let upper = text.to_ascii_uppercase();
-            // Only the based forms the lowering understands.
-            if !(upper.starts_with("X\"") || upper.starts_with("B\"") || upper.starts_with("O\"")) {
-                return None;
-            }
-            Some(fit(crate::expr::parse_vhdl_bit_string(text)))
+            crate::expr::parse_vhdl_bit_string(text).ok().map(fit)
         }
         vhdl_ast::Expr::Aggregate { elements, .. } => {
             // `(others => c)`: every bit takes the value of `c`.
@@ -483,7 +478,7 @@ fn eval_vhdl_default(
 /// `'0'`/`'L'` are 0, `'1'`/`'H'` are 1, `'Z'` is high-impedance, and
 /// `'U'`, `'X'`, `'W'`, `'-'` are unknown. Returns `None` for any other
 /// character.
-fn std_logic_char(c: char) -> Option<Logic> {
+pub(crate) fn std_logic_char(c: char) -> Option<Logic> {
     match c.to_ascii_uppercase() {
         '0' | 'L' => Some(Logic::Zero),
         '1' | 'H' => Some(Logic::One),

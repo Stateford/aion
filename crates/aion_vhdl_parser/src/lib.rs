@@ -15,6 +15,7 @@
 #![warn(missing_docs)]
 
 pub mod ast;
+pub mod bit_string;
 mod decl;
 mod expr;
 pub mod lexer;
@@ -335,5 +336,50 @@ mod tests {
         let json = serde_json::to_string(&ast).unwrap();
         let back: VhdlDesignFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.units.len(), ast.units.len());
+    }
+
+    #[test]
+    fn integration_lexer_correctness_constructs() {
+        // Issue #22: delimited comment containing `/*`, a qualified
+        // expression with a space character, and sized bit strings.
+        let ast = parse_ok(
+            "/* see src/*.vhd */
+            entity e is end;
+            architecture rtl of e is
+                signal a : std_logic_vector(7 downto 0) := 8UX\"F\";
+                signal b : std_logic_vector(11 downto 0) := 12SB\"101\";
+            begin
+                process
+                    variable c : character;
+                begin
+                    c := character'(' ');
+                    c := character'('a');
+                    a <= 8D\"255\";
+                    if a'length = 8 then
+                        a <= x\"0\" & 4SX\"F\";
+                    end if;
+                    wait;
+                end process;
+            end architecture;",
+        );
+        assert_eq!(ast.units.len(), 2);
+    }
+
+    #[test]
+    fn integration_smart_quotes_report_without_panic() {
+        use aion_diagnostics::{DiagnosticRenderer, TerminalRenderer};
+        let src = "architecture rtl of e is begin x <= \u{2018}1\u{2019}; end;";
+        let mut db = SourceDb::new();
+        let file_id = db.add_source("smart.vhd", src.to_string());
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let _ = parse_file(file_id, &db, &interner, &sink);
+        let diags = sink.take_all();
+        assert!(diags.iter().any(|d| d.message.contains("U+2018")));
+        let renderer = TerminalRenderer::new(false, 80);
+        for d in &diags {
+            let out = renderer.render(d, &db);
+            assert!(out.contains("smart.vhd"));
+        }
     }
 }
