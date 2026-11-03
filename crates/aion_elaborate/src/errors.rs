@@ -1,8 +1,8 @@
 //! Diagnostic codes and helper functions for elaboration errors and warnings.
 //!
-//! Error codes `E200`--`E212` cover elaboration failures (unknown modules,
+//! Error codes `E200`--`E213` cover elaboration failures (unknown modules,
 //! duplicate signals, type mismatches, unresolvable VHDL range attributes,
-//! etc.). Warning codes `W200`--`W207`
+//! invalid VHDL bit-string literals, etc.). Warning codes `W200`--`W207`
 //! cover non-fatal issues (width mismatches, unconnected ports, `forever`
 //! loops and `always` blocks with no timing control, VHDL defaults that
 //! cannot be evaluated, ignored delays, and approximated time literals).
@@ -87,6 +87,12 @@ pub const E211: DiagnosticCode = DiagnosticCode {
 pub const E212: DiagnosticCode = DiagnosticCode {
     category: Category::Error,
     number: 212,
+};
+
+/// VHDL bit-string literal that cannot be converted to a logic vector.
+pub const E213: DiagnosticCode = DiagnosticCode {
+    category: Category::Error,
+    number: 213,
 };
 
 /// Width mismatch in assignment or connection.
@@ -300,6 +306,13 @@ pub fn error_unresolved_range_attribute(
         "use an explicit range (e.g. `7 downto 0`) or the name of a declared array signal, \
          port, constant, variable or array type with constant bounds",
     )
+}
+
+/// Creates a diagnostic for a VHDL bit-string literal (e.g. `3UX"F"`, or one
+/// containing a character with no 4-state logic equivalent) that cannot be
+/// lowered to a logic vector. `msg` explains why.
+pub fn error_invalid_bit_string(msg: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(E213, format!("invalid bit string literal: {msg}"), span)
 }
 
 /// Creates a diagnostic for a port mismatch in instantiation.
