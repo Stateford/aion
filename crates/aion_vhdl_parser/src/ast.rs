@@ -439,13 +439,66 @@ pub struct AttributeSpecNode {
 // Types
 // ============================================================================
 
-/// A type indication (type mark with optional constraint).
+/// A subtype indication: an optional resolution indication, a type mark and
+/// an optional constraint (LRM 6.3).
+///
+/// ```text
+/// subtype_indication ::= [resolution_indication] type_mark [constraint]
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeIndication {
+    /// The resolution indication preceding the type mark, if any (e.g.
+    /// `resolved` in `resolved std_ulogic`, or `(resolved)` in
+    /// `(resolved) std_ulogic_vector`).
+    pub resolution: Option<ResolutionIndication>,
     /// The type mark (e.g., `std_logic_vector`).
     pub type_mark: SelectedName,
     /// Optional constraint (e.g., `(7 downto 0)`).
     pub constraint: Option<Constraint>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// A resolution indication in a subtype indication (LRM 6.3), naming the
+/// function that resolves multiple drivers of a signal of the subtype.
+///
+/// ```text
+/// resolution_indication ::= resolution_function_name | ( element_resolution )
+/// element_resolution    ::= array_element_resolution | record_resolution
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResolutionIndication {
+    /// A resolution function applied to the whole subtype (e.g. `resolved`
+    /// in `resolved std_ulogic`).
+    Function(SelectedName),
+    /// An array element resolution `( resolution_indication )`: the inner
+    /// indication resolves each element of an array subtype (e.g.
+    /// `(resolved)` in `(resolved) std_ulogic_vector`).
+    Element(Box<ResolutionIndication>, Span),
+    /// A record resolution `( element resolution, ... )` giving a resolution
+    /// indication per record element (e.g. `(a resolved, b wired_or)`).
+    Record(Vec<RecordElementResolution>, Span),
+}
+
+impl ResolutionIndication {
+    /// Returns the source span covered by this resolution indication,
+    /// including the parentheses of an element or record resolution.
+    pub fn span(&self) -> Span {
+        match self {
+            ResolutionIndication::Function(name) => name.span,
+            ResolutionIndication::Element(_, span) | ResolutionIndication::Record(_, span) => *span,
+        }
+    }
+}
+
+/// One `element_simple_name resolution_indication` entry of a record
+/// resolution (e.g. `b wired_or` in `(a resolved, b wired_or)`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordElementResolution {
+    /// The record element the resolution applies to.
+    pub element: Ident,
+    /// The resolution indication for that element.
+    pub resolution: ResolutionIndication,
     /// Source span.
     pub span: Span,
 }
@@ -457,6 +510,34 @@ pub enum Constraint {
     Range(RangeConstraint),
     /// An index constraint (e.g., `(7 downto 0)` or `(0 to 3, 0 to 7)`).
     Index(Vec<DiscreteRange>, Span),
+    /// The VHDL-2008 `(open)` array constraint: the index range of this
+    /// array level is left unconstrained, typically so that an element
+    /// constraint can follow (e.g. `mem_t(open)(7 downto 0)`).
+    Open(Span),
+    /// A VHDL-2008 array constraint with an element constraint (LRM
+    /// 5.3.2.1), e.g. `mem_t(0 to 3)(7 downto 0)`. `index` constrains the
+    /// outer array ([`Constraint::Index`] or [`Constraint::Open`]) and
+    /// `element` constrains its element subtype (itself another
+    /// [`Constraint::Array`] for deeper nesting).
+    Array {
+        /// The constraint on this array level's index ranges.
+        index: Box<Constraint>,
+        /// The constraint on the element subtype.
+        element: Box<Constraint>,
+        /// Source span (from the first `(` to the last `)`).
+        span: Span,
+    },
+}
+
+impl Constraint {
+    /// Returns the source span covered by this constraint.
+    pub fn span(&self) -> Span {
+        match self {
+            Constraint::Range(rc) => rc.span,
+            Constraint::Index(_, span) | Constraint::Open(span) => *span,
+            Constraint::Array { span, .. } => *span,
+        }
+    }
 }
 
 /// A range constraint with direction (e.g., `7 downto 0`).
@@ -493,6 +574,16 @@ pub enum DiscreteRange {
     /// A range attribute name (e.g., `v'range`, `T'reverse_range`,
     /// `m'range(2)`), whose bounds and direction come from the prefix.
     Attribute(RangeAttributeName),
+    /// An unconstrained index subtype definition `type_mark range <>`
+    /// (e.g. `natural range <>`). Only legal as an index of an array type
+    /// definition: the actual index range is supplied later by a subtype or
+    /// object declaration.
+    Unconstrained {
+        /// The index subtype (e.g. `natural`).
+        type_mark: SelectedName,
+        /// Source span (from the type mark to `<>`).
+        span: Span,
+    },
     /// An expression that is neither a range nor a type mark; a diagnostic
     /// has already been emitted by the parser.
     Error(Span),
@@ -505,6 +596,7 @@ impl DiscreteRange {
             DiscreteRange::Range(rc) => rc.span,
             DiscreteRange::TypeIndication(ti) => ti.span,
             DiscreteRange::Attribute(attr) => attr.span,
+            DiscreteRange::Unconstrained { span, .. } => *span,
             DiscreteRange::Error(span) => *span,
         }
     }
@@ -1354,8 +1446,15 @@ pub struct Name {
 pub enum NameSuffix {
     /// A dot selection (e.g., `.field`).
     Selected(Ident, Span),
-    /// Index or function call (e.g., `(0)`, `(a, b)`).
+    /// Index or function call with positional arguments only (e.g., `(0)`,
+    /// `(a, b)`).
     Index(Vec<Expr>, Span),
+    /// A function call or type conversion whose parenthesized association
+    /// list contains at least one named association `formal => actual`
+    /// (e.g., `(arg => x, size => 8)` or `(v, new_size => 16)`). Positional
+    /// elements, which must come first, have no formal. A list with only
+    /// positional elements is a [`NameSuffix::Index`] instead.
+    Call(AssociationList, Span),
     /// A slice (e.g., `(7 downto 0)`).
     Slice(RangeConstraint, Span),
     /// An attribute (e.g., `'event`, `'range`).
@@ -1516,6 +1615,7 @@ mod tests {
     #[test]
     fn serde_roundtrip_type_indication() {
         let ti = TypeIndication {
+            resolution: None,
             type_mark: dummy_name(),
             constraint: None,
             span: dummy_span(),

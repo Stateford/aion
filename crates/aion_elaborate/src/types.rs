@@ -236,6 +236,11 @@ pub fn resolve_vhdl_type(
                         }
                         types.intern(Type::Error)
                     }
+                    // `(open)` leaves the vector unconstrained, like no
+                    // constraint at all; an element constraint is not
+                    // meaningful on a vector of scalar elements.
+                    aion_vhdl_parser::ast::Constraint::Open(_)
+                    | aion_vhdl_parser::ast::Constraint::Array { .. } => types.intern(Type::Error),
                 }
             } else {
                 // No constraint — unconstrained vector, use Error for now
@@ -367,6 +372,7 @@ mod tests {
         let (sdb, interner, sink, mut types, env) = setup();
         let std_logic = interner.get_or_intern("std_logic");
         let ti = aion_vhdl_parser::ast::TypeIndication {
+            resolution: None,
             type_mark: aion_vhdl_parser::ast::SelectedName {
                 parts: vec![std_logic],
                 span: aion_source::Span::DUMMY,
@@ -391,6 +397,7 @@ mod tests {
         let (sdb, interner, sink, mut types, env) = setup();
         let integer = interner.get_or_intern("integer");
         let ti = aion_vhdl_parser::ast::TypeIndication {
+            resolution: None,
             type_mark: aion_vhdl_parser::ast::SelectedName {
                 parts: vec![integer],
                 span: aion_source::Span::DUMMY,
@@ -416,6 +423,7 @@ mod tests {
         let fid = sdb.add_source("test.vhd", "7 0".to_string());
         let slv = interner.get_or_intern("std_logic_vector");
         let ti = aion_vhdl_parser::ast::TypeIndication {
+            resolution: None,
             type_mark: aion_vhdl_parser::ast::SelectedName {
                 parts: vec![slv],
                 span: aion_source::Span::DUMMY,
@@ -456,10 +464,61 @@ mod tests {
     }
 
     #[test]
+    fn vhdl_open_and_resolved_vector_types() {
+        let (sdb, interner, sink, mut types, env) = setup();
+        let mark = |name: &str| aion_vhdl_parser::ast::SelectedName {
+            parts: vec![interner.get_or_intern(name)],
+            span: aion_source::Span::DUMMY,
+        };
+        // `std_logic_vector(open)` is unconstrained: no width is guessed.
+        let open = aion_vhdl_parser::ast::TypeIndication {
+            resolution: None,
+            type_mark: mark("std_logic_vector"),
+            constraint: Some(aion_vhdl_parser::ast::Constraint::Open(
+                aion_source::Span::DUMMY,
+            )),
+            span: aion_source::Span::DUMMY,
+        };
+        let tid = resolve_vhdl_type(
+            &open,
+            &RangeEnv::new(),
+            &mut types,
+            &env,
+            &sdb,
+            &interner,
+            &sink,
+        );
+        assert_eq!(*types.get(tid), Type::Error);
+
+        // `resolved std_logic`: the resolution function does not change the
+        // type.
+        let resolved = aion_vhdl_parser::ast::TypeIndication {
+            resolution: Some(aion_vhdl_parser::ast::ResolutionIndication::Function(mark(
+                "resolved",
+            ))),
+            type_mark: mark("std_logic"),
+            constraint: None,
+            span: aion_source::Span::DUMMY,
+        };
+        let tid = resolve_vhdl_type(
+            &resolved,
+            &RangeEnv::new(),
+            &mut types,
+            &env,
+            &sdb,
+            &interner,
+            &sink,
+        );
+        assert_eq!(*types.get(tid), Type::Bit);
+        assert!(sink.diagnostics().is_empty());
+    }
+
+    #[test]
     fn vhdl_unknown_type_emits_diagnostic() {
         let (sdb, interner, sink, mut types, env) = setup();
         let custom = interner.get_or_intern("my_custom_type");
         let ti = aion_vhdl_parser::ast::TypeIndication {
+            resolution: None,
             type_mark: aion_vhdl_parser::ast::SelectedName {
                 parts: vec![custom],
                 span: aion_source::Span::DUMMY,

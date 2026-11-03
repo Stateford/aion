@@ -706,6 +706,11 @@ impl Lexer<'_> {
                 } else if self.peek() == b'<' {
                     self.pos += 1;
                     VhdlToken::DoubleLess
+                } else if self.peek() == b'>' {
+                    // `<>` is a single compound delimiter (box); no VHDL
+                    // expression has `<` directly followed by `>`.
+                    self.pos += 1;
+                    VhdlToken::Box
                 } else {
                     VhdlToken::LessThan
                 }
@@ -1074,6 +1079,41 @@ mod tests {
         assert_eq!(k[19], VhdlToken::Bar);
         assert_eq!(k[20], VhdlToken::Dot);
         assert_eq!(k[21], VhdlToken::Eof);
+    }
+
+    #[test]
+    fn box_is_one_token() {
+        let tokens = lex_tokens("natural range <>");
+        assert_eq!(
+            kinds(&tokens),
+            vec![
+                VhdlToken::Identifier,
+                VhdlToken::Range,
+                VhdlToken::Box,
+                VhdlToken::Eof,
+            ]
+        );
+        assert_eq!(tokens[2].span.start, 14);
+        assert_eq!(tokens[2].span.end, 16);
+    }
+
+    #[test]
+    fn separated_less_greater_are_not_a_box() {
+        // Only an adjacent `<>` is the box; `< >` stays two operators and
+        // `<=`/`<<` keep their meanings.
+        let k = kinds(&lex_tokens("< > <= << <>>"));
+        assert_eq!(
+            k,
+            vec![
+                VhdlToken::LessThan,
+                VhdlToken::GreaterThan,
+                VhdlToken::LessEquals,
+                VhdlToken::DoubleLess,
+                VhdlToken::Box,
+                VhdlToken::GreaterThan,
+                VhdlToken::Eof,
+            ]
+        );
     }
 
     #[test]

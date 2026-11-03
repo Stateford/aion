@@ -928,7 +928,23 @@ pub fn lower_vhdl_expr(
             }
         }
         Expr::Paren { inner, .. } => lower_vhdl_expr(inner, sig_env, source_db, interner, sink),
-        Expr::Aggregate { elements, span: _ } => {
+        Expr::Aggregate { elements, span } => {
+            // Choice lists (`1 | 3 => ...`) and range choices
+            // (`7 downto 4 => ...`) select element positions, which a
+            // value concatenation cannot express: reject them rather than
+            // build hardware with the wrong bit layout.
+            if elements.iter().any(|e| {
+                e.choices.len() > 1
+                    || e.choices
+                        .iter()
+                        .any(|c| matches!(c, aion_vhdl_parser::ast::Choice::Range(_)))
+            }) {
+                sink.emit(errors::error_unsupported(
+                    "aggregate with `|` or range choices in an expression",
+                    *span,
+                ));
+                return poison(*span);
+            }
             // Lower aggregate elements as a concat
             let parts: Vec<_> = elements
                 .iter()
@@ -1408,6 +1424,93 @@ fn is_vhdl_builtin(name: &str) -> bool {
     VHDL_BUILTINS.iter().any(|b| *b == lower)
 }
 
+/// Returns the formal parameter names, in declaration order, of a VHDL
+/// built-in subprogram (as declared in IEEE `std_logic_1164` and
+/// `numeric_std`), or `None` for a built-in that has no named formals: the
+/// type conversions (`unsigned(x)`, `integer(x)`, ...), which only take a
+/// single positional operand.
+fn vhdl_builtin_formals(name: &str) -> Option<&'static [&'static str]> {
+    match name.to_lowercase().as_str() {
+        "rising_edge" | "falling_edge" => Some(&["s"]),
+        "to_unsigned" | "to_signed" => Some(&["arg", "size"]),
+        "to_integer" => Some(&["arg"]),
+        "resize" => Some(&["arg", "new_size"]),
+        "shift_left" | "shift_right" => Some(&["arg", "count"]),
+        "to_stdulogicvector" | "to_stdlogicvector" => Some(&["s"]),
+        "to_bitvector" => Some(&["s", "xmap"]),
+        _ => None,
+    }
+}
+
+/// Puts the actuals of a call to the VHDL built-in `func` that uses named
+/// association (`resize(arg => v, new_size => 16)`) into positional order,
+/// so it lowers exactly like `resize(v, 16)`.
+///
+/// Positional actuals fill the first formals; each named actual goes to the
+/// formal it names (case-insensitively). Trailing formals may be left out
+/// (they take their defaults), but a gap before an associated formal may
+/// not. Returns an error message for a built-in without named formals (a
+/// type conversion), an unknown or repeated formal, a formal that is not a
+/// simple name, an `open` actual, too many actuals, or a gap.
+pub(crate) fn order_vhdl_builtin_actuals<'a>(
+    func: &str,
+    list: &'a aion_vhdl_parser::ast::AssociationList,
+    interner: &Interner,
+) -> Result<Vec<&'a aion_vhdl_parser::ast::Expr>, String> {
+    use aion_vhdl_parser::ast::Expr;
+
+    let Some(formals) = vhdl_builtin_formals(func) else {
+        return Err(format!(
+            "`{func}` is a type conversion and does not take named association"
+        ));
+    };
+    let mut slots: Vec<Option<&Expr>> = vec![None; formals.len()];
+    let mut next_positional = 0;
+    for elem in &list.elements {
+        if matches!(elem.actual, Expr::Open { .. }) {
+            return Err(format!("`open` actual in call to `{func}`"));
+        }
+        let index = match &elem.formal {
+            None => {
+                let i = next_positional;
+                next_positional += 1;
+                i
+            }
+            Some(Expr::Name(n)) if n.parts.is_empty() => {
+                let formal = interner.resolve(n.primary).to_lowercase();
+                formals
+                    .iter()
+                    .position(|f| *f == formal)
+                    .ok_or_else(|| format!("`{func}` has no formal parameter `{formal}`"))?
+            }
+            Some(_) => {
+                return Err(format!(
+                    "formal part in call to `{func}` must be a simple parameter name"
+                ))
+            }
+        };
+        let Some(slot) = slots.get_mut(index) else {
+            return Err(format!(
+                "too many actuals in call to `{func}` (it takes {})",
+                formals.len()
+            ));
+        };
+        if slot.is_some() {
+            return Err(format!(
+                "formal `{}` of `{func}` is associated more than once",
+                formals[index]
+            ));
+        }
+        *slot = Some(&elem.actual);
+    }
+    let used = slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+    slots[..used]
+        .iter()
+        .enumerate()
+        .map(|(i, s)| s.ok_or_else(|| format!("formal `{}` of `{func}` has no actual", formals[i])))
+        .collect()
+}
+
 /// Lowers a VHDL `Name` to an IR expression.
 fn lower_vhdl_name(
     name: &aion_vhdl_parser::ast::Name,
@@ -1435,8 +1538,46 @@ fn lower_vhdl_name(
                 span: *span,
             };
         }
+        // Named association: reorder the actuals to their formals' positions.
+        if let Some(NameSuffix::Call(list, span)) = name.parts.first() {
+            return match order_vhdl_builtin_actuals(primary_text, list, interner) {
+                Ok(args) => IrExpr::FuncCall {
+                    name: name.primary,
+                    args: args
+                        .into_iter()
+                        .map(|a| lower_vhdl_expr(a, sig_env, source_db, interner, sink))
+                        .collect(),
+                    ty: TypeId::from_raw(0),
+                    span: *span,
+                },
+                Err(msg) => {
+                    sink.emit(errors::error_unsupported(
+                        &format!("named association: {msg}"),
+                        *span,
+                    ));
+                    poison(*span)
+                }
+            };
+        }
         // No arguments — return a passthrough zero literal (type name used as value)
         return IrExpr::Literal(LogicVec::all_zero(1));
+    }
+
+    // Named association is only meaningful in subprogram calls, and only
+    // calls to the IEEE built-ins above are elaborated.
+    if let Some(NameSuffix::Call(_, span)) = name
+        .parts
+        .iter()
+        .find(|p| matches!(p, NameSuffix::Call(..)))
+    {
+        sink.emit(errors::error_unsupported(
+            &format!(
+                "named association in a call to `{primary_text}` (only IEEE built-in \
+                 functions can be called)"
+            ),
+            *span,
+        ));
+        return poison(*span);
     }
 
     let base = resolve_signal(name.primary, name.span, sig_env, interner, sink);
@@ -1469,8 +1610,12 @@ fn lower_vhdl_name(
                     span: *span,
                 };
             }
-            NameSuffix::Selected(_, _) | NameSuffix::Attribute(_, _, _) | NameSuffix::All(_) => {
+            NameSuffix::Selected(_, _)
+            | NameSuffix::Attribute(_, _, _)
+            | NameSuffix::All(_)
+            | NameSuffix::Call(..) => {
                 // These are handled elsewhere or ignored at this stage
+                // (`Call` suffixes are rejected above).
             }
         }
     }
@@ -2515,6 +2660,150 @@ mod tests {
         assert_eq!(map_vhdl_unary_op(V::Neg), Some((UnaryOp::Neg, false)));
         let (ir, sid, _) = lower_vhdl_unary(V::Not);
         assert!(is_unary_of_signal(&ir, UnaryOp::Not, sid));
+    }
+
+    // ---- VHDL named association in built-in calls ----
+
+    /// Parses `text` as one VHDL expression, registering it in `sdb` so its
+    /// spans resolve, and asserts that it parses cleanly.
+    fn parse_vhdl_expr(
+        sdb: &mut SourceDb,
+        interner: &Interner,
+        text: &str,
+    ) -> aion_vhdl_parser::ast::Expr {
+        let fid = sdb.add_source("e.vhd", text.to_string());
+        let sink = DiagnosticSink::new();
+        let tokens = aion_vhdl_parser::lexer::lex(text, fid, &sink);
+        let expr = aion_vhdl_parser::parser::VhdlParser::new(tokens, text, fid, interner, &sink)
+            .parse_expr();
+        assert!(sink.diagnostics().is_empty(), "{:?}", sink.diagnostics());
+        expr
+    }
+
+    /// Returns the association list of a parsed `f(formal => actual, ...)`.
+    fn call_list(expr: &aion_vhdl_parser::ast::Expr) -> &aion_vhdl_parser::ast::AssociationList {
+        match expr {
+            aion_vhdl_parser::ast::Expr::Name(n) => match n.parts.first() {
+                Some(aion_vhdl_parser::ast::NameSuffix::Call(list, _)) => list,
+                other => panic!("expected call suffix, got {other:?}"),
+            },
+            other => panic!("expected name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vhdl_named_builtin_call_lowers_like_positional() {
+        let (mut sdb, interner, sink, mut env) = setup();
+        env.insert(interner.get_or_intern("v"), SignalId::from_raw(3));
+        let args = |text: &str, sdb: &mut SourceDb| {
+            let expr = parse_vhdl_expr(sdb, &interner, text);
+            match lower_vhdl_expr(&expr, &env, sdb, &interner, &sink) {
+                IrExpr::FuncCall { name, args, .. } => {
+                    assert_eq!(interner.resolve(name), text.split('(').next().unwrap());
+                    format!("{args:?}")
+                }
+                other => panic!("expected call for `{text}`, got {other:?}"),
+            }
+        };
+        let positional = args("resize(v, 16)", &mut sdb);
+        assert_eq!(
+            args("resize(arg => v, new_size => 16)", &mut sdb),
+            positional
+        );
+        assert_eq!(
+            args("resize(new_size => 16, arg => v)", &mut sdb),
+            positional
+        );
+        assert_eq!(args("resize(v, NEW_SIZE => 16)", &mut sdb), positional);
+        assert_eq!(
+            args("to_unsigned(size => 8, arg => 3)", &mut sdb),
+            args("to_unsigned(3, 8)", &mut sdb)
+        );
+        assert!(sink.diagnostics().is_empty(), "{:?}", sink.diagnostics());
+    }
+
+    #[test]
+    fn vhdl_builtin_actual_ordering_keeps_trailing_defaults() {
+        let (mut sdb, interner, _, _) = setup();
+        let expr = parse_vhdl_expr(&mut sdb, &interner, "to_bitvector(s => v)");
+        let args = order_vhdl_builtin_actuals("to_bitvector", call_list(&expr), &interner)
+            .expect("trailing formals may be omitted");
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn vhdl_builtin_actual_ordering_errors() {
+        let (mut sdb, interner, _, _) = setup();
+        let cases = [
+            ("unsigned(arg => v)", "type conversion"),
+            (
+                "resize(foo => v, new_size => 3)",
+                "no formal parameter `foo`",
+            ),
+            ("resize(arg => v, arg => w)", "more than once"),
+            ("resize(v, 8, new_size => 1)", "more than once"),
+            ("resize(new_size => 3)", "`arg` of `resize` has no actual"),
+            ("to_integer(v, w, arg => 1)", "too many actuals"),
+            ("rising_edge(s => open)", "`open` actual"),
+            ("resize(arg(0) => v)", "simple parameter name"),
+        ];
+        for (text, needle) in cases {
+            let expr = parse_vhdl_expr(&mut sdb, &interner, text);
+            let func = text.split('(').next().unwrap();
+            let err =
+                order_vhdl_builtin_actuals(func, call_list(&expr), &interner).expect_err(text);
+            assert!(err.contains(needle), "`{text}`: {err}");
+        }
+    }
+
+    #[test]
+    fn vhdl_bad_named_builtin_call_is_reported() {
+        let (mut sdb, interner, sink, mut env) = setup();
+        env.insert(interner.get_or_intern("v"), SignalId::from_raw(0));
+        let expr = parse_vhdl_expr(&mut sdb, &interner, "resize(size => v)");
+        let _ = lower_vhdl_expr(&expr, &env, &sdb, &interner, &sink);
+        let diags = sink.diagnostics();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, errors::E210);
+        assert!(diags[0].message.contains("no formal parameter `size`"));
+    }
+
+    #[test]
+    fn vhdl_aggregate_choice_lists_are_rejected_not_miscompiled() {
+        let (mut sdb, interner, sink, env) = setup();
+        for text in [
+            "(1 | 3 => '1', others => '0')",
+            "(7 downto 4 => '1', others => '0')",
+        ] {
+            let expr = parse_vhdl_expr(&mut sdb, &interner, text);
+            let _ = lower_vhdl_expr(&expr, &env, &sdb, &interner, &sink);
+        }
+        let diags = sink.diagnostics();
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert!(diags.iter().all(|d| d.code == errors::E210));
+
+        // A positional aggregate still lowers to a concatenation.
+        let sink = DiagnosticSink::new();
+        let expr = parse_vhdl_expr(&mut sdb, &interner, "('1', '0')");
+        let ir = lower_vhdl_expr(&expr, &env, &sdb, &interner, &sink);
+        assert!(
+            matches!(ir, IrExpr::Concat(ref p) if p.len() == 2),
+            "{ir:?}"
+        );
+        assert!(sink.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn vhdl_named_call_to_user_function_is_unsupported() {
+        let (mut sdb, interner, sink, mut env) = setup();
+        env.insert(interner.get_or_intern("v"), SignalId::from_raw(0));
+        let expr = parse_vhdl_expr(&mut sdb, &interner, "my_func(x => v)");
+        let _ = lower_vhdl_expr(&expr, &env, &sdb, &interner, &sink);
+        let diags = sink.diagnostics();
+        // One E210, and no extra E204 for the unknown callee.
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, errors::E210);
+        assert!(diags[0].message.contains("my_func"));
     }
 
     #[test]

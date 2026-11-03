@@ -1,7 +1,10 @@
 //! Type indication, constraint, and range parsing for VHDL-2008.
 //!
-//! Handles type marks, range constraints (`7 downto 0`), index constraints,
-//! and discrete ranges used in type declarations and subtype indications.
+//! Handles subtype indications (with optional resolution indications), range
+//! constraints (`7 downto 0`), index and VHDL-2008 array constraints
+//! (`(0 to 3)(7 downto 0)`, `(open)`), and the discrete ranges used in type
+//! declarations and subtype indications, including the unconstrained
+//! `type_mark range <>` index of an array type definition.
 
 use crate::ast::*;
 use crate::parser::VhdlParser;
@@ -9,14 +12,39 @@ use crate::token::VhdlToken;
 use aion_source::Span;
 
 impl VhdlParser<'_> {
-    /// Parses a type indication (type mark with optional constraint).
+    /// Parses a subtype indication: an optional resolution indication, a
+    /// type mark and an optional constraint.
     ///
     /// ```text
-    /// type_indication ::= type_mark [constraint]
+    /// subtype_indication    ::= [resolution_indication] type_mark [constraint]
+    /// resolution_indication ::= resolution_function_name | ( element_resolution )
+    /// constraint            ::= range_constraint | array_constraint
     /// ```
+    ///
+    /// A leading `(` starts an element resolution. A name directly followed
+    /// by another identifier is a resolution function name: no other
+    /// construct places an identifier right after a subtype indication's
+    /// type mark.
     pub fn parse_type_indication(&mut self) -> TypeIndication {
         let start = self.current_span();
-        let type_mark = self.parse_selected_name();
+
+        let resolution = if self.at(VhdlToken::LeftParen) {
+            Some(self.parse_element_resolution())
+        } else {
+            None
+        };
+
+        let mut type_mark = self.parse_selected_name();
+        let resolution = match resolution {
+            Some(r) => Some(r),
+            None if self.at_identifier() => {
+                // `resolved std_ulogic`: the first name was the resolution
+                // function and the type mark follows.
+                let function = std::mem::replace(&mut type_mark, self.parse_selected_name());
+                Some(ResolutionIndication::Function(function))
+            }
+            None => None,
+        };
 
         // Check for range constraint: `range expr direction expr`
         let constraint = if self.at(VhdlToken::Range) {
@@ -24,27 +52,91 @@ impl VhdlParser<'_> {
             let range = self.parse_range_constraint();
             Some(Constraint::Range(range))
         } else if self.at(VhdlToken::LeftParen) {
-            // Index constraint: (discrete_range {, discrete_range})
-            Some(self.parse_index_constraint())
+            Some(self.parse_array_constraint())
         } else {
             None
         };
 
-        let span = if let Some(ref c) = constraint {
-            let end = match c {
-                Constraint::Range(r) => r.span,
-                Constraint::Index(_, s) => *s,
-            };
-            start.merge(end)
-        } else {
-            type_mark.span
+        let end = match &constraint {
+            Some(c) => c.span(),
+            None => type_mark.span,
         };
 
         TypeIndication {
+            resolution,
             type_mark,
             constraint,
-            span,
+            span: start.merge(end),
         }
+    }
+
+    /// Parses an element resolution in parentheses, the current token being
+    /// `(`.
+    ///
+    /// ```text
+    /// array_element_resolution   ::= resolution_indication
+    /// record_resolution          ::= record_element_resolution { , record_element_resolution }
+    /// record_element_resolution  ::= record_element_simple_name resolution_indication
+    /// ```
+    ///
+    /// `(f)` and `((f))` are array element resolutions; `(a f, b g)` is a
+    /// record resolution.
+    fn parse_element_resolution(&mut self) -> ResolutionIndication {
+        let start = self.current_span();
+        self.expect(VhdlToken::LeftParen);
+
+        if self.at(VhdlToken::LeftParen) {
+            // Nested array element resolution: `((resolved))`
+            let inner = self.parse_element_resolution();
+            self.expect(VhdlToken::RightParen);
+            return ResolutionIndication::Element(Box::new(inner), start.merge(self.prev_span()));
+        }
+
+        let first = self.parse_selected_name();
+        if self.at(VhdlToken::RightParen) || !self.at_record_resolution_continuation() {
+            // Array element resolution: `(resolved)`
+            self.expect(VhdlToken::RightParen);
+            return ResolutionIndication::Element(
+                Box::new(ResolutionIndication::Function(first)),
+                start.merge(self.prev_span()),
+            );
+        }
+
+        // Record resolution: `(a resolved, b (wired_or))`
+        let mut elements = Vec::new();
+        let mut element_name = first;
+        loop {
+            if element_name.parts.len() != 1 {
+                self.error_at(
+                    "a record element resolution must start with a simple element name",
+                    element_name.span,
+                );
+            }
+            let resolution = if self.at(VhdlToken::LeftParen) {
+                self.parse_element_resolution()
+            } else {
+                ResolutionIndication::Function(self.parse_selected_name())
+            };
+            let span = element_name.span.merge(resolution.span());
+            elements.push(RecordElementResolution {
+                element: element_name.parts[0],
+                resolution,
+                span,
+            });
+            // Progress: each further iteration consumes a `,`.
+            if !self.eat(VhdlToken::Comma) {
+                break;
+            }
+            element_name = self.parse_selected_name();
+        }
+        self.expect(VhdlToken::RightParen);
+        ResolutionIndication::Record(elements, start.merge(self.prev_span()))
+    }
+
+    /// Returns `true` if the current token can follow a record element name
+    /// in a record resolution (`a resolved` or `a (resolved)`).
+    fn at_record_resolution_continuation(&self) -> bool {
+        self.at_identifier() || self.at(VhdlToken::LeftParen)
     }
 
     /// Parses a range constraint: `expr (to|downto) expr`.
@@ -68,10 +160,52 @@ impl VhdlParser<'_> {
         }
     }
 
-    /// Parses an index constraint: `( discrete_range {, discrete_range} )`.
+    /// Parses an array constraint, the current token being `(`.
+    ///
+    /// ```text
+    /// array_constraint   ::= index_constraint [ element_constraint ]
+    ///                      | ( open ) [ element_constraint ]
+    /// element_constraint ::= array_constraint | record_constraint
+    /// ```
+    ///
+    /// A single `( ... )` yields [`Constraint::Index`] or
+    /// [`Constraint::Open`]; each further `( ... )` constrains the element
+    /// subtype and wraps the result in [`Constraint::Array`].
+    fn parse_array_constraint(&mut self) -> Constraint {
+        let start = self.current_span();
+        let index = self.parse_index_constraint();
+        if !self.at(VhdlToken::LeftParen) {
+            return index;
+        }
+        let element = self.parse_array_constraint();
+        let span = start.merge(element.span());
+        Constraint::Array {
+            index: Box::new(index),
+            element: Box::new(element),
+            span,
+        }
+    }
+
+    /// Parses one parenthesized index constraint,
+    /// `( discrete_range {, discrete_range} )`, or the VHDL-2008 `( open )`.
     fn parse_index_constraint(&mut self) -> Constraint {
         let start = self.current_span();
         self.expect(VhdlToken::LeftParen);
+        if self.at(VhdlToken::Open) {
+            self.advance();
+            if !self.at(VhdlToken::RightParen) {
+                self.error("`open` must be the only element of an index constraint: `(open)`");
+                // Recover: skip the rest of the constraint.
+                while !self.at(VhdlToken::RightParen)
+                    && !self.at(VhdlToken::Semicolon)
+                    && !self.at_eof()
+                {
+                    self.advance();
+                }
+            }
+            self.expect(VhdlToken::RightParen);
+            return Constraint::Open(start.merge(self.prev_span()));
+        }
         let mut ranges = Vec::new();
         ranges.push(self.parse_discrete_range());
         while self.eat(VhdlToken::Comma) {
@@ -96,7 +230,40 @@ impl VhdlParser<'_> {
     /// [`DiscreteRange::Attribute`], and a plain (possibly selected) type
     /// mark becomes [`DiscreteRange::TypeIndication`]. Anything else is
     /// reported and yields [`DiscreteRange::Error`].
+    ///
+    /// The unconstrained form `type_mark range <>` is only legal in an array
+    /// type definition (see [`Self::parse_array_index`]); here it is
+    /// reported and yields [`DiscreteRange::Error`].
     pub fn parse_discrete_range(&mut self) -> DiscreteRange {
+        self.parse_discrete_range_or_box(false)
+    }
+
+    /// Parses one index of an array type definition: either an
+    /// unconstrained index subtype definition `type_mark range <>`
+    /// ([`DiscreteRange::Unconstrained`]) or a discrete range.
+    ///
+    /// ```text
+    /// index_subtype_definition ::= type_mark range <>
+    /// ```
+    pub fn parse_array_index(&mut self) -> DiscreteRange {
+        self.parse_discrete_range_or_box(true)
+    }
+
+    /// Shared implementation of [`Self::parse_discrete_range`] and
+    /// [`Self::parse_array_index`]; `allow_box` says whether
+    /// `type_mark range <>` is legal at this position.
+    fn parse_discrete_range_or_box(&mut self, allow_box: bool) -> DiscreteRange {
+        // A bare `<>` with no `type_mark range` before it.
+        if self.at(VhdlToken::Box) {
+            let span = self.current_span();
+            self.advance();
+            self.error_at(
+                "`<>` must be preceded by an index subtype: write `natural range <>`",
+                span,
+            );
+            return DiscreteRange::Error(span);
+        }
+
         // Parse the first expression / name
         let start = self.current_span();
         let first_expr = self.parse_expr();
@@ -119,6 +286,27 @@ impl VhdlParser<'_> {
             });
         }
 
+        // `type_mark range <>`: an unconstrained index subtype definition
+        if self.at(VhdlToken::Range) && self.peek_is(VhdlToken::Box) {
+            let type_mark = self.expr_as_type_mark(&first_expr);
+            self.advance(); // eat 'range'
+            self.advance(); // eat '<>'
+            let span = start.merge(self.prev_span());
+            let Some(type_mark) = type_mark else {
+                self.report_invalid_discrete_range(&first_expr, "a type mark before `range <>`");
+                return DiscreteRange::Error(span);
+            };
+            if !allow_box {
+                self.error_at(
+                    "an unconstrained index range `range <>` is only allowed in an array \
+                     type definition",
+                    span,
+                );
+                return DiscreteRange::Error(span);
+            }
+            return DiscreteRange::Unconstrained { type_mark, span };
+        }
+
         // `type_mark range L to R`: a subtype indication with a range constraint
         if self.at(VhdlToken::Range) {
             let type_mark = self.expr_as_type_mark(&first_expr);
@@ -130,6 +318,7 @@ impl VhdlParser<'_> {
                 return DiscreteRange::Error(span);
             };
             return DiscreteRange::TypeIndication(TypeIndication {
+                resolution: None,
                 type_mark,
                 constraint: Some(Constraint::Range(range)),
                 span,
@@ -146,6 +335,7 @@ impl VhdlParser<'_> {
             Some(type_mark) => {
                 let span = type_mark.span;
                 DiscreteRange::TypeIndication(TypeIndication {
+                    resolution: None,
                     type_mark,
                     constraint: None,
                     span,
@@ -259,6 +449,7 @@ fn name_suffix_span(suffix: &NameSuffix) -> Span {
     match suffix {
         NameSuffix::Selected(_, span)
         | NameSuffix::Index(_, span)
+        | NameSuffix::Call(_, span)
         | NameSuffix::Slice(_, span)
         | NameSuffix::Attribute(_, _, span)
         | NameSuffix::All(span) => *span,
@@ -529,5 +720,251 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         let back: DiscreteRange = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, DiscreteRange::Error(s) if s == range.span()));
+    }
+
+    // ---- subtype indications: resolution, array constraints, box ----
+
+    /// Parses `decls` inside a package; returns the package declarations,
+    /// the diagnostic messages and the interner.
+    fn package(decls: &str) -> (Vec<Declaration>, Vec<String>, Interner) {
+        let src = format!("package p is {decls} end package;");
+        let (ast, diags, interner) = parse_vhdl(&src);
+        let DesignUnit::ContextUnit {
+            unit: DesignUnitKind::Package(p),
+            ..
+        } = &ast.units[0]
+        else {
+            panic!("expected package, got {:?}", ast.units[0]);
+        };
+        let msgs = diags.into_iter().map(|d| d.message).collect();
+        (p.decls.clone(), msgs, interner)
+    }
+
+    /// Returns the subtype indication of a subtype declaration.
+    fn subtype_ind(decl: &Declaration) -> &TypeIndication {
+        match decl {
+            Declaration::Subtype(st) => &st.ty,
+            other => panic!("expected subtype declaration, got {other:?}"),
+        }
+    }
+
+    /// Returns the indices of an array type declaration.
+    fn array_indices(decl: &Declaration) -> &[DiscreteRange] {
+        match decl {
+            Declaration::Type(TypeDecl {
+                def: TypeDef::Array { indices, .. },
+                ..
+            }) => indices,
+            other => panic!("expected array type declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolution_function_before_type_mark() {
+        let (decls, msgs, interner) = package(
+            "subtype rsl is resolved std_ulogic;
+             signal s : ieee.std_logic_1164.resolved std_ulogic_vector(3 downto 0);
+             subtype plain is std_ulogic;",
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let ti = subtype_ind(&decls[0]);
+        let Some(ResolutionIndication::Function(f)) = &ti.resolution else {
+            panic!("expected resolution function, got {:?}", ti.resolution);
+        };
+        assert_eq!(interner.resolve(f.parts[0]), "resolved");
+        assert_eq!(interner.resolve(ti.type_mark.parts[0]), "std_ulogic");
+
+        let Declaration::Signal(sd) = &decls[1] else {
+            panic!("expected signal");
+        };
+        let Some(ResolutionIndication::Function(f)) = &sd.ty.resolution else {
+            panic!("expected resolution function");
+        };
+        assert_eq!(f.parts.len(), 3);
+        assert!(matches!(sd.ty.constraint, Some(Constraint::Index(..))));
+        assert!(subtype_ind(&decls[2]).resolution.is_none());
+    }
+
+    #[test]
+    fn element_and_record_resolutions() {
+        let (decls, msgs, interner) = package(
+            "subtype rslv is (resolved) std_ulogic_vector;
+             subtype rmat is ((resolved)) mat_t;
+             subtype rrec is (a resolved, b (wired_or)) rec_t;",
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let ti = subtype_ind(&decls[0]);
+        let Some(ResolutionIndication::Element(inner, span)) = &ti.resolution else {
+            panic!("expected element resolution, got {:?}", ti.resolution);
+        };
+        assert!(matches!(**inner, ResolutionIndication::Function(_)));
+        // The subtype indication starts at the resolution's `(`.
+        assert_eq!(ti.span.start, span.start);
+
+        let Some(ResolutionIndication::Element(inner, _)) = &subtype_ind(&decls[1]).resolution
+        else {
+            panic!("expected element resolution");
+        };
+        assert!(matches!(**inner, ResolutionIndication::Element(..)));
+
+        let Some(ResolutionIndication::Record(elems, _)) = &subtype_ind(&decls[2]).resolution
+        else {
+            panic!("expected record resolution");
+        };
+        assert_eq!(elems.len(), 2);
+        assert_eq!(interner.resolve(elems[0].element), "a");
+        assert!(matches!(
+            elems[1].resolution,
+            ResolutionIndication::Element(..)
+        ));
+    }
+
+    #[test]
+    fn record_resolution_needs_simple_element_names() {
+        let (decls, msgs, _) = package("subtype r is (x.y resolved) rec_t;");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("simple element name"), "{msgs:?}");
+        assert!(matches!(
+            subtype_ind(&decls[0]).resolution,
+            Some(ResolutionIndication::Record(..))
+        ));
+    }
+
+    #[test]
+    fn multi_level_and_open_constraints() {
+        let (decls, msgs, _) = package(
+            "subtype m4 is mem_t(0 to 3)(7 downto 0);
+             subtype mx is mem_t(open)(15 downto 0);
+             subtype cube is cube_t(0 to 1)(open)(3 downto 0);
+             subtype o is std_logic_vector(open);",
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let ti = subtype_ind(&decls[0]);
+        let Some(Constraint::Array {
+            index,
+            element,
+            span,
+        }) = &ti.constraint
+        else {
+            panic!("expected array constraint, got {:?}", ti.constraint);
+        };
+        assert!(matches!(**index, Constraint::Index(ref r, _) if r.len() == 1));
+        assert!(matches!(**element, Constraint::Index(..)));
+        assert_eq!(ti.span.end, span.end);
+        assert_eq!(ti.constraint.as_ref().unwrap().span(), *span);
+
+        let Some(Constraint::Array { index, .. }) = &subtype_ind(&decls[1]).constraint else {
+            panic!("expected array constraint");
+        };
+        assert!(matches!(**index, Constraint::Open(_)));
+
+        let Some(Constraint::Array { element, .. }) = &subtype_ind(&decls[2]).constraint else {
+            panic!("expected array constraint");
+        };
+        assert!(matches!(
+            **element,
+            Constraint::Array { ref index, .. } if matches!(**index, Constraint::Open(_))
+        ));
+
+        assert!(matches!(
+            subtype_ind(&decls[3]).constraint,
+            Some(Constraint::Open(_))
+        ));
+    }
+
+    #[test]
+    fn open_must_be_alone_in_index_constraint() {
+        let (decls, msgs, _) = package(
+            "subtype bad is mem_t(open, 0 to 3);
+             subtype good is mem_t(0 to 3);",
+        );
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("`open` must be the only"), "{msgs:?}");
+        assert_eq!(decls.len(), 2);
+        assert!(matches!(
+            subtype_ind(&decls[0]).constraint,
+            Some(Constraint::Open(_))
+        ));
+    }
+
+    #[test]
+    fn unconstrained_array_indices() {
+        let (decls, msgs, interner) = package(
+            "type m is array (natural range <>) of bit;
+             type g is array (work.p.idx_t range <>, integer range <>) of bit;
+             type c is array (0 to 3) of bit;",
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let [DiscreteRange::Unconstrained { type_mark, span }] = array_indices(&decls[0]) else {
+            panic!("expected one unconstrained index");
+        };
+        assert_eq!(interner.resolve(type_mark.parts[0]), "natural");
+        assert!(span.end > span.start);
+        let idx = array_indices(&decls[1]);
+        assert_eq!(idx.len(), 2);
+        assert!(matches!(
+            &idx[0],
+            DiscreteRange::Unconstrained { type_mark, .. } if type_mark.parts.len() == 3
+        ));
+        assert!(matches!(
+            array_indices(&decls[2])[0],
+            DiscreteRange::Range(_)
+        ));
+    }
+
+    #[test]
+    fn box_errors() {
+        // `range <>` outside an array type definition.
+        let (_, msgs, _) = package("signal s : bit_vector(natural range <>);");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(
+            msgs[0].contains("only allowed in an array type"),
+            "{msgs:?}"
+        );
+
+        // A bare `<>`.
+        let (_, msgs, _) = package("type m is array (<>) of bit;");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(
+            msgs[0].contains("must be preceded by an index subtype"),
+            "{msgs:?}"
+        );
+
+        // Something other than a type mark before `range <>`.
+        let (_, msgs, _) = package("type m is array (3 range <>) of bit;");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("type mark before `range <>`"), "{msgs:?}");
+
+        // Mixing unconstrained and constrained indices.
+        let (_, msgs, _) = package("type m is array (natural range <>, 0 to 3) of bit;");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("cannot mix"), "{msgs:?}");
+
+        // A box in a for-loop range.
+        let (range, diags, _, _) = for_loop_range("natural range <>");
+        assert!(matches!(range, DiscreteRange::Error(_)), "got {range:?}");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+    }
+
+    #[test]
+    fn new_type_nodes_serde_roundtrip() {
+        let (decls, msgs, _) = package(
+            "type m is array (natural range <>) of bit;
+             subtype s is (resolved) mem_t(open)(7 downto 0);",
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let json = serde_json::to_string(&decls).unwrap();
+        let back: Vec<Declaration> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            array_indices(&back[0])[0],
+            DiscreteRange::Unconstrained { .. }
+        ));
+        let ti = subtype_ind(&back[1]);
+        assert!(matches!(
+            ti.resolution,
+            Some(ResolutionIndication::Element(..))
+        ));
+        assert!(matches!(ti.constraint, Some(Constraint::Array { .. })));
+        assert_eq!(ti.span, subtype_ind(&decls[1]).span);
     }
 }

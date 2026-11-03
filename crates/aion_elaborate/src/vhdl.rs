@@ -745,6 +745,13 @@ fn collect_vhdl_expr_signals(expr: &vhdl_ast::Expr, sig_env: &SignalEnv, out: &m
                             collect_vhdl_expr_signals(a, sig_env, out);
                         }
                     }
+                    // Named association: only the actuals are read; the
+                    // formals name the callee's parameters.
+                    vhdl_ast::NameSuffix::Call(list, _) => {
+                        for a in &list.elements {
+                            collect_vhdl_expr_signals(&a.actual, sig_env, out);
+                        }
+                    }
                     vhdl_ast::NameSuffix::Attribute(_, Some(arg), _) => {
                         collect_vhdl_expr_signals(arg, sig_env, out);
                     }
@@ -974,18 +981,28 @@ fn collect_edge_calls_expr(
             if (primary_text == "rising_edge" || primary_text == "falling_edge")
                 && !name.parts.is_empty()
             {
-                if let vhdl_ast::NameSuffix::Index(args, _) = &name.parts[0] {
-                    if let Some(vhdl_ast::Expr::Name(arg_name)) = args.first() {
-                        if let Some(&sid) = sig_env.get(&arg_name.primary) {
-                            let edge = if primary_text == "rising_edge" {
-                                Edge::Posedge
-                            } else {
-                                Edge::Negedge
-                            };
-                            let already = edges.iter().any(|e| e.signal == sid);
-                            if !already {
-                                edges.push(EdgeSensitivity { signal: sid, edge });
-                            }
+                // `rising_edge(clk)` or, with named association,
+                // `rising_edge(s => clk)`. A malformed named call yields no
+                // argument here; lowering the expression reports it.
+                let arg = match &name.parts[0] {
+                    vhdl_ast::NameSuffix::Index(args, _) => args.first(),
+                    vhdl_ast::NameSuffix::Call(list, _) => {
+                        crate::expr::order_vhdl_builtin_actuals(&primary_text, list, interner)
+                            .ok()
+                            .and_then(|args| args.first().copied())
+                    }
+                    _ => None,
+                };
+                if let Some(vhdl_ast::Expr::Name(arg_name)) = arg {
+                    if let Some(&sid) = sig_env.get(&arg_name.primary) {
+                        let edge = if primary_text == "rising_edge" {
+                            Edge::Posedge
+                        } else {
+                            Edge::Negedge
+                        };
+                        let already = edges.iter().any(|e| e.signal == sid);
+                        if !already {
+                            edges.push(EdgeSensitivity { signal: sid, edge });
                         }
                     }
                 }
@@ -1275,6 +1292,7 @@ mod tests {
                     names: vec![clk],
                     mode: Some(PortMode::In),
                     ty: vhdl_ast::TypeIndication {
+                        resolution: None,
                         type_mark: vhdl_ast::SelectedName {
                             parts: vec![std_logic],
                             span: Span::DUMMY,
@@ -1343,6 +1361,7 @@ mod tests {
             decls: vec![vhdl_ast::Declaration::Signal(vhdl_ast::SignalDecl {
                 names: vec![sig],
                 ty: vhdl_ast::TypeIndication {
+                    resolution: None,
                     type_mark: vhdl_ast::SelectedName {
                         parts: vec![std_logic],
                         span: Span::DUMMY,
@@ -1634,6 +1653,63 @@ mod tests {
         assert_eq!(
             e212_snippets(&src, &diags),
             vec!["tmp'reverse_range"],
+            "{diags:?}"
+        );
+    }
+
+    // ========================================================================
+    // Named association, unconstrained arrays and resolution (issue #19)
+    // ========================================================================
+
+    #[test]
+    fn vhdl_rising_edge_with_named_association_is_sequential() {
+        let (design, _, _, diags) = elab_vhdl(
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\
+             entity t is port (clk, d : in std_logic; q : out std_logic); end entity;\n\
+             architecture rtl of t is begin\n\
+             process (clk) begin\n\
+               if rising_edge(s => clk) then q <= d; end if;\n\
+             end process;\n\
+             end architecture;",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let module = &design.modules[design.top];
+        let (_, process) = module.processes.iter().next().expect("one process");
+        assert!(matches!(process.kind, ProcessKind::Sequential));
+        assert!(
+            matches!(&process.sensitivity, Sensitivity::EdgeList(e) if matches!(e[0].edge, Edge::Posedge))
+        );
+    }
+
+    #[test]
+    fn vhdl_unconstrained_array_subtypes_give_object_ranges() {
+        let (_, _, _, diags) = elab_vhdl(&range_src(
+            "type mem_t is array (natural range <>) of std_logic_vector(7 downto 0);\n\
+             type grid_t is array (natural range <>) of std_logic_vector;\n\
+             subtype mem4_t is mem_t(0 to 3);\n\
+             subtype grid2_t is grid_t(0 to 1)(3 downto 0);\n\
+             signal r : resolved std_logic;\n\
+             begin\n\
+             process (a) begin\n\
+               for i in mem4_t'range loop null; end loop;\n\
+               for i in grid2_t'range loop null; end loop;\n\
+               y <= a(0);\n\
+             end process;",
+        ));
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // The unconstrained type itself has no index range to iterate.
+        let (_, _, src, diags) = elab_vhdl(&range_src(
+            "type mem_t is array (natural range <>) of std_logic_vector(7 downto 0);\n\
+             begin\n\
+             process (a) begin\n\
+               for i in mem_t'range loop null; end loop;\n\
+               y <= a(0);\n\
+             end process;",
+        ));
+        assert_eq!(
+            e212_snippets(&src, &diags),
+            vec!["mem_t'range"],
             "{diags:?}"
         );
     }

@@ -993,6 +993,7 @@ mod tests {
                                     names: vec![clk],
                                     mode: Some(vhdl_ast::PortMode::In),
                                     ty: vhdl_ast::TypeIndication {
+                                        resolution: None,
                                         type_mark: vhdl_ast::SelectedName {
                                             parts: vec![std_logic],
                                             span: Span::DUMMY,

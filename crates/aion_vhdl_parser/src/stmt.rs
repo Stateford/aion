@@ -276,33 +276,15 @@ impl VhdlParser<'_> {
         }
 
         self.expect(VhdlToken::RightParen);
+        self.check_association_order(&elements);
         let span = start.merge(self.prev_span());
         AssociationList { elements, span }
     }
 
     /// Parses a single association element (named or positional).
     fn parse_association_element(&mut self) -> AssociationElement {
-        let start = self.current_span();
         let expr = self.parse_expr();
-
-        if self.eat(VhdlToken::Arrow) {
-            // Named association: formal => actual
-            let actual = self.parse_expr();
-            let span = start.merge(actual.span());
-            AssociationElement {
-                formal: Some(expr),
-                actual,
-                span,
-            }
-        } else {
-            // Positional association
-            let span = expr.span();
-            AssociationElement {
-                formal: None,
-                actual: expr,
-                span,
-            }
-        }
+        self.finish_association_element(expr)
     }
 
     /// Parses a for-generate statement.
@@ -1015,50 +997,6 @@ impl VhdlParser<'_> {
             choices,
             stmts,
             span,
-        }
-    }
-
-    /// Parses a choice list: `choice { | choice }` (case alternatives and
-    /// selected assignments).
-    fn parse_choices(&mut self) -> Vec<Choice> {
-        let mut choices = Vec::new();
-        // Progress: each further iteration consumes a `|`.
-        loop {
-            choices.push(self.parse_choice());
-            if !self.eat(VhdlToken::Bar) {
-                break;
-            }
-        }
-        choices
-    }
-
-    /// Parses a single choice.
-    fn parse_choice(&mut self) -> Choice {
-        if self.at(VhdlToken::Others) {
-            let span = self.current_span();
-            self.advance();
-            Choice::Others(span)
-        } else {
-            let expr = self.parse_expr();
-            // Check for range
-            if self.at(VhdlToken::To) || self.at(VhdlToken::Downto) {
-                let direction = if self.eat(VhdlToken::To) {
-                    RangeDirection::To
-                } else {
-                    self.advance();
-                    RangeDirection::Downto
-                };
-                let right = self.parse_expr();
-                let span = expr.span().merge(right.span());
-                Choice::Range(RangeConstraint {
-                    left: Box::new(expr),
-                    direction,
-                    right: Box::new(right),
-                    span,
-                })
-            } else {
-                Choice::Expr(expr)
-            }
         }
     }
 
@@ -2094,6 +2032,65 @@ mod tests {
         assert_eq!(diags.len(), 1, "{:?}", messages(&diags));
         assert!(diags[0].message.contains("aggregate target"));
         assert_eq!(process_of(ast).len(), 2);
+    }
+
+    #[test]
+    fn case_choices_use_shared_choice_parser() {
+        let stmts = process_stmts(
+            "case s is
+                when 1 | 3 to 5 | 7 => y <= a;
+                when others => null;
+            end case;",
+        );
+        let SequentialStatement::Case(c) = &stmts[0] else {
+            panic!("expected case, got {:?}", stmts[0]);
+        };
+        assert!(matches!(
+            c.alternatives[0].choices[..],
+            [Choice::Expr(_), Choice::Range(_), Choice::Expr(_)]
+        ));
+    }
+
+    #[test]
+    fn case_others_combined_with_choices_is_rejected() {
+        let (ast, diags, _) = parse_vhdl(&process_src(
+            "case s is
+                when 1 | others => y <= a;
+            end case;
+            y <= b;",
+        ));
+        assert_eq!(diags.len(), 1, "{:?}", messages(&diags));
+        assert!(diags[0].message.contains("cannot be combined"));
+        assert_eq!(process_of(ast).len(), 2);
+
+        // A missing choice is reported without losing the alternative.
+        let (_, diags, _) = parse_vhdl(&process_src("case s is when 1 | => null; end case;"));
+        assert_eq!(diags.len(), 1, "{:?}", messages(&diags));
+        assert!(diags[0].message.contains("expected choice"));
+    }
+
+    #[test]
+    fn named_association_procedure_calls() {
+        let stmts = process_stmts("write(l, value => x);\nproc(a => open);");
+        for stmt in &stmts {
+            let SequentialStatement::ProcedureCall {
+                name: Expr::Name(n),
+                ..
+            } = stmt
+            else {
+                panic!("expected procedure call, got {stmt:?}");
+            };
+            assert!(matches!(n.parts[..], [NameSuffix::Call(..)]));
+        }
+    }
+
+    #[test]
+    fn port_map_positional_after_named_is_rejected() {
+        let stmts = arch_stmts("u0 : entity work.sub port map (clk, d => x, q => open);");
+        assert_eq!(stmts.len(), 1);
+        let (_, diags, _) = parse_vhdl(&arch_src("u0 : entity work.sub port map (d => x, clk);"));
+        assert_eq!(diags.len(), 1, "{:?}", messages(&diags));
+        assert!(diags[0].message.contains("positional association"));
     }
 
     #[test]
