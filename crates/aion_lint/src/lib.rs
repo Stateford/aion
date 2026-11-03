@@ -9,13 +9,35 @@
 //! - **W-series (warnings):** Unused signals, width mismatches, missing resets, latches
 //! - **E-series (errors):** Non-synthesizable constructs, multiple drivers, port mismatches
 //! - **C-series (conventions):** Naming violations, magic numbers, inconsistent coding style
+//!
+//! # Running the linter
+//!
+//! Rules see the elaborated design plus a [`LintContext`] carrying the
+//! session's interner (to print real signal, port and module names), the
+//! source database (for checks on comments and original spelling), and the
+//! optional target [`Architecture`](aion_arch::Architecture):
+//!
+//! ```
+//! use aion_common::Interner;
+//! use aion_diagnostics::DiagnosticSink;
+//! use aion_lint::{LintContext, LintEngine};
+//! use aion_source::SourceDb;
+//!
+//! # fn lint(design: &aion_ir::Design, interner: &Interner, sources: &SourceDb) {
+//! let ctx = LintContext::new(interner, sources);
+//! let sink = DiagnosticSink::new();
+//! LintEngine::with_defaults().run(design, &ctx, &sink);
+//! # }
+//! ```
 
 #![warn(missing_docs)]
 
+mod context;
 mod engine;
 mod helpers;
 mod rules;
 
+pub use context::{LintContext, UNKNOWN_NAME};
 pub use engine::LintEngine;
 pub use helpers::{
     check_cell_port_match, collect_expr_signals, collect_read_signals, collect_signal_ref_signals,
@@ -50,7 +72,8 @@ pub const LINT_INTERNAL_ERROR: DiagnosticCode = DiagnosticCode {
 ///
 /// Each rule has a unique diagnostic code, a human-readable name, a description,
 /// and a default severity. The `check_module` method is called for each module
-/// in the design and should emit diagnostics via the provided sink.
+/// in the design and should emit diagnostics via the provided sink. The
+/// [`LintContext`] gives access to names, source text and the target device.
 pub trait LintRule: Send + Sync {
     /// Returns the diagnostic code for this rule (e.g., W101, E104).
     fn code(&self) -> DiagnosticCode;
@@ -65,5 +88,15 @@ pub trait LintRule: Send + Sync {
     fn default_severity(&self) -> Severity;
 
     /// Checks a single module for issues and emits diagnostics to the sink.
-    fn check_module(&self, module: &Module, design: &Design, sink: &DiagnosticSink);
+    ///
+    /// `ctx` resolves the module's interned names (messages must name the
+    /// offending signal, port or module, never print raw IDs), exposes the
+    /// source text, and carries the target architecture when one is known.
+    fn check_module(
+        &self,
+        module: &Module,
+        design: &Design,
+        ctx: &LintContext<'_>,
+        sink: &DiagnosticSink,
+    );
 }

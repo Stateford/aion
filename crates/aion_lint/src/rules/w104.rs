@@ -3,7 +3,7 @@
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
 use aion_ir::{Design, Module, ProcessKind, Sensitivity, Statement};
 
-use crate::LintRule;
+use crate::{LintContext, LintRule};
 
 /// Detects sequential processes (flip-flop style) that have no reset signal
 /// in their sensitivity list or body.
@@ -29,7 +29,13 @@ impl LintRule for MissingReset {
         Severity::Warning
     }
 
-    fn check_module(&self, module: &Module, _design: &Design, sink: &DiagnosticSink) {
+    fn check_module(
+        &self,
+        module: &Module,
+        _design: &Design,
+        _ctx: &LintContext<'_>,
+        sink: &DiagnosticSink,
+    ) {
         for (_pid, process) in module.processes.iter() {
             if process.kind != ProcessKind::Sequential {
                 continue;
@@ -80,6 +86,7 @@ fn body_has_reset_pattern(stmt: &Statement) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::test_util::empty_ctx;
     use aion_common::{ContentHash, Ident, LogicVec};
     use aion_ir::*;
     use aion_source::Span;
@@ -142,7 +149,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MissingReset.check_module(design.modules.get(design.top), &design, &sink);
+        MissingReset.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, DiagnosticCode::new(Category::Warning, 104));
@@ -195,7 +202,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MissingReset.check_module(design.modules.get(design.top), &design, &sink);
+        MissingReset.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -241,7 +248,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MissingReset.check_module(design.modules.get(design.top), &design, &sink);
+        MissingReset.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -263,7 +270,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MissingReset.check_module(design.modules.get(design.top), &design, &sink);
+        MissingReset.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 }

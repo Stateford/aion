@@ -13,7 +13,7 @@
 
 use aion_config::{LintConfig, ProjectConfig};
 use aion_diagnostics::{DiagnosticRenderer, DiagnosticSink, Severity, TerminalRenderer};
-use aion_lint::LintEngine;
+use aion_lint::{LintContext, LintEngine};
 
 use crate::pipeline::{discover_source_files, parse_all_files, resolve_project_root};
 use crate::{GlobalArgs, LintArgs, ReportFormat};
@@ -67,7 +67,7 @@ pub fn run(args: &LintArgs, global: &GlobalArgs) -> Result<i32, Box<dyn std::err
     // Step 6: Merge CLI args with config lint section and run lint
     let merged_config = merge_lint_config(&config, args);
     let engine = LintEngine::new(&merged_config);
-    engine.run(&design, &sink);
+    engine.run(&design, &LintContext::new(&interner, &source_db), &sink);
 
     // Step 7: Render diagnostics
     let diagnostics = sink.diagnostics();

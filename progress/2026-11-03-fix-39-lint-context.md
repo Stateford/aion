@@ -1,0 +1,25 @@
+## 2026-11-03 — Lint: LintContext, C201/C202, W101 Reads, Named Messages (Fixes #39)
+
+- **What changed:**
+  - New `aion_lint::LintContext<'a>` (interner, `SourceDb`, optional `&dyn aion_arch::Architecture`). `LintRule::check_module(module, design, ctx, sink)` and `LintEngine::run(design, ctx, sink)` take it, following the spec's `arch: Option<&dyn Architecture>`. It has non-panicking helpers: `name`/`try_name`, `signal_name`, `signal_ref_name` (`q[7:4]`, `{a, b}`), `source_text`, `file_text_before` and `source_spelling`, which recovers the user's spelling of VHDL identifiers that the parser folds to lowercase. An unresolvable ident prints `<unknown>` (`UNKNOWN_NAME`), never a raw ID. `aion_lint` now depends on `aion_arch`, which CLAUDE.md allows.
+  - Small non-panicking APIs: `Interner::try_resolve` in `aion_common`, and `SourceDb::try_get_file` / `try_snippet` in `aion_source`.
+  - **C201** is implemented against `[lint.naming]`: `NamingViolation::new(Option<&NamingConfig>)`, kept by the engine. It checks only the categories that are configured (module, signal/port/variable, parameter, constant), uses the source spelling, ignores leading `_` and the scope prefix (`proc.var`), skips escaped identifiers, and suggests a converted name. With no config it reports nothing.
+  - **C202** is implemented from source text. A module or entity counts as documented when the first line above it is a `//`/`--` comment or the end of a `/* */` block. Blank lines, `` ` `` directives, `(* *)` attributes and VHDL `library`/`use`/`context` clauses between the comment and the declaration are skipped. `_`-prefixed modules and modules without source text are exempt. Each declaration is reported once, not once per parameter specialization (`is_duplicate_specialization`).
+  - **LINT-12 (W101):** `is_signal_read_in_module` now counts `EdgeList` and `SignalList` entries as reads, so the gated-clock and async-reset repros no longer warn. Names starting with `_` (also `proc._x`) are exempt, as the doc and help text said. For a dynamic-index write `mem[addr] <= d`, the IR target is the whole `mem`, so W101 falls back to the assignment's source text and counts the identifiers inside the LHS brackets/parens as reads. That fallback can only remove warnings, never add them.
+  - **LINT-17:** E105 names the port, the target module and the instance (`missing port connection: port `b` of module `sub` is not connected in instance `u0``) and skips a dangling module ID instead of panicking. W101, W102 and E104 name the signal. W105 lists every missing signal, sorted. W103 and W107 name the assignment target. W103/W107 now walk statements through a small checker struct, which removed W107's `#[allow(clippy::too_many_arguments)]`.
+  - Callers updated: `aion_cli lint` and `aion_conformance::finish_pipeline` build a `LintContext` (no target architecture yet). `aion_conformance` gained `full_pipeline_{verilog,vhdl}_with_config`.
+- **Tests:** about 50 new tests.
+  - `context.rs` (8): name fallback, slice/concat rendering, safe source text, VHDL spelling recovery, whole-word matching.
+  - `helpers.rs` (6): edge-list and signal-list reads, LHS operator splitting, `dynamic_index_reads`, specialization detection.
+  - C201 (8), C202 (11) and E105 (4), including the raw-ID and dangling-ID cases.
+  - W101 (4) covering the issue repros: `_unused`, gclk, `mem[addr]`.
+  - W102 (2), E104 (1), W105 (3), W103 (3) and W107 (2) message tests.
+  - `Interner::try_resolve` (2) and `SourceDb::try_get_file`/`try_snippet` (3).
+  - `lint_detection.rs` gets 15 pipeline tests for the repros, C201 with and without `[lint.naming]`, VHDL spelling, and C202 for Verilog, VHDL and parameterized modules. The two C20x "stub" tests were replaced.
+  - 2 conformance-lib tests.
+- **Checks:** `cargo test` passes for `aion_lint`, `aion_conformance`, `aion_cli`, `aion_common` and `aion_source`. `cargo clippy --all-targets -D warnings` is clean for those crates, and `cargo build --workspace --all-targets` builds.
+- **Decisions / known gaps:**
+  - The dynamic-index read reconstructs reads from source text because AionIR has no dynamic-index target. A proper fix needs a new `SignalRef` variant and touches elaborate, sim and synth, which is out of scope here.
+  - Naming checks are opt-in, so the PRD defaults are not applied without `[lint.naming]`. The PRD's TOML example (`"UPPER_SNAKE_CASE"`) does not deserialize, because the config expects `upper_snake_case`.
+  - No vendor rule uses `ctx.arch()` yet, and `aion lint` passes no architecture.
+- **Phase progress:** Phase 3 status unchanged. All 15 built-in lint rules are now implemented; there are no stubs left.

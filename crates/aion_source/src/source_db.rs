@@ -47,6 +47,25 @@ impl SourceDb {
         &self.files[id.as_raw() as usize]
     }
 
+    /// Returns the [`SourceFile`] for the given [`FileId`], or `None` if the
+    /// ID does not belong to this database (e.g. [`FileId::DUMMY`]).
+    pub fn try_get_file(&self, id: FileId) -> Option<&SourceFile> {
+        self.files.get(id.as_raw() as usize)
+    }
+
+    /// Returns the source text covered by `span`, or `None` if the span's
+    /// file is unknown, its range lies outside the file, is reversed, or does
+    /// not fall on UTF-8 character boundaries.
+    ///
+    /// This is the non-panicking counterpart of [`SourceDb::snippet`], for
+    /// analyses (such as lint rules) that inspect source text and must not
+    /// crash on a synthesized or stale span.
+    pub fn try_snippet(&self, span: Span) -> Option<&str> {
+        self.try_get_file(span.file)?
+            .content
+            .get(span.start as usize..span.end as usize)
+    }
+
     /// Resolves a [`Span`] to human-readable line/column coordinates.
     pub fn resolve_span(&self, span: Span) -> ResolvedSpan {
         let file = self.get_file(span.file);
@@ -105,6 +124,36 @@ mod tests {
         let id = db.add_source("test.vhd", "hello world".to_string());
         let span = Span::new(id, 0, 5);
         assert_eq!(db.snippet(span), "hello");
+    }
+
+    #[test]
+    fn try_get_file_valid_and_invalid() {
+        let mut db = SourceDb::new();
+        let id = db.add_source("a.v", "module a; endmodule".to_string());
+        assert_eq!(db.try_get_file(id).map(|f| f.id), Some(id));
+        assert!(db.try_get_file(FileId::from_raw(5)).is_none());
+        assert!(db.try_get_file(FileId::DUMMY).is_none());
+    }
+
+    #[test]
+    fn try_snippet_valid_range() {
+        let mut db = SourceDb::new();
+        let id = db.add_source("t.v", "hello world".to_string());
+        assert_eq!(db.try_snippet(Span::new(id, 6, 11)), Some("world"));
+    }
+
+    #[test]
+    fn try_snippet_rejects_bad_spans() {
+        let mut db = SourceDb::new();
+        let id = db.add_source("t.v", "h\u{e9}llo".to_string());
+        // Past the end of the file.
+        assert_eq!(db.try_snippet(Span::new(id, 0, 99)), None);
+        // Reversed range.
+        assert_eq!(db.try_snippet(Span::new(id, 3, 1)), None);
+        // Splits the two-byte `\u{e9}`.
+        assert_eq!(db.try_snippet(Span::new(id, 0, 2)), None);
+        // Unknown file.
+        assert_eq!(db.try_snippet(Span::DUMMY), None);
     }
 
     #[test]

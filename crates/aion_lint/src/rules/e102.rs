@@ -3,7 +3,7 @@
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
 use aion_ir::{Design, Module, ProcessKind, Statement};
 
-use crate::LintRule;
+use crate::{LintContext, LintRule};
 
 /// Detects non-synthesizable constructs in the design.
 ///
@@ -29,7 +29,13 @@ impl LintRule for NonSynthesizable {
         Severity::Error
     }
 
-    fn check_module(&self, module: &Module, _design: &Design, sink: &DiagnosticSink) {
+    fn check_module(
+        &self,
+        module: &Module,
+        _design: &Design,
+        _ctx: &LintContext<'_>,
+        sink: &DiagnosticSink,
+    ) {
         for (_pid, process) in module.processes.iter() {
             // Initial processes are simulation-only
             if process.kind == ProcessKind::Initial {
@@ -104,6 +110,7 @@ fn check_non_synth_stmts(stmt: &Statement, code: DiagnosticCode, sink: &Diagnost
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::test_util::empty_ctx;
     use aion_common::{ContentHash, Ident, LogicVec};
     use aion_ir::*;
     use aion_source::Span;
@@ -153,7 +160,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        NonSynthesizable.check_module(design.modules.get(design.top), &design, &sink);
+        NonSynthesizable.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Severity::Error);
@@ -176,7 +183,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        NonSynthesizable.check_module(design.modules.get(design.top), &design, &sink);
+        NonSynthesizable.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("wait"));
@@ -202,7 +209,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        NonSynthesizable.check_module(design.modules.get(design.top), &design, &sink);
+        NonSynthesizable.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("$display"));
@@ -226,7 +233,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        NonSynthesizable.check_module(design.modules.get(design.top), &design, &sink);
+        NonSynthesizable.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 }

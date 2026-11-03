@@ -41,8 +41,11 @@ use crate::LintEngine;
 
 /// Registers all 15 built-in lint rules with the engine.
 ///
-/// This adds rules W101-W108, E102/E104/E105, and C201-C204.
+/// This adds rules W101-W108, E102/E104/E105, and C201-C204. The C201 rule
+/// uses the naming conventions from the `LintConfig` the engine was created
+/// with.
 pub fn register_builtin_rules(engine: &mut LintEngine) {
+    let naming = engine.naming;
     engine.register(Box::new(UnusedSignal));
     engine.register(Box::new(UndrivenSignal));
     engine.register(Box::new(WidthMismatch));
@@ -54,7 +57,7 @@ pub fn register_builtin_rules(engine: &mut LintEngine) {
     engine.register(Box::new(NonSynthesizable));
     engine.register(Box::new(MultipleDrivers));
     engine.register(Box::new(PortMismatch));
-    engine.register(Box::new(NamingViolation));
+    engine.register(Box::new(naming));
     engine.register(Box::new(MissingDoc));
     engine.register(Box::new(MagicNumber));
     engine.register(Box::new(InconsistentStyle));

@@ -1,10 +1,11 @@
 //! W103: Width mismatch — LHS and RHS of assignment have different bit widths.
 
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
-use aion_ir::{Design, Module, Statement};
+use aion_ir::{Design, Expr, Module, SignalRef, Statement};
+use aion_source::Span;
 
 use crate::helpers::{expr_width, signal_ref_width};
-use crate::LintRule;
+use crate::{LintContext, LintRule};
 
 /// Detects assignments where the LHS and RHS have different bit widths.
 ///
@@ -31,91 +32,107 @@ impl LintRule for WidthMismatch {
         Severity::Warning
     }
 
-    fn check_module(&self, module: &Module, design: &Design, sink: &DiagnosticSink) {
+    fn check_module(
+        &self,
+        module: &Module,
+        design: &Design,
+        ctx: &LintContext<'_>,
+        sink: &DiagnosticSink,
+    ) {
+        let checker = WidthChecker {
+            module,
+            design,
+            ctx,
+            code: self.code(),
+            sink,
+        };
+
         // Check continuous assignments
         for assign in &module.assignments {
-            let lhs_width = signal_ref_width(&assign.target, module, design);
-            let rhs_width = expr_width(&assign.value, design);
-            if let (Some(lw), Some(rw)) = (lhs_width, rhs_width) {
-                if lw != rw {
-                    sink.emit(
-                        Diagnostic::warning(
-                            self.code(),
-                            format!("width mismatch: LHS is {lw} bits, RHS is {rw} bits"),
-                            assign.span,
-                        )
-                        .with_label(Label::primary(assign.span, "mismatched widths")),
-                    );
-                }
-            }
+            checker.check_assign(&assign.target, &assign.value, assign.span);
         }
 
         // Check assignments in processes
         for (_pid, process) in module.processes.iter() {
-            check_stmt_widths(&process.body, module, design, self.code(), sink);
+            checker.check_stmt(&process.body);
         }
     }
 }
 
-fn check_stmt_widths(
-    stmt: &Statement,
-    module: &Module,
-    design: &Design,
+/// The per-module state W103 needs while walking assignments.
+struct WidthChecker<'m, 'c> {
+    module: &'m Module,
+    design: &'m Design,
+    ctx: &'m LintContext<'c>,
     code: DiagnosticCode,
-    sink: &DiagnosticSink,
-) {
-    match stmt {
-        Statement::Assign {
-            target,
-            value,
-            span,
-            ..
-        } => {
-            let lhs_width = signal_ref_width(target, module, design);
-            let rhs_width = expr_width(value, design);
-            if let (Some(lw), Some(rw)) = (lhs_width, rhs_width) {
-                if lw != rw {
-                    sink.emit(
-                        Diagnostic::warning(
-                            code,
-                            format!("width mismatch: LHS is {lw} bits, RHS is {rw} bits"),
-                            *span,
-                        )
-                        .with_label(Label::primary(*span, "mismatched widths")),
-                    );
+    sink: &'m DiagnosticSink,
+}
+
+impl WidthChecker<'_, '_> {
+    /// Reports `target = value` if both widths are known and differ.
+    fn check_assign(&self, target: &SignalRef, value: &Expr, span: Span) {
+        let lhs_width = signal_ref_width(target, self.module, self.design);
+        let rhs_width = expr_width(value, self.design);
+        if let (Some(lw), Some(rw)) = (lhs_width, rhs_width) {
+            if lw != rw {
+                let target_desc = self
+                    .ctx
+                    .signal_ref_name(self.module, target)
+                    .map(|n| format!(" in assignment to `{n}`"))
+                    .unwrap_or_default();
+                self.sink.emit(
+                    Diagnostic::warning(
+                        self.code,
+                        format!("width mismatch{target_desc}: LHS is {lw} bits, RHS is {rw} bits"),
+                        span,
+                    )
+                    .with_label(Label::primary(span, "mismatched widths")),
+                );
+            }
+        }
+    }
+
+    /// Checks every assignment nested in `stmt`.
+    fn check_stmt(&self, stmt: &Statement) {
+        match stmt {
+            Statement::Assign {
+                target,
+                value,
+                span,
+                ..
+            } => self.check_assign(target, value, *span),
+            Statement::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.check_stmt(then_body);
+                if let Some(else_b) = else_body {
+                    self.check_stmt(else_b);
                 }
             }
-        }
-        Statement::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            check_stmt_widths(then_body, module, design, code, sink);
-            if let Some(else_b) = else_body {
-                check_stmt_widths(else_b, module, design, code, sink);
+            Statement::Case { arms, default, .. } => {
+                for arm in arms {
+                    self.check_stmt(&arm.body);
+                }
+                if let Some(def) = default {
+                    self.check_stmt(def);
+                }
             }
-        }
-        Statement::Case { arms, default, .. } => {
-            for arm in arms {
-                check_stmt_widths(&arm.body, module, design, code, sink);
+            Statement::Block { stmts, .. } => {
+                for s in stmts {
+                    self.check_stmt(s);
+                }
             }
-            if let Some(def) = default {
-                check_stmt_widths(def, module, design, code, sink);
-            }
+            _ => {}
         }
-        Statement::Block { stmts, .. } => {
-            for s in stmts {
-                check_stmt_widths(s, module, design, code, sink);
-            }
-        }
-        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::test_util::empty_ctx;
     use aion_common::{ContentHash, Ident, LogicVec};
     use aion_ir::*;
     use aion_source::Span;
@@ -173,7 +190,7 @@ mod tests {
         });
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("8 bits"));
@@ -203,7 +220,7 @@ mod tests {
         });
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -238,7 +255,7 @@ mod tests {
         });
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
     }
@@ -269,7 +286,7 @@ mod tests {
         });
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(
             sink.take_all().is_empty(),
             "1-bit all-zero should not trigger W103 (context-dependent width)"
@@ -300,7 +317,7 @@ mod tests {
         });
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(
             sink.take_all().is_empty(),
             "1-bit all-one should not trigger W103 (context-dependent width)"
@@ -331,7 +348,7 @@ mod tests {
         });
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(
             diags.len(),
@@ -371,7 +388,7 @@ mod tests {
     fn run_rule(module: Module, types: TypeDb) -> Vec<aion_diagnostics::Diagnostic> {
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        WidthMismatch.check_module(design.modules.get(design.top), &design, &sink);
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         sink.take_all()
     }
 
@@ -471,5 +488,70 @@ mod tests {
             span: Span::DUMMY,
         });
         assert!(run_rule(module, types).is_empty());
+    }
+
+    // ---- Target names in messages (issue #39) ----
+
+    fn run_named(target: impl Fn(SignalId) -> SignalRef) -> Vec<aion_diagnostics::Diagnostic> {
+        let interner = aion_common::Interner::new();
+        let db = aion_source::SourceDb::new();
+        let (mut module, mut types) = mk_module_with_types();
+        let ty8 = types.intern(Type::BitVec {
+            width: 8,
+            signed: false,
+        });
+        let sig_id = module.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: interner.get_or_intern("result"),
+            ty: ty8,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        module.assignments.push(Assignment {
+            target: target(sig_id),
+            value: Expr::Literal(LogicVec::from_u64(0x5, 3)),
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module, types);
+        let sink = DiagnosticSink::new();
+        let ctx = LintContext::new(&interner, &db);
+        WidthMismatch.check_module(design.modules.get(design.top), &design, &ctx, &sink);
+        sink.take_all()
+    }
+
+    #[test]
+    fn message_names_the_target_signal() {
+        let diags = run_named(SignalRef::Signal);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "width mismatch in assignment to `result`: LHS is 8 bits, RHS is 3 bits"
+        );
+    }
+
+    #[test]
+    fn message_names_a_slice_target() {
+        let diags = run_named(|s| SignalRef::Slice {
+            signal: s,
+            high: 7,
+            low: 4,
+        });
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "width mismatch in assignment to `result[7:4]`: LHS is 4 bits, RHS is 3 bits"
+        );
+    }
+
+    #[test]
+    fn constant_target_has_no_name_clause() {
+        let diags = run_named(|_| SignalRef::Const(LogicVec::all_zero(8)));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "width mismatch: LHS is 8 bits, RHS is 3 bits"
+        );
     }
 }

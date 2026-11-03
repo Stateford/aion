@@ -3,7 +3,7 @@
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
 use aion_ir::{Design, Expr, Module, Statement};
 
-use crate::LintRule;
+use crate::{LintContext, LintRule};
 
 /// Detects dead logic: code after `$finish`, or `if`/`case` with
 /// always-true or always-false literal conditions.
@@ -28,7 +28,13 @@ impl LintRule for DeadLogic {
         Severity::Warning
     }
 
-    fn check_module(&self, module: &Module, _design: &Design, sink: &DiagnosticSink) {
+    fn check_module(
+        &self,
+        module: &Module,
+        _design: &Design,
+        _ctx: &LintContext<'_>,
+        sink: &DiagnosticSink,
+    ) {
         for (_pid, process) in module.processes.iter() {
             check_dead_logic(&process.body, self.code(), sink);
         }
@@ -126,6 +132,7 @@ fn is_literal_bool(expr: &Expr) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::test_util::empty_ctx;
     use aion_common::{ContentHash, Ident, LogicVec};
     use aion_ir::*;
     use aion_source::Span;
@@ -181,7 +188,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        DeadLogic.check_module(design.modules.get(design.top), &design, &sink);
+        DeadLogic.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("dead logic after $finish"));
@@ -210,7 +217,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        DeadLogic.check_module(design.modules.get(design.top), &design, &sink);
+        DeadLogic.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("always true"));
@@ -239,7 +246,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        DeadLogic.check_module(design.modules.get(design.top), &design, &sink);
+        DeadLogic.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("always false"));
@@ -263,7 +270,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        DeadLogic.check_module(design.modules.get(design.top), &design, &sink);
+        DeadLogic.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -295,7 +302,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        DeadLogic.check_module(design.modules.get(design.top), &design, &sink);
+        DeadLogic.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 }

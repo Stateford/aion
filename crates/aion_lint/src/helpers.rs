@@ -14,9 +14,13 @@ use std::collections::HashSet;
 
 use aion_ir::ids::TypeId;
 use aion_ir::{
-    CellKind, Connection, Design, Expr, Module, PortDirection, SignalId, SignalRef, Statement,
-    Type, TypeDb,
+    CellKind, Connection, Design, Expr, Module, PortDirection, Sensitivity, SignalId, SignalRef,
+    Statement, Type, TypeDb,
 };
+use aion_source::Span;
+
+use crate::context::is_ident_byte;
+use crate::LintContext;
 
 /// Collects all `SignalId`s referenced (read) in a signal reference.
 ///
@@ -63,8 +67,10 @@ pub fn collect_written_signals(stmt: &Statement) -> HashSet<SignalId> {
 
 /// Returns true if the given signal is read anywhere in the module.
 ///
-/// Checks continuous assignments (RHS), process bodies, and cell connections
-/// where the signal appears as an input.
+/// Checks continuous assignments (RHS), process bodies, process sensitivity
+/// lists (a signal used only as a clock or asynchronous reset in
+/// `@(posedge gclk)`, or listed in a VHDL `process (a, b)`, is still read),
+/// and cell connections where the signal appears as an input.
 pub fn is_signal_read_in_module(module: &Module, signal_id: SignalId) -> bool {
     // Check continuous assignment RHS
     for assign in &module.assignments {
@@ -73,9 +79,14 @@ pub fn is_signal_read_in_module(module: &Module, signal_id: SignalId) -> bool {
         }
     }
 
-    // Check process bodies
+    // Check process bodies and sensitivity lists
     for (_pid, process) in module.processes.iter() {
-        if collect_read_signals(&process.body).contains(&signal_id) {
+        let in_sensitivity = match &process.sensitivity {
+            Sensitivity::All => false,
+            Sensitivity::EdgeList(edges) => edges.iter().any(|e| e.signal == signal_id),
+            Sensitivity::SignalList(signals) => signals.contains(&signal_id),
+        };
+        if in_sensitivity || collect_read_signals(&process.body).contains(&signal_id) {
             return true;
         }
     }
@@ -385,6 +396,164 @@ pub fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
             _ => None,
         },
     }
+}
+
+/// Returns true if `module` is a second (or later) parameter specialization
+/// of the same source declaration as an earlier module in `design`.
+///
+/// Elaboration creates one IR module per distinct parameterization, and all
+/// of them share the declaration's name and span. Rules that check the
+/// declaration itself (its name, its doc comment) use this to report once per
+/// declaration rather than once per specialization.
+pub(crate) fn is_duplicate_specialization(module: &Module, design: &Design) -> bool {
+    if module.span.is_dummy() {
+        return false;
+    }
+    design
+        .modules
+        .values()
+        .find(|m| m.name == module.name && m.span == module.span)
+        .is_some_and(|first| !std::ptr::eq(first, module))
+}
+
+/// Returns the lowercased identifiers that appear inside an index on the
+/// left-hand side of an assignment whose IR target lost that index.
+///
+/// AionIR has no dynamic-index target: elaboration lowers `mem[addr] <= d`
+/// (Verilog) or `mem(addr) <= d` (VHDL) to a whole-signal target, so `addr`
+/// disappears from the IR even though the assignment reads it. For every
+/// assignment whose target contains a whole-signal reference, this inspects
+/// the source text of the statement, takes the part before the assignment
+/// operator, and collects the identifiers written inside `[...]` or `(...)`.
+///
+/// The result is only used to *suppress* unused-signal warnings (W101), so
+/// an over-approximation (e.g. a function name inside the index) is harmless.
+/// Assignments without source text contribute nothing.
+pub(crate) fn dynamic_index_reads(module: &Module, ctx: &LintContext<'_>) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for assign in &module.assignments {
+        add_dynamic_index_reads(&assign.target, assign.span, ctx, &mut names);
+    }
+    for (_pid, process) in module.processes.iter() {
+        for_each_assign(&process.body, &mut |target, span| {
+            add_dynamic_index_reads(target, span, ctx, &mut names);
+        });
+    }
+    names
+}
+
+/// Calls `f` with the target and span of every `Assign` in `stmt`.
+fn for_each_assign(stmt: &Statement, f: &mut dyn FnMut(&SignalRef, Span)) {
+    match stmt {
+        Statement::Assign { target, span, .. } => f(target, *span),
+        Statement::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for_each_assign(then_body, f);
+            if let Some(e) = else_body {
+                for_each_assign(e, f);
+            }
+        }
+        Statement::Case { arms, default, .. } => {
+            for arm in arms {
+                for_each_assign(&arm.body, f);
+            }
+            if let Some(d) = default {
+                for_each_assign(d, f);
+            }
+        }
+        Statement::Block { stmts, .. } => {
+            for s in stmts {
+                for_each_assign(s, f);
+            }
+        }
+        Statement::Delay { body, .. } | Statement::Forever { body, .. } => {
+            for_each_assign(body, f);
+        }
+        Statement::Wait { .. }
+        | Statement::Assertion { .. }
+        | Statement::Display { .. }
+        | Statement::Finish { .. }
+        | Statement::Nop => {}
+    }
+}
+
+/// Returns true if `sref` is, or contains, a whole-signal reference — the
+/// form a dynamically indexed target is lowered to.
+fn has_whole_signal(sref: &SignalRef) -> bool {
+    match sref {
+        SignalRef::Signal(_) => true,
+        SignalRef::Concat(parts) => parts.iter().any(has_whole_signal),
+        SignalRef::Slice { .. } | SignalRef::Const(_) => false,
+    }
+}
+
+fn add_dynamic_index_reads(
+    target: &SignalRef,
+    span: Span,
+    ctx: &LintContext<'_>,
+    names: &mut HashSet<String>,
+) {
+    if !has_whole_signal(target) {
+        return;
+    }
+    let Some(text) = ctx.source_text(span) else {
+        return;
+    };
+    let lhs = assignment_lhs(text);
+    let bytes = lhs.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'[' | b'(' | b'{' => depth += 1,
+            b']' | b')' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth > 0 && is_ident_start(b) && (i == 0 || !is_ident_byte(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            names.insert(lhs[start..i].to_ascii_lowercase());
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Returns true if `b` can start an HDL identifier.
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+/// Returns the text before the first assignment operator (`<=`, `:=`, or a
+/// lone `=`) that is not nested inside brackets, or all of `text` if there
+/// is none.
+fn assignment_lhs(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' | b'(' | b'{' => depth += 1,
+            b']' | b')' | b'}' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            b'<' | b':' if bytes.get(i + 1) == Some(&b'=') => return &text[..i],
+            b'=' => {
+                let prev = i.checked_sub(1).map(|p| bytes[p]);
+                let next = bytes.get(i + 1).copied();
+                let prev_is_op = matches!(prev, Some(b'<' | b'>' | b'!' | b'=' | b':'));
+                if !prev_is_op && next != Some(b'=') {
+                    return &text[..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    text
 }
 
 // ---- Internal helpers ----
@@ -1254,5 +1423,183 @@ mod tests {
             span: dummy_span(),
         };
         assert_eq!(expr_width(&idx, &design), Some(1));
+    }
+
+    // ---- Sensitivity lists, dynamic indices, specializations (issue #39) ----
+
+    fn add_wire(module: &mut Module, raw_name: u32) -> SignalId {
+        let id = SignalId::from_raw(module.signals.len() as u32);
+        module.signals.alloc(Signal {
+            id,
+            name: Ident::from_raw(raw_name),
+            ty: TypeId::from_raw(0),
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: dummy_span(),
+        })
+    }
+
+    fn add_process(module: &mut Module, sensitivity: Sensitivity, body: Statement) {
+        module.processes.alloc(Process {
+            id: ProcessId::from_raw(module.processes.len() as u32),
+            name: None,
+            kind: ProcessKind::Sequential,
+            body,
+            sensitivity,
+            span: dummy_span(),
+        });
+    }
+
+    #[test]
+    fn edge_list_signal_counts_as_read() {
+        // `always @(posedge gclk) q <= d;` — gclk only appears in the edge list.
+        let mut module = mk_module();
+        let gclk = add_wire(&mut module, 0);
+        let q = add_wire(&mut module, 1);
+        let d = add_wire(&mut module, 2);
+        let unrelated = add_wire(&mut module, 3);
+        add_process(
+            &mut module,
+            Sensitivity::EdgeList(vec![EdgeSensitivity {
+                signal: gclk,
+                edge: Edge::Posedge,
+            }]),
+            Statement::Assign {
+                target: SignalRef::Signal(q),
+                value: mk_signal_expr(d),
+                kind: AssignKind::NonBlocking,
+                span: dummy_span(),
+            },
+        );
+        assert!(is_signal_read_in_module(&module, gclk));
+        assert!(is_signal_read_in_module(&module, d));
+        assert!(!is_signal_read_in_module(&module, q));
+        assert!(!is_signal_read_in_module(&module, unrelated));
+    }
+
+    #[test]
+    fn signal_list_entry_counts_as_read_but_all_does_not() {
+        let mut module = mk_module();
+        let a = add_wire(&mut module, 0);
+        let b = add_wire(&mut module, 1);
+        add_process(
+            &mut module,
+            Sensitivity::SignalList(vec![a]),
+            Statement::Nop,
+        );
+        add_process(&mut module, Sensitivity::All, Statement::Nop);
+        assert!(is_signal_read_in_module(&module, a));
+        assert!(!is_signal_read_in_module(&module, b));
+    }
+
+    #[test]
+    fn assignment_lhs_finds_top_level_operator() {
+        assert_eq!(assignment_lhs("mem[addr] <= d;"), "mem[addr] ");
+        assert_eq!(assignment_lhs("mem[a <= b] <= d;"), "mem[a <= b] ");
+        assert_eq!(assignment_lhs("assign y[i] = a == b;"), "assign y[i] ");
+        assert_eq!(assignment_lhs("v(idx) := x;"), "v(idx) ");
+        assert_eq!(assignment_lhs("cnt[k] += 1;"), "cnt[k] +");
+        assert_eq!(assignment_lhs("no operator"), "no operator");
+        assert_eq!(assignment_lhs(""), "");
+    }
+
+    #[test]
+    fn dynamic_index_reads_from_source_text() {
+        use aion_common::Interner;
+        use aion_source::SourceDb;
+
+        let interner = Interner::new();
+        let mut db = SourceDb::new();
+        let text = "mem[Addr + off] <= d;  q[3] <= e;  mem <= x[sel];";
+        let fid = db.add_source("t.v", text.to_string());
+        let span_of = |s: &str| {
+            let start = text.find(s).unwrap() as u32;
+            Span::new(fid, start, start + s.len() as u32)
+        };
+
+        let mut module = mk_module();
+        let mem = add_wire(&mut module, 0);
+        let q = add_wire(&mut module, 1);
+        let body = Statement::Block {
+            stmts: vec![
+                // Dynamic index lowered to a whole-signal target.
+                Statement::Assign {
+                    target: SignalRef::Signal(mem),
+                    value: Expr::Literal(LogicVec::all_zero(1)),
+                    kind: AssignKind::NonBlocking,
+                    span: span_of("mem[Addr + off] <= d;"),
+                },
+                // Constant index kept as a slice: nothing lost, nothing added.
+                Statement::Assign {
+                    target: SignalRef::Slice {
+                        signal: q,
+                        high: 3,
+                        low: 3,
+                    },
+                    value: Expr::Literal(LogicVec::all_zero(1)),
+                    kind: AssignKind::NonBlocking,
+                    span: span_of("q[3] <= e;"),
+                },
+                // Index on the RHS only: not part of the LHS.
+                Statement::Assign {
+                    target: SignalRef::Signal(mem),
+                    value: Expr::Literal(LogicVec::all_zero(1)),
+                    kind: AssignKind::NonBlocking,
+                    span: span_of("mem <= x[sel];"),
+                },
+                // No source text: ignored.
+                Statement::Assign {
+                    target: SignalRef::Signal(mem),
+                    value: Expr::Literal(LogicVec::all_zero(1)),
+                    kind: AssignKind::NonBlocking,
+                    span: dummy_span(),
+                },
+            ],
+            span: dummy_span(),
+        };
+        add_process(&mut module, Sensitivity::All, body);
+
+        let ctx = LintContext::new(&interner, &db);
+        let names = dynamic_index_reads(&module, &ctx);
+        let mut sorted: Vec<_> = names.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec!["addr".to_string(), "off".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_specialization_detection() {
+        let mut first = mk_module();
+        first.span = Span::new(aion_source::FileId::from_raw(0), 0, 10);
+        let second = first.clone();
+        let mut other = mk_module();
+        other.name = Ident::from_raw(5);
+        other.span = Span::new(aion_source::FileId::from_raw(0), 20, 30);
+        let mut modules = Arena::new();
+        let a = modules.alloc(first);
+        let b = modules.alloc(second);
+        let c = modules.alloc(other);
+        let design = mk_design_from_arena(modules, a);
+        assert!(!is_duplicate_specialization(design.modules.get(a), &design));
+        assert!(is_duplicate_specialization(design.modules.get(b), &design));
+        assert!(!is_duplicate_specialization(design.modules.get(c), &design));
+    }
+
+    #[test]
+    fn dummy_span_modules_are_never_duplicates() {
+        let mut modules = Arena::new();
+        let a = modules.alloc(mk_module());
+        let b = modules.alloc(mk_module());
+        let design = mk_design_from_arena(modules, a);
+        assert!(!is_duplicate_specialization(design.modules.get(b), &design));
+    }
+
+    fn mk_design_from_arena(modules: Arena<ModuleId, Module>, top: ModuleId) -> Design {
+        Design {
+            modules,
+            top,
+            types: TypeDb::new(),
+            source_map: SourceMap::new(),
+        }
     }
 }

@@ -68,6 +68,17 @@ impl Interner {
     pub fn resolve(&self, ident: Ident) -> &str {
         self.rodeo.resolve(&ident)
     }
+
+    /// Resolves an [`Ident`] back to its string value without panicking.
+    ///
+    /// Returns `None` when `ident` was not created by this interner (for
+    /// example an ID deserialized from another session, or one built with
+    /// [`Ident::from_raw`] in a test). Consumers that must never panic on a
+    /// stale or foreign ID, such as lint rules formatting messages, use this
+    /// instead of [`Interner::resolve`].
+    pub fn try_resolve(&self, ident: Ident) -> Option<&str> {
+        self.rodeo.try_resolve(&ident)
+    }
 }
 
 impl Default for Interner {
@@ -101,6 +112,20 @@ mod tests {
         let a = interner.get_or_intern("foo");
         let b = interner.get_or_intern("bar");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn try_resolve_known_ident() {
+        let interner = Interner::new();
+        let id = interner.get_or_intern("clk");
+        assert_eq!(interner.try_resolve(id), Some("clk"));
+    }
+
+    #[test]
+    fn try_resolve_foreign_ident_is_none() {
+        let interner = Interner::new();
+        interner.get_or_intern("only_one");
+        assert_eq!(interner.try_resolve(Ident::from_raw(7)), None);
     }
 
     #[test]
