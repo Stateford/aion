@@ -49,8 +49,16 @@ pub enum BinaryOp {
     Xor,
     /// Left shift (`<<` / `sll`).
     Shl,
-    /// Right shift (`>>` / `srl`).
+    /// Logical right shift (`>>` / `srl`): the vacated high bits are
+    /// filled with zeros.
     Shr,
+    /// Arithmetic right shift (Verilog/SystemVerilog `>>>`, IEEE 1364-2005
+    /// 5.1.12). When the left operand is signed the vacated high bits are
+    /// filled with copies of its sign (most significant) bit; when it is
+    /// unsigned this is identical to [`BinaryOp::Shr`]. The right operand
+    /// (the shift amount) is always treated as unsigned. (`<<<` needs no
+    /// variant: it is identical to [`BinaryOp::Shl`].)
+    AShr,
     /// Equality (`==` / `=`).
     Eq,
     /// Inequality (`!=` / `/=`).
@@ -325,6 +333,7 @@ mod tests {
             BinaryOp::Xor,
             BinaryOp::Shl,
             BinaryOp::Shr,
+            BinaryOp::AShr,
             BinaryOp::Eq,
             BinaryOp::Ne,
             BinaryOp::Lt,

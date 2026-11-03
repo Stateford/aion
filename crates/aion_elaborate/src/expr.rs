@@ -17,6 +17,7 @@ use aion_source::{SourceDb, Span};
 
 use crate::const_eval::{self, ConstEnv};
 use crate::errors;
+use crate::vhdl_aggregate::AggregateContext;
 
 /// Name-resolution scope for expression lowering within one module.
 ///
@@ -38,6 +39,10 @@ pub struct SignalEnv {
     consts: ConstEnv,
     /// Bit width of each constant when lowered to a literal.
     const_widths: HashMap<Ident, u32>,
+    /// The shape (width and, for a one-dimensional array of bits, index
+    /// range) of each VHDL object of known width, used to lay out
+    /// aggregates assigned to it.
+    aggregate_contexts: HashMap<SignalId, AggregateContext>,
 }
 
 impl SignalEnv {
@@ -66,6 +71,21 @@ impl SignalEnv {
     pub fn insert_const(&mut self, name: Ident, value: ConstValue, width: u32) {
         self.consts.insert(name, value);
         self.const_widths.insert(name, width.max(1));
+    }
+
+    /// Records the shape of the VHDL object `sid` (its bit width and, for a
+    /// one-dimensional array of single bits, its declared index range), so
+    /// that aggregates assigned to it can be laid out (see
+    /// [`crate::vhdl_aggregate`]).
+    pub fn insert_aggregate_context(&mut self, sid: SignalId, ctx: AggregateContext) {
+        self.aggregate_contexts.insert(sid, ctx);
+    }
+
+    /// Returns the shape recorded for `sid` with
+    /// [`SignalEnv::insert_aggregate_context`], or `None` if none was
+    /// recorded (a VHDL object of unknown width, or a Verilog/SV signal).
+    pub fn aggregate_context(&self, sid: SignalId) -> Option<AggregateContext> {
+        self.aggregate_contexts.get(&sid).copied()
     }
 
     /// Returns every constant in scope, for use with the constant evaluator
@@ -929,23 +949,18 @@ pub fn lower_vhdl_expr(
         }
         Expr::Paren { inner, .. } => lower_vhdl_expr(inner, sig_env, source_db, interner, sink),
         Expr::Aggregate { elements, span } => {
-            // Choice lists (`1 | 3 => ...`) and range choices
-            // (`7 downto 4 => ...`) select element positions, which a
-            // value concatenation cannot express: reject them rather than
-            // build hardware with the wrong bit layout.
-            if elements.iter().any(|e| {
-                e.choices.len() > 1
-                    || e.choices
-                        .iter()
-                        .any(|c| matches!(c, aion_vhdl_parser::ast::Choice::Range(_)))
-            }) {
-                sink.emit(errors::error_unsupported(
-                    "aggregate with `|` or range choices in an expression",
-                    *span,
-                ));
-                return poison(*span);
+            // Named and `others` choices select element positions in an
+            // index range that only the context (an assignment target or a
+            // declared subtype) provides; none is known here, so they are
+            // rejected rather than guessed. Assignments lower their value
+            // with `lower_vhdl_assign_value`, which supplies the range.
+            if elements.iter().any(|e| !e.choices.is_empty()) {
+                return crate::vhdl_aggregate::lower_vhdl_aggregate(
+                    elements, *span, None, sig_env, source_db, interner, sink,
+                );
             }
-            // Lower aggregate elements as a concat
+            // A positional aggregate is its elements left to right (the
+            // first is the MSB), exactly like a concatenation.
             let parts: Vec<_> = elements
                 .iter()
                 .map(|e| lower_vhdl_expr(&e.value, sig_env, source_db, interner, sink))
@@ -1693,7 +1708,8 @@ fn map_verilog_binary_op(op: aion_verilog_parser::ast::BinaryOp) -> BinaryOp {
         V::BitOr => BinaryOp::Or,
         V::BitXor | V::BitXnor => BinaryOp::Xor,
         V::Shl | V::AShl => BinaryOp::Shl,
-        V::Shr | V::AShr => BinaryOp::Shr,
+        V::Shr => BinaryOp::Shr,
+        V::AShr => BinaryOp::AShr,
     }
 }
 
@@ -1740,7 +1756,8 @@ fn map_sv_binary_op(op: aion_sv_parser::ast::BinaryOp) -> BinaryOp {
         S::BitOr => BinaryOp::Or,
         S::BitXor | S::BitXnor => BinaryOp::Xor,
         S::Shl | S::AShl => BinaryOp::Shl,
-        S::Shr | S::AShr => BinaryOp::Shr,
+        S::Shr => BinaryOp::Shr,
+        S::AShr => BinaryOp::AShr,
     }
 }
 
@@ -1809,7 +1826,8 @@ pub fn map_sv_compound_op(op: aion_sv_parser::ast::CompoundOp) -> BinaryOp {
         C::BitOr => BinaryOp::Or,
         C::BitXor => BinaryOp::Xor,
         C::Shl | C::AShl => BinaryOp::Shl,
-        C::Shr | C::AShr => BinaryOp::Shr,
+        C::Shr => BinaryOp::Shr,
+        C::AShr => BinaryOp::AShr,
     }
 }
 
@@ -2440,6 +2458,23 @@ mod tests {
     }
 
     #[test]
+    fn arithmetic_right_shift_keeps_its_own_ir_op() {
+        use aion_sv_parser::ast::{BinaryOp as S, CompoundOp as C};
+        use aion_verilog_parser::ast::BinaryOp as V;
+        // `>>>` sign-fills a signed operand, so it must not become `>>`.
+        assert_eq!(map_verilog_binary_op(V::AShr), BinaryOp::AShr);
+        assert_eq!(map_sv_binary_op(S::AShr), BinaryOp::AShr);
+        assert_eq!(map_sv_compound_op(C::AShr), BinaryOp::AShr);
+        // `>>` stays logical, and `<<<` is identical to `<<`.
+        assert_eq!(map_verilog_binary_op(V::Shr), BinaryOp::Shr);
+        assert_eq!(map_sv_binary_op(S::Shr), BinaryOp::Shr);
+        assert_eq!(map_sv_compound_op(C::Shr), BinaryOp::Shr);
+        assert_eq!(map_verilog_binary_op(V::AShl), BinaryOp::Shl);
+        assert_eq!(map_sv_binary_op(S::AShl), BinaryOp::Shl);
+        assert_eq!(map_sv_compound_op(C::AShl), BinaryOp::Shl);
+    }
+
+    #[test]
     fn map_all_verilog_unary_ops() {
         use aion_verilog_parser::ast::UnaryOp as V;
         let ops = [
@@ -2769,18 +2804,30 @@ mod tests {
     }
 
     #[test]
-    fn vhdl_aggregate_choice_lists_are_rejected_not_miscompiled() {
+    fn vhdl_aggregate_choices_without_context_are_rejected_not_miscompiled() {
+        // With no assignment target there is no index range to place the
+        // choices in: `(3 => '1', others => '0')` used to become the 2-bit
+        // concat "10", and `(others => '1')` a 1-bit '1' (zero-extended).
         let (mut sdb, interner, sink, env) = setup();
         for text in [
             "(1 | 3 => '1', others => '0')",
             "(7 downto 4 => '1', others => '0')",
+            "(3 => '1', others => '0')",
+            "(others => '1')",
         ] {
             let expr = parse_vhdl_expr(&mut sdb, &interner, text);
             let _ = lower_vhdl_expr(&expr, &env, &sdb, &interner, &sink);
         }
         let diags = sink.diagnostics();
-        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert_eq!(diags.len(), 4, "{diags:?}");
         assert!(diags.iter().all(|d| d.code == errors::E210));
+
+        // An all-zero fill is exact as a 1-bit zero (zero-extension).
+        let sink = DiagnosticSink::new();
+        let expr = parse_vhdl_expr(&mut sdb, &interner, "(others => '0')");
+        let ir = lower_vhdl_expr(&expr, &env, &sdb, &interner, &sink);
+        assert!(matches!(ir, IrExpr::Literal(ref lv) if lv.to_u64() == Some(0)));
+        assert!(sink.diagnostics().is_empty());
 
         // A positional aggregate still lowers to a concatenation.
         let sink = DiagnosticSink::new();

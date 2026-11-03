@@ -201,7 +201,9 @@ fn expr_type(
             | BinaryOp::Or
             | BinaryOp::Xor => expr_type(ctx, ov, lhs)?.merge(expr_type(ctx, ov, rhs)?),
             // The shift amount and the exponent are self-determined.
-            BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Pow => expr_type(ctx, ov, lhs)?,
+            BinaryOp::Shl | BinaryOp::Shr | BinaryOp::AShr | BinaryOp::Pow => {
+                expr_type(ctx, ov, lhs)?
+            }
             BinaryOp::Eq
             | BinaryOp::Ne
             | BinaryOp::Lt
@@ -588,6 +590,23 @@ fn shift_logic(v: &LogicVec, amount: u64, left: bool) -> LogicVec {
     out
 }
 
+/// Shifts `v` right by `amount` bits, filling the vacated high bits with
+/// copies of its most significant bit (the arithmetic `>>>` of a signed
+/// operand, IEEE 1364-2005 5.1.12). An X/Z sign bit fills with that X/Z.
+fn shift_right_arith(v: &LogicVec, amount: u64) -> LogicVec {
+    let width = v.width();
+    if width == 0 {
+        return v.clone();
+    }
+    let sign = v.get(width - 1);
+    let mut out = shift_logic(v, amount, false);
+    let kept = u64::from(width).saturating_sub(amount) as u32;
+    for i in kept..width {
+        out.set(i, sign);
+    }
+    out
+}
+
 /// Evaluates a binary operation in a context of type `ty`.
 fn eval_binary(
     ctx: &EvalContext<'_>,
@@ -622,12 +641,19 @@ fn eval_binary(
             })
         }
 
-        BinaryOp::Shl | BinaryOp::Shr => {
+        BinaryOp::Shl | BinaryOp::Shr | BinaryOp::AShr => {
             let l = eval_ctx(ctx, ov, lhs, ty)?;
             let amount = eval_self(ctx, ov, rhs)?;
             // The shift amount is always unsigned; an X/Z amount gives X.
             Ok(match Bits::from_logic(&amount) {
-                Some(n) => shift_logic(&l, n.as_u64().unwrap_or(u64::MAX), op == BinaryOp::Shl),
+                Some(n) => {
+                    let n = n.as_u64().unwrap_or(u64::MAX);
+                    if op == BinaryOp::AShr && ty.signed {
+                        shift_right_arith(&l, n)
+                    } else {
+                        shift_logic(&l, n, op == BinaryOp::Shl)
+                    }
+                }
                 None => all_x(w),
             })
         }
@@ -2967,6 +2993,31 @@ mod tests {
             assert_eq!(s(&r), "01X0");
             let r = ev(&bin(BinaryOp::Shr, bits("1000"), bits("x")));
             assert_eq!(s(&r), "XXXX");
+        }
+
+        #[test]
+        fn ashr_sign_fills_signed_and_zero_fills_unsigned() {
+            let (mut signals, map, types) = setup(&[
+                (LogicVec::from_u64(0xF8, 8), true),
+                (LogicVec::from_binary_str("x0000000").unwrap(), true),
+                (LogicVec::from_u64(0x40, 8), true),
+            ]);
+            let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+            let ashr = |l: Expr, r: Expr| eval_expr(&ctx, &bin(BinaryOp::AShr, l, r)).unwrap();
+            // -8 >>> 1 == -4; an over-shift leaves only sign bits.
+            assert_eq!(ashr(rd(0), lit(1, 4)).to_u64(), Some(0xFC));
+            assert_eq!(ashr(rd(0), lit(200, 8)).to_u64(), Some(0xFF));
+            assert_eq!(ashr(rd(0), lit(0, 1)).to_u64(), Some(0xF8));
+            // An X sign bit fills with X; a positive value zero-fills.
+            assert_eq!(s(&ashr(rd(1), lit(2, 2))), "XXX00000");
+            assert_eq!(ashr(rd(2), lit(3, 2)).to_u64(), Some(0x08));
+            // An unsigned operand (a literal) shifts logically, and an X
+            // amount gives all-X.
+            assert_eq!(
+                ev(&bin(BinaryOp::AShr, lit(0xF8, 8), lit(1, 1))).to_u64(),
+                Some(0x7C)
+            );
+            assert_eq!(s(&ashr(rd(0), bits("x"))), "XXXXXXXX");
         }
 
         #[test]

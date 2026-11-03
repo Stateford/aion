@@ -19,6 +19,9 @@ use crate::expr::{
     self, lower_sv_assign_value, lower_sv_expr, lower_sv_to_signal_ref, lower_to_signal_ref,
     lower_verilog_expr, lower_vhdl_expr, lower_vhdl_to_signal_ref, SignalEnv, WidthLookup,
 };
+use crate::vhdl_aggregate::{
+    lower_vhdl_assign_value, lower_vhdl_sized, vhdl_target_context, AggregateContext,
+};
 
 /// Default timescale: 1 time unit = 1 ns = 1,000,000 fs.
 ///
@@ -971,7 +974,7 @@ pub fn lower_vhdl_stmt(
             let tgt = lower_vhdl_to_signal_ref(target, sig_env, interner, sink);
             // Use the first waveform's value (ignore `after` timing)
             let val = if let Some(wf) = waveforms.first() {
-                lower_vhdl_expr(&wf.value, sig_env, source_db, interner, sink)
+                lower_vhdl_assign_value(&wf.value, target, sig_env, source_db, interner, sink)
             } else {
                 IrExpr::Literal(aion_common::LogicVec::all_zero(1))
             };
@@ -988,7 +991,7 @@ pub fn lower_vhdl_stmt(
             span,
         } => {
             let tgt = lower_vhdl_to_signal_ref(target, sig_env, interner, sink);
-            let val = lower_vhdl_expr(value, sig_env, source_db, interner, sink);
+            let val = lower_vhdl_assign_value(value, target, sig_env, source_db, interner, sink);
             IrStmt::Assign {
                 target: tgt,
                 value: val,
@@ -1009,6 +1012,7 @@ pub fn lower_vhdl_stmt(
                 .iter()
                 .map(|a| (a.condition.as_ref(), Some(&a.value), a.span));
             let lower = VhdlLowering {
+                target_ctx: vhdl_target_context(&cv.target, sig_env, source_db, interner),
                 sig_env,
                 source_db,
                 interner,
@@ -1023,6 +1027,7 @@ pub fn lower_vhdl_stmt(
                 .iter()
                 .map(|a| (a.choices.as_slice(), Some(&a.value), a.span));
             let lower = VhdlLowering {
+                target_ctx: vhdl_target_context(&sv.target, sig_env, source_db, interner),
                 sig_env,
                 source_db,
                 interner,
@@ -1316,6 +1321,7 @@ pub fn lower_vhdl_conditional_signal_assignment(
         )
     });
     let lower = VhdlLowering {
+        target_ctx: vhdl_target_context(&ca.target, sig_env, source_db, interner),
         sig_env,
         source_db,
         interner,
@@ -1347,6 +1353,7 @@ pub fn lower_vhdl_selected_signal_assignment(
         )
     });
     let lower = VhdlLowering {
+        target_ctx: vhdl_target_context(&sa.target, sig_env, source_db, interner),
         sig_env,
         source_db,
         interner,
@@ -1369,8 +1376,12 @@ pub fn lower_vhdl_selected_signal_assignment(
 /// alternative still has a condition (the target must hold its value, so a
 /// latch-style `If` chain is needed) or when any alternative is
 /// `unaffected`. Nothing is lowered (and no diagnostic emitted) in that case.
+///
+/// `target` is the assignment target: aggregates with named or `others`
+/// choices in the alternatives are laid out over its index range.
 pub fn lower_vhdl_conditional_value(
     alternatives: &[aion_vhdl_parser::ast::ConditionalWaveform],
+    target: &aion_vhdl_parser::ast::Expr,
     sig_env: &SignalEnv,
     source_db: &SourceDb,
     interner: &Interner,
@@ -1385,12 +1396,15 @@ pub fn lower_vhdl_conditional_value(
         .map(|a| first_waveform_value(&a.waveform))
         .collect::<Option<_>>()?;
 
-    let mut acc = lower_vhdl_expr(values[rest.len()], sig_env, source_db, interner, sink);
-    for (alt, value) in rest.iter().zip(&values).rev() {
+    // Each alternative's value takes aggregate layouts from the target.
+    let ctx = vhdl_target_context(target, sig_env, source_db, interner);
+    let value = |v| lower_vhdl_sized(v, ctx, sig_env, source_db, interner, sink);
+    let mut acc = value(values[rest.len()]);
+    for (alt, v) in rest.iter().zip(&values).rev() {
         let cond = alt.condition.as_ref()?;
         acc = IrExpr::Ternary {
             condition: Box::new(lower_vhdl_expr(cond, sig_env, source_db, interner, sink)),
-            true_val: Box::new(lower_vhdl_expr(value, sig_env, source_db, interner, sink)),
+            true_val: Box::new(value(v)),
             false_val: Box::new(acc),
             ty: TypeId::from_raw(0),
             span: alt.span,
@@ -1402,6 +1416,9 @@ pub fn lower_vhdl_conditional_value(
 /// Bundles the lowering context for the VHDL conditional/selected
 /// assignment helpers.
 struct VhdlLowering<'a> {
+    /// The aggregate context of the assignment target, for laying out
+    /// aggregate values (see [`vhdl_target_context`]).
+    target_ctx: Option<AggregateContext>,
     sig_env: &'a SignalEnv,
     source_db: &'a SourceDb,
     interner: &'a Interner,
@@ -1425,7 +1442,14 @@ impl VhdlLowering<'_> {
         match value {
             Some(v) => IrStmt::Assign {
                 target: target.clone(),
-                value: self.expr(v),
+                value: lower_vhdl_sized(
+                    v,
+                    self.target_ctx,
+                    self.sig_env,
+                    self.source_db,
+                    self.interner,
+                    self.sink,
+                ),
                 kind,
                 span,
             },
@@ -2833,13 +2857,16 @@ mod tests {
             span: Span::DUMMY,
         };
         let complete = [guarded.clone(), fallback];
+        let y = vhdl_name(interner.get_or_intern("y"));
         assert!(matches!(
-            lower_vhdl_conditional_value(&complete, &env, &sdb, &interner, &sink),
+            lower_vhdl_conditional_value(&complete, &y, &env, &sdb, &interner, &sink),
             Some(IrExpr::Ternary { .. })
         ));
         // No final else: not a pure mux.
-        assert!(lower_vhdl_conditional_value(&[guarded], &env, &sdb, &interner, &sink).is_none());
-        assert!(lower_vhdl_conditional_value(&[], &env, &sdb, &interner, &sink).is_none());
+        assert!(
+            lower_vhdl_conditional_value(&[guarded], &y, &env, &sdb, &interner, &sink).is_none()
+        );
+        assert!(lower_vhdl_conditional_value(&[], &y, &env, &sdb, &interner, &sink).is_none());
         assert!(!sink.has_errors());
     }
 

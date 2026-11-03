@@ -24,6 +24,7 @@ pub mod sv;
 pub mod types;
 pub mod verilog;
 pub mod vhdl;
+pub mod vhdl_aggregate;
 
 use aion_common::{AionResult, Interner};
 use aion_config::ProjectConfig;

@@ -21,7 +21,7 @@ use aion_vhdl_parser::ast::{self as vhdl_ast, PortMode};
 use crate::const_eval::{self, ConstEnv};
 use crate::context::ElaborationContext;
 use crate::errors;
-use crate::expr::{lower_vhdl_expr, lower_vhdl_to_signal_ref, SignalEnv};
+use crate::expr::{lower_vhdl_to_signal_ref, SignalEnv};
 use crate::ranges::{resolve_vhdl_discrete_range, DeclaredRange, RangeEnv, ResolvedRange};
 use crate::registry::ModuleEntry;
 use crate::stmt::{
@@ -29,6 +29,9 @@ use crate::stmt::{
     lower_vhdl_selected_signal_assignment, lower_vhdl_stmt,
 };
 use crate::types;
+use crate::vhdl_aggregate::{
+    eval_vhdl_aggregate_default, lower_vhdl_assign_value, AggregateContext,
+};
 
 /// Elaborates a VHDL entity+architecture pair into an IR module.
 pub fn elaborate_vhdl_entity(
@@ -243,6 +246,7 @@ fn elaborate_vhdl_ports(
                     span: iface.span,
                 });
                 sig_env.insert(name, sid);
+                record_aggregate_context(name, sid, ty, ranges, sig_env, ctx);
                 let pid = ctx.alloc_port_id();
                 ports.push(Port {
                     id: pid,
@@ -319,8 +323,11 @@ fn elaborate_vhdl_decl(
     );
     ranges.declare_object(names, ty_ast, const_env, ctx.source_db, ctx.interner);
     let width = ctx.design.types.bit_width(ty);
+    let index_range = names
+        .first()
+        .and_then(|&n| object_bit_range(n, width, ranges));
     let init = default.as_ref().and_then(|expr| {
-        let value = eval_vhdl_default(expr, width, const_env, signals, sig_env, ctx);
+        let value = eval_vhdl_default(expr, width, index_range, const_env, signals, sig_env, ctx);
         if value.is_none() {
             let shown = names
                 .first()
@@ -349,23 +356,63 @@ fn elaborate_vhdl_decl(
             span,
         });
         sig_env.insert(name, sid);
+        record_aggregate_context(name, sid, ty, ranges, sig_env, ctx);
     }
+}
+
+/// Returns the declared index range of the VHDL object `name` when it is a
+/// one-dimensional array with one bit per element (its length equals the
+/// object's `width`), as recorded in `ranges`.
+fn object_bit_range(name: Ident, width: Option<u32>, ranges: &RangeEnv) -> Option<ResolvedRange> {
+    let dims = match ranges.get(name)? {
+        DeclaredRange::Array(dims) => dims.as_slice(),
+        _ => return None,
+    };
+    AggregateContext::for_object(width?, Some(dims)).bit_range
+}
+
+/// Records in `sig_env` the shape that aggregates assigned to the VHDL
+/// object `name` (signal `sid`, of IR type `ty`) take from it: its bit width
+/// and, for a one-dimensional array of bits, its declared index range (see
+/// [`AggregateContext`]). Nothing is recorded for an object of unknown width.
+fn record_aggregate_context(
+    name: Ident,
+    sid: SignalId,
+    ty: TypeId,
+    ranges: &RangeEnv,
+    sig_env: &mut SignalEnv,
+    ctx: &ElaborationContext<'_>,
+) {
+    let Some(width) = ctx.design.types.bit_width(ty) else {
+        return;
+    };
+    let dims = match ranges.get(name) {
+        Some(DeclaredRange::Array(dims)) => Some(dims.as_slice()),
+        _ => None,
+    };
+    sig_env.insert_aggregate_context(sid, AggregateContext::for_object(width, dims));
 }
 
 /// Evaluates the default value of a VHDL object declaration to a constant.
 ///
 /// Handles character literals (`'1'`), string literals of `std_logic`
 /// characters (`"1010"`), bit-string literals (`x"5A"`), `(others => c)`
-/// and positional aggregates, references to previously declared objects
-/// that have a constant init (e.g. another constant), and integer constant
-/// expressions over generics. Logic values are fitted to `width` (the
-/// declared type's bit width, when known): zero-extended or truncated.
+/// and positional aggregates, aggregates with named choices such as
+/// `(7 => '1', others => '0')` or `(3 downto 0 => '1', others => '0')`
+/// (laid out over `index_range`, the object's declared index range when it
+/// is a one-dimensional array of bits; see
+/// [`crate::vhdl_aggregate::vhdl_aggregate_layout`]), references to
+/// previously declared objects that have a constant init (e.g. another
+/// constant), and integer constant expressions over generics. Logic values
+/// are fitted to `width` (the declared type's bit width, when known):
+/// zero-extended or truncated.
 ///
 /// Returns `None` if the expression is not one of these forms; the caller
 /// reports that. No diagnostics are emitted here.
 fn eval_vhdl_default(
     expr: &vhdl_ast::Expr,
     width: Option<u32>,
+    index_range: Option<ResolvedRange>,
     const_env: &ConstEnv,
     signals: &Arena<SignalId, Signal>,
     sig_env: &SignalEnv,
@@ -387,7 +434,7 @@ fn eval_vhdl_default(
         vhdl_ast::Expr::Paren { inner, .. }
         | vhdl_ast::Expr::Qualified { expr: inner, .. }
         | vhdl_ast::Expr::TypeConversion { expr: inner, .. } => {
-            eval_vhdl_default(inner, width, const_env, signals, sig_env, ctx)
+            eval_vhdl_default(inner, width, index_range, const_env, signals, sig_env, ctx)
         }
         vhdl_ast::Expr::CharLiteral { span } => {
             let text = ctx.source_db.snippet(*span).trim_matches('\'');
@@ -422,12 +469,48 @@ fn eval_vhdl_default(
             crate::expr::parse_vhdl_bit_string(text).ok().map(fit)
         }
         vhdl_ast::Expr::Aggregate { elements, .. } => {
+            // A single bit of an element value.
+            let bit = |e: &vhdl_ast::Expr| match eval_vhdl_default(
+                e,
+                Some(1),
+                None,
+                const_env,
+                signals,
+                sig_env,
+                ctx,
+            )? {
+                ConstValue::Logic(b) => Some(b.get(0)),
+                _ => None,
+            };
+            // Named choices, laid out over the object's own index range.
+            let has_named = elements.iter().any(|e| {
+                !e.choices.is_empty()
+                    && !matches!(e.choices.as_slice(), [vhdl_ast::Choice::Others(_)])
+            });
+            if let (true, Some(range)) = (has_named, index_range) {
+                return eval_vhdl_aggregate_default(
+                    elements,
+                    range,
+                    const_env,
+                    ctx.source_db,
+                    ctx.interner,
+                    &bit,
+                )
+                .map(ConstValue::Logic);
+            }
             // `(others => c)`: every bit takes the value of `c`.
             if let [only] = elements.as_slice() {
                 if matches!(only.choices.as_slice(), [vhdl_ast::Choice::Others(_)]) {
                     let w = width?;
-                    let ConstValue::Logic(elem) =
-                        eval_vhdl_default(&only.value, Some(1), const_env, signals, sig_env, ctx)?
+                    let ConstValue::Logic(elem) = eval_vhdl_default(
+                        &only.value,
+                        Some(1),
+                        None,
+                        const_env,
+                        signals,
+                        sig_env,
+                        ctx,
+                    )?
                     else {
                         return None;
                     };
@@ -438,18 +521,27 @@ fn eval_vhdl_default(
                     return Some(ConstValue::Logic(lv));
                 }
             }
+            // Positional elements followed by `others`.
+            if let Some(range) = index_range {
+                if elements.iter().any(|e| !e.choices.is_empty()) {
+                    return eval_vhdl_aggregate_default(
+                        elements,
+                        range,
+                        const_env,
+                        ctx.source_db,
+                        ctx.interner,
+                        &bit,
+                    )
+                    .map(ConstValue::Logic);
+                }
+            }
             // Positional aggregate of single bits, leftmost = MSB.
             if elements.iter().any(|e| !e.choices.is_empty()) || elements.is_empty() {
                 return None;
             }
             let mut bits = Vec::with_capacity(elements.len());
             for e in elements {
-                let ConstValue::Logic(b) =
-                    eval_vhdl_default(&e.value, Some(1), const_env, signals, sig_env, ctx)?
-                else {
-                    return None;
-                };
-                bits.push(b.get(0));
+                bits.push(bit(&e.value)?);
             }
             let mut lv = LogicVec::new(bits.len() as u32);
             for (i, bit) in bits.iter().rev().enumerate() {
@@ -577,7 +669,14 @@ fn elaborate_vhdl_concurrent(
         vhdl_ast::ConcurrentStatement::SignalAssignment(sa) => {
             let target = lower_vhdl_to_signal_ref(&sa.target, sig_env, ctx.interner, ctx.sink);
             let value = if let Some(wf) = sa.waveforms.first() {
-                lower_vhdl_expr(&wf.value, sig_env, ctx.source_db, ctx.interner, ctx.sink)
+                lower_vhdl_assign_value(
+                    &wf.value,
+                    &sa.target,
+                    sig_env,
+                    ctx.source_db,
+                    ctx.interner,
+                    ctx.sink,
+                )
             } else {
                 aion_ir::expr::Expr::Literal(aion_common::LogicVec::all_zero(1))
             };
@@ -696,6 +795,7 @@ fn elaborate_vhdl_conditional_assignment(
 
     if let Some(value) = lower_vhdl_conditional_value(
         &ca.alternatives,
+        &ca.target,
         sig_env,
         ctx.source_db,
         ctx.interner,
