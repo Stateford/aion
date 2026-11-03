@@ -47,7 +47,51 @@ impl Lexer<'_> {
             }
             tokens.push(self.next_token());
         }
+        debug_assert!(
+            tokens.iter().all(|t| t.span.start <= t.span.end
+                && self.is_char_boundary(t.span.start as usize)
+                && self.is_char_boundary(t.span.end as usize)),
+            "lexer produced a span past EOF or inside a UTF-8 character"
+        );
         tokens
+    }
+
+    /// Returns `true` if `pos` is within the source (or exactly at its end)
+    /// and does not fall inside a multi-byte UTF-8 character.
+    fn is_char_boundary(&self, pos: usize) -> bool {
+        pos == self.source.len() || (pos < self.source.len() && (self.source[pos] & 0xC0) != 0x80)
+    }
+
+    /// Returns the byte position just past the UTF-8 character starting at `pos`.
+    fn char_end(&self, pos: usize) -> usize {
+        let mut end = (pos + 1).min(self.source.len());
+        while end < self.source.len() && (self.source[end] & 0xC0) == 0x80 {
+            end += 1;
+        }
+        end
+    }
+
+    /// Returns the position of the first non-whitespace byte at or after `pos`.
+    fn skip_ws_from(&self, mut pos: usize) -> usize {
+        while pos < self.source.len() && self.source[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        pos
+    }
+
+    /// If a based-literal prefix (`'b`, `'sh`, ...) starts at `pos`, returns the
+    /// lowercase base letter and the position just past it. The tick, optional
+    /// `s` and base letter must be adjacent.
+    fn based_prefix_at(&self, pos: usize) -> Option<(u8, usize)> {
+        if self.source.get(pos) != Some(&b'\'') {
+            return None;
+        }
+        let mut p = pos + 1;
+        if matches!(self.source.get(p), Some(b's' | b'S')) {
+            p += 1;
+        }
+        let base = self.source.get(p)?.to_ascii_lowercase();
+        matches!(base, b'b' | b'o' | b'd' | b'h').then_some((base, p + 1))
     }
 
     fn peek(&self) -> u8 {
@@ -83,6 +127,42 @@ impl Lexer<'_> {
             msg,
             span,
         ));
+    }
+
+    /// Reports the unrecognized character spanning `start..self.pos` with one
+    /// diagnostic that names the real character and its code point.
+    fn unrecognized_char(&self, start: usize) {
+        let ch = std::str::from_utf8(&self.source[start..self.pos])
+            .ok()
+            .and_then(|s| s.chars().next())
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        let code_point = format!("U+{:04X}", ch as u32);
+        let msg = if ch.is_whitespace() || ch.is_control() {
+            format!("unrecognized character {code_point}")
+        } else {
+            format!("unrecognized character '{ch}' ({code_point})")
+        };
+        let help = match ch {
+            '\u{2018}' | '\u{2019}' | '\u{201B}' | '\u{2032}' => {
+                "replace it with an ASCII apostrophe (')"
+            }
+            '\u{201C}' | '\u{201D}' | '\u{201F}' | '\u{2033}' => {
+                "replace it with an ASCII double quote (\")"
+            }
+            c if c.is_whitespace() => "replace it with an ASCII space",
+            c if c.is_alphanumeric() => {
+                "identifiers may only contain ASCII letters, digits, '_' and '$'"
+            }
+            _ => "remove this character",
+        };
+        self.sink.emit(
+            Diagnostic::error(
+                DiagnosticCode::new(Category::Error, 100),
+                msg,
+                self.span_from(start),
+            )
+            .with_help(help),
+        );
     }
 
     fn skip_whitespace_and_comments(&mut self) {
@@ -240,37 +320,16 @@ impl Lexer<'_> {
         // Consume digits (and underscores)
         self.eat_decimal_digits();
 
-        // Check for sized literal: digits ' base digits
-        if self.pos < self.source.len() && self.source[self.pos] == b'\'' {
-            let next = if self.pos + 1 < self.source.len() {
-                self.source[self.pos + 1].to_ascii_lowercase()
-            } else {
-                0
+        // Check for sized literal: size ' [s] base value. IEEE 1364-2005 §3.5.1
+        // allows whitespace between the size and the tick; it is only consumed
+        // when a tick plus a valid base letter follows.
+        if let Some((base, base_end)) = self.based_prefix_at(self.skip_ws_from(self.pos)) {
+            self.pos = base_end;
+            self.lex_based_value(start, base);
+            return Token {
+                kind: VerilogToken::SizedLiteral,
+                span: self.span_from(start),
             };
-            // 's is signed prefix before base
-            if next == b's' {
-                let base = if self.pos + 2 < self.source.len() {
-                    self.source[self.pos + 2].to_ascii_lowercase()
-                } else {
-                    0
-                };
-                if matches!(base, b'b' | b'o' | b'd' | b'h') {
-                    self.pos += 3; // skip 's and base
-                    self.eat_based_digits(base);
-                    return Token {
-                        kind: VerilogToken::SizedLiteral,
-                        span: self.span_from(start),
-                    };
-                }
-            }
-            if matches!(next, b'b' | b'o' | b'd' | b'h') {
-                self.pos += 2; // skip ' and base letter
-                self.eat_based_digits(next);
-                return Token {
-                    kind: VerilogToken::SizedLiteral,
-                    span: self.span_from(start),
-                };
-            }
         }
 
         // Check for real literal: digits.digits
@@ -307,27 +366,63 @@ impl Lexer<'_> {
 
     /// Lex an unsized based literal starting with tick: `'b1010`, `'hFF`, `'sb1010`
     fn lex_unsized_based_literal(&mut self, start: usize) -> Token {
-        self.pos += 1; // skip '
-        let next = self.source[self.pos].to_ascii_lowercase();
-        if next == b's' {
-            self.pos += 1; // skip s
-            let base = if self.pos < self.source.len() {
-                self.source[self.pos].to_ascii_lowercase()
-            } else {
-                0
-            };
-            if matches!(base, b'b' | b'o' | b'd' | b'h') {
-                self.pos += 1;
-                self.eat_based_digits(base);
-            }
+        if let Some((base, base_end)) = self.based_prefix_at(start) {
+            self.pos = base_end;
+            self.lex_based_value(start, base);
         } else {
-            self.pos += 1; // skip base letter
-            self.eat_based_digits(next);
+            // `'s` not followed by a base letter
+            self.pos = start + 2;
+            self.error(
+                "expected base specifier ('b', 'o', 'd' or 'h') after signed prefix 's'",
+                self.span_from(start),
+            );
         }
         Token {
             kind: VerilogToken::SizedLiteral,
             span: self.span_from(start),
         }
+    }
+
+    /// Lexes the value of a based literal; `self.pos` is just past the base letter.
+    ///
+    /// Whitespace between the base and the value is allowed (§3.5.1). Reports
+    /// an error when no digits follow the base, or when the value contains a
+    /// digit invalid for the base; in the latter case the whole alphanumeric
+    /// run is consumed so the literal stays a single token.
+    fn lex_based_value(&mut self, start: usize, base: u8) {
+        let base_end = self.pos;
+        self.pos = self.skip_ws_from(self.pos);
+        let digits_start = self.pos;
+        let has_digit = self.eat_based_digits(base);
+        if self.pos == digits_start && digits_start > base_end {
+            // Only whitespace followed the base: the value is missing, and
+            // whatever comes next is not part of this literal.
+            self.pos = base_end;
+            self.missing_based_digits(start, base);
+        } else if self.pos < self.source.len() && is_ident_char(self.source[self.pos]) {
+            let bad_pos = self.pos;
+            let bad = self.source[bad_pos] as char; // ASCII: is_ident_char only accepts ASCII
+            while self.pos < self.source.len() && is_ident_char(self.source[self.pos]) {
+                self.pos += 1;
+            }
+            self.error(
+                &format!("invalid digit '{bad}' for {} literal", base_name(base)),
+                Span::new(self.file, bad_pos as u32, bad_pos as u32 + 1),
+            );
+        } else if !has_digit {
+            self.missing_based_digits(start, base);
+        }
+    }
+
+    /// Reports a based literal whose base specifier is not followed by any digits.
+    fn missing_based_digits(&self, start: usize, base: u8) {
+        self.error(
+            &format!(
+                "missing digits after {} base specifier in based literal",
+                base_name(base)
+            ),
+            self.span_from(start),
+        );
     }
 
     fn eat_decimal_digits(&mut self) {
@@ -341,7 +436,18 @@ impl Lexer<'_> {
         }
     }
 
-    fn eat_based_digits(&mut self, base: u8) {
+    /// Consumes the digits valid for `base` and returns `true` if at least one
+    /// non-underscore digit was consumed. A decimal value may instead be a
+    /// single `x`, `z` or `?` digit (§3.5.1).
+    fn eat_based_digits(&mut self, base: u8) -> bool {
+        if base == b'd' && matches!(self.peek().to_ascii_lowercase(), b'x' | b'z' | b'?') {
+            self.pos += 1;
+            while self.peek() == b'_' {
+                self.pos += 1;
+            }
+            return true;
+        }
+        let mut has_digit = false;
         while self.pos < self.source.len() {
             let ch = self.source[self.pos].to_ascii_lowercase();
             let valid = match base {
@@ -352,22 +458,32 @@ impl Lexer<'_> {
                 _ => false,
             };
             if valid {
+                has_digit |= ch != b'_';
                 self.pos += 1;
             } else {
                 break;
             }
         }
+        has_digit
     }
 
     fn eat_exponent(&mut self) {
         if self.pos < self.source.len()
             && (self.source[self.pos] == b'e' || self.source[self.pos] == b'E')
         {
+            let exp_start = self.pos;
             self.pos += 1;
             if self.pos < self.source.len()
                 && (self.source[self.pos] == b'+' || self.source[self.pos] == b'-')
             {
                 self.pos += 1;
+            }
+            if !self.peek().is_ascii_digit() {
+                self.error(
+                    "missing digits in real literal exponent",
+                    self.span_from(exp_start),
+                );
+                return;
             }
             self.eat_decimal_digits();
         }
@@ -384,8 +500,13 @@ impl Lexer<'_> {
                 };
             }
             if self.source[self.pos] == b'\\' {
-                // C-style escape: skip the next character
-                self.pos += 2;
+                // C-style escape: skip the backslash and the whole next
+                // character, never running past EOF (a trailing `\` at EOF
+                // falls through to the unterminated-string error).
+                self.pos += 1;
+                if self.pos < self.source.len() {
+                    self.pos = self.char_end(self.pos);
+                }
                 continue;
             }
             if self.source[self.pos] == b'"' {
@@ -524,10 +645,10 @@ impl Lexer<'_> {
                 }
             }
             _ => {
-                self.error(
-                    &format!("unrecognized character '{}'", b as char),
-                    self.span_from(start),
-                );
+                // `b` may be the lead byte of a multi-byte UTF-8 character:
+                // consume the whole character and report it once.
+                self.pos = self.char_end(start);
+                self.unrecognized_char(start);
                 VerilogToken::Error
             }
         };
@@ -543,7 +664,17 @@ fn is_ident_start(b: u8) -> bool {
 }
 
 fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Returns the human-readable name of a lowercase base letter (`b`, `o`, `d`, `h`).
+fn base_name(base: u8) -> &'static str {
+    match base {
+        b'b' => "binary",
+        b'o' => "octal",
+        b'd' => "decimal",
+        _ => "hexadecimal",
+    }
 }
 
 #[cfg(test)]
@@ -909,5 +1040,224 @@ mod tests {
         let (tokens, errors) = lex_tokens_with_errors("$ ;");
         assert!(tokens.iter().any(|t| t.kind == VerilogToken::Error));
         assert!(!errors.is_empty());
+    }
+
+    /// Asserts every span lies within `source` on UTF-8 character boundaries.
+    fn assert_spans_valid(source: &str, tokens: &[Token], errors: &[Diagnostic]) {
+        let spans = tokens
+            .iter()
+            .map(|t| t.span)
+            .chain(errors.iter().map(|d| d.primary_span));
+        for span in spans {
+            assert!(span.start <= span.end, "inverted span {span:?}");
+            assert!(source.get(span.start as usize..span.end as usize).is_some());
+        }
+    }
+
+    #[test]
+    fn multibyte_char_single_error() {
+        let src = "wire a\u{2019};";
+        let (tokens, errors) = lex_tokens_with_errors(src);
+        assert_spans_valid(src, &tokens, &errors);
+        assert_eq!(
+            kinds(&tokens),
+            vec![
+                VerilogToken::Wire,
+                VerilogToken::Identifier,
+                VerilogToken::Error,
+                VerilogToken::Semicolon,
+                VerilogToken::Eof,
+            ]
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].message,
+            "unrecognized character '\u{2019}' (U+2019)"
+        );
+        assert!(errors[0].help[0].contains("apostrophe"));
+        assert_eq!(
+            &src[tokens[2].span.start as usize..tokens[2].span.end as usize],
+            "\u{2019}"
+        );
+    }
+
+    #[test]
+    fn non_ascii_letter_in_identifier() {
+        let src = "wire caf\u{e9};";
+        let (tokens, errors) = lex_tokens_with_errors(src);
+        assert_spans_valid(src, &tokens, &errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].message,
+            "unrecognized character '\u{e9}' (U+00E9)"
+        );
+        assert_eq!(tokens[3].kind, VerilogToken::Semicolon);
+    }
+
+    #[test]
+    fn nbsp_reported_by_code_point() {
+        let src = "wire\u{a0}a;";
+        let (tokens, errors) = lex_tokens_with_errors(src);
+        assert_spans_valid(src, &tokens, &errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "unrecognized character U+00A0");
+        assert!(errors[0].help[0].contains("space"));
+    }
+
+    #[test]
+    fn four_byte_char_single_error() {
+        let src = "a \u{1F600} b";
+        let (tokens, errors) = lex_tokens_with_errors(src);
+        assert_spans_valid(src, &tokens, &errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(tokens.len(), 4);
+    }
+
+    #[test]
+    fn string_trailing_backslash_at_eof() {
+        let src = "module m; initial $display(\"abc\\";
+        let (tokens, errors) = lex_tokens_with_errors(src);
+        assert_spans_valid(src, &tokens, &errors);
+        assert!(errors
+            .iter()
+            .any(|d| d.message == "unterminated string literal"));
+        let eof = tokens.last().unwrap();
+        assert_eq!(eof.kind, VerilogToken::Eof);
+        assert_eq!(eof.span.end as usize, src.len());
+    }
+
+    #[test]
+    fn string_escaped_multibyte_char() {
+        let src = "\"a\\\u{e9}b\"";
+        let tokens = lex_tokens(src);
+        assert_eq!(
+            kinds(&tokens),
+            vec![VerilogToken::StringLiteral, VerilogToken::Eof]
+        );
+        assert_eq!(tokens[0].span.end as usize, src.len());
+    }
+
+    #[test]
+    fn sized_literal_whitespace_before_tick_and_after_base() {
+        let tokens = lex_tokens("8 'hFF 8'h FF 4 'sb 1010 16'd\n255");
+        assert_eq!(
+            kinds(&tokens),
+            vec![
+                VerilogToken::SizedLiteral,
+                VerilogToken::SizedLiteral,
+                VerilogToken::SizedLiteral,
+                VerilogToken::SizedLiteral,
+                VerilogToken::Eof,
+            ]
+        );
+        assert_eq!(tokens[0].span.start, 0);
+        assert_eq!(tokens[0].span.end, 6);
+    }
+
+    #[test]
+    fn int_followed_by_tick_without_base_is_not_sized() {
+        // `8 '(` is not a based literal: the whitespace is not consumed.
+        let (tokens, _) = lex_tokens_with_errors("8 '(x)");
+        assert_eq!(tokens[0].kind, VerilogToken::IntLiteral);
+        assert_eq!(tokens[0].span.end, 1);
+    }
+
+    #[test]
+    fn tick_and_base_must_be_adjacent() {
+        let (tokens, _) = lex_tokens_with_errors("8' hFF");
+        assert_eq!(tokens[0].kind, VerilogToken::IntLiteral);
+        assert_ne!(tokens[1].kind, VerilogToken::SizedLiteral);
+    }
+
+    #[test]
+    fn based_literal_missing_digits() {
+        let (tokens, errors) = lex_tokens_with_errors("4'b;");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("missing digits after binary"));
+        assert_eq!(
+            kinds(&tokens),
+            vec![
+                VerilogToken::SizedLiteral,
+                VerilogToken::Semicolon,
+                VerilogToken::Eof
+            ]
+        );
+        assert_eq!(tokens[0].span.end, 3);
+    }
+
+    #[test]
+    fn based_literal_missing_digits_after_whitespace() {
+        let (tokens, errors) = lex_tokens_with_errors("'h ;");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("hexadecimal"));
+        assert_eq!(tokens[0].span.end, 2);
+        assert_eq!(tokens[1].kind, VerilogToken::Semicolon);
+    }
+
+    #[test]
+    fn based_literal_invalid_digit() {
+        let (tokens, errors) = lex_tokens_with_errors("4'b102;");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "invalid digit '2' for binary literal");
+        assert_eq!(errors[0].primary_span.start, 5);
+        assert_eq!(
+            kinds(&tokens),
+            vec![
+                VerilogToken::SizedLiteral,
+                VerilogToken::Semicolon,
+                VerilogToken::Eof
+            ]
+        );
+
+        let (_, errors) = lex_tokens_with_errors("8'o78 8'hFG");
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].message.contains("octal"));
+        assert!(errors[1].message.contains("'G' for hexadecimal"));
+    }
+
+    #[test]
+    fn decimal_literal_single_xz_digit() {
+        let tokens = lex_tokens("8'dx 8'dZ 'd? 4'sdx_");
+        assert_eq!(tokens.len(), 5);
+        assert!(tokens[..4]
+            .iter()
+            .all(|t| t.kind == VerilogToken::SizedLiteral));
+        let (_, errors) = lex_tokens_with_errors("8'dx1");
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn signed_prefix_without_base_error() {
+        let (_, errors) = lex_tokens_with_errors("'s ;");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("signed prefix"));
+    }
+
+    #[test]
+    fn real_exponent_missing_digits() {
+        for src in ["1e", "1e+;", "2.5E-"] {
+            let (tokens, errors) = lex_tokens_with_errors(src);
+            assert_eq!(errors.len(), 1, "{src}");
+            assert_eq!(errors[0].message, "missing digits in real literal exponent");
+            assert_eq!(tokens[0].kind, VerilogToken::RealLiteral);
+        }
+        let tokens = lex_tokens("1e3 1E+3 1.5e-2");
+        assert_eq!(tokens.len(), 4);
+    }
+
+    #[test]
+    fn dollar_inside_identifier() {
+        let tokens = lex_tokens("a$b $c$d");
+        assert_eq!(
+            kinds(&tokens),
+            vec![
+                VerilogToken::Identifier,
+                VerilogToken::SystemIdentifier,
+                VerilogToken::Eof
+            ]
+        );
+        assert_eq!(tokens[0].span.end, 3);
+        // `$` is not an identifier start character.
+        assert_eq!(lex_tokens("$x")[0].kind, VerilogToken::SystemIdentifier);
     }
 }
