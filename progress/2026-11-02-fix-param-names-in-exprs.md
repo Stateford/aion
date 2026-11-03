@@ -21,3 +21,4 @@
   - VHDL generics with string or bit-string defaults give E209 (const eval handles integers only).
   - Parameter signedness is not modelled.
   - Out of scope: LINT-4 part-select, LINT-20 net initializers.
+- **Merged with #20/#21/#31/#34 (2026-11-03):** #21 (PR #60) added a `&RangeEnv` argument to `types::resolve_vhdl_type`; the generic-width lookup in `apply_vhdl_generics` now passes an empty `RangeEnv`, since no object is in scope yet when a generic's own type is resolved. New test `vhdl_generic_type_range_attribute_reports_e212` checks that a range attribute in a generic's type is reported (`E212`). Both sides' new `expr.rs` tests are kept.

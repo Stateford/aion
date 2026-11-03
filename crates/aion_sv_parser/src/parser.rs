@@ -115,6 +115,14 @@ impl<'src> SvParser<'src> {
     pub(crate) fn expect_ident(&mut self) -> Ident {
         if self.at(SvToken::Identifier) || self.at(SvToken::EscapedIdentifier) {
             let text = self.current_text();
+            // IEEE 1364-2005 §3.7.1: the leading backslash and the terminating
+            // whitespace are not part of an escaped identifier, so `\cpu3 `
+            // and `cpu3` name the same object. The token span is unchanged.
+            let text = if self.at(SvToken::EscapedIdentifier) {
+                text.strip_prefix('\\').unwrap_or(text)
+            } else {
+                text
+            };
             let ident = self.interner.get_or_intern(text);
             self.advance();
             ident
@@ -1000,5 +1008,57 @@ mod tests {
         let (ast, errors) = parse_sv("module m #(parameter A = 1, )(); endmodule");
         assert!(!errors.is_empty());
         assert!(!ast.items.is_empty());
+    }
+
+    #[test]
+    fn escaped_identifier_interned_without_backslash() {
+        // IEEE 1364-2005 §3.7.1: `\cpu3 ` and `cpu3` are the same identifier.
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let source = "module \\cpu3 (a); input a; wire \\a+b ; assign \\a+b = a; endmodule";
+        let tokens = lexer::lex(source, file, &sink);
+        let mut parser = SvParser::new(tokens, source, file, &interner, &sink);
+        let ast = parser.parse_source_file();
+        assert!(!sink.has_errors(), "{:?}", sink.diagnostics());
+        match &ast.items[0] {
+            SvItem::Module(m) => {
+                assert_eq!(m.name, interner.get_or_intern("cpu3"));
+                assert_eq!(interner.resolve(m.name), "cpu3");
+                let assign = m
+                    .items
+                    .iter()
+                    .find_map(|i| match i {
+                        ModuleItem::ContinuousAssign(a) => Some(a),
+                        _ => None,
+                    })
+                    .expect("continuous assign");
+                match &assign.target {
+                    Expr::Identifier { name, span } => {
+                        assert_eq!(interner.resolve(*name), "a+b");
+                        // The span still covers the backslash.
+                        assert_eq!(&source[span.start as usize..span.end as usize], "\\a+b");
+                    }
+                    other => panic!("expected identifier, got {other:?}"),
+                }
+            }
+            _ => panic!("expected module"),
+        }
+    }
+
+    #[test]
+    fn plain_identifier_not_stripped() {
+        // Only escaped identifiers lose their leading backslash.
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let file = FileId::from_raw(0);
+        let source = "module cpu3; endmodule";
+        let tokens = lexer::lex(source, file, &sink);
+        let mut parser = SvParser::new(tokens, source, file, &interner, &sink);
+        let ast = parser.parse_source_file();
+        match &ast.items[0] {
+            SvItem::Module(m) => assert_eq!(interner.resolve(m.name), "cpu3"),
+            _ => panic!("expected module"),
+        }
     }
 }

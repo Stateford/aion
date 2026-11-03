@@ -17,6 +17,7 @@ pub mod const_eval;
 pub mod context;
 pub mod errors;
 pub mod expr;
+pub mod ranges;
 pub mod registry;
 pub mod stmt;
 pub mod sv;
@@ -1612,6 +1613,22 @@ mod tests {
         assert_eq!(
             params_of(child, &interner),
             vec![("n".to_string(), ConstValue::Int(7))]
+        );
+    }
+
+    #[test]
+    fn vhdl_generic_type_range_attribute_reports_e212() {
+        // A generic is the first declaration of an entity, so a range
+        // attribute in its own type has nothing in scope to name (#20/#21
+        // merge): it is reported as unresolvable rather than panicking or
+        // silently picking a width.
+        let src = "library ieee; use ieee.std_logic_1164.all;
+            entity m is generic (G : std_logic_vector(x'range) := \"0\"); port (y : out integer); end entity;
+            architecture rtl of m is begin end architecture;";
+        let (_design, _interner, diags) = elaborate_src("m.vhd", src, "m");
+        assert!(
+            diags.iter().any(|(code, _)| *code == crate::errors::E212),
+            "{diags:?}"
         );
     }
 

@@ -22,3 +22,4 @@
   - Parameter names inside expressions (`s == IDLE`) still give E204 for header params too: expression lowering does not consult the const env.
   - Net-declaration initializers (`wire w = a;`) are parsed but dropped by the elaborator.
   - Not supported yet: min:typ:max delays, drive strengths, `repeat (n) @` intra-assignment controls, gate instance arrays, and `assign a = b, c = d;`.
+- **Merged with #31/#34 (2026-11-03):** kept both sides' new parser tests and the combined diagnostic-code ranges (`E200`–`E212` from master, `W200`–`W207` here; no code numbers clash). #31's SV precedence-matrix renderer now covers `Expr::TimeLiteral`, and a new matrix test (`time_literals_as_operands`) checks `t + 10ns`, `2.5ps * n` and `d[i] > 1step`. #34's sized-literal lexing and this branch's time-literal lexing in `lex_number` merged cleanly and all lexer tests pass.
