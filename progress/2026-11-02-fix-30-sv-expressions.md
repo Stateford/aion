@@ -13,3 +13,4 @@
   - `'1` in comparisons needs operand widths.
   - Typed patterns `T'{...}`, replication patterns `'{N{x}}`, keyword casts (`int'(x)`), streaming operators and `inside` ranges are not done.
   - Unary `+` still maps to IR `Neg`, a pre-existing bug.
+- **Merged with #31 (2026-11-03):** the precedence-matrix S-expression renderers from #31 now cover `Member`, `UnbasedUnsized`, `AssignmentPattern` and `PostIncr`/`PostDecr`. New matrix tests (`member_fill_pattern_postfix_with_index_ops` in SV, `member_select_with_index_ops` in Verilog) check that these forms compose with full index and `+:`/`-:` expressions, e.g. `arr[i << 2].valid` and `d[8*i+7 -: 8].f`.

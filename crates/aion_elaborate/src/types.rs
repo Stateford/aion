@@ -12,6 +12,7 @@ use aion_source::SourceDb;
 
 use crate::const_eval::{self, ConstEnv};
 use crate::errors;
+use crate::ranges::{resolve_vhdl_discrete_range, RangeEnv};
 
 /// Resolves a Verilog type from an optional range and signed flag to a [`TypeId`].
 ///
@@ -157,8 +158,13 @@ pub(crate) fn resolve_sv_range(
 /// Recognizes common IEEE types: `std_logic` maps to [`Type::Bit`],
 /// `std_logic_vector(N downto M)` maps to [`Type::BitVec`],
 /// `integer` maps to [`Type::Integer`], `boolean` maps to [`Type::Bool`].
+///
+/// A vector index constraint may also be a range attribute
+/// (`std_logic_vector(a'range)`); its prefix is looked up in `ranges`, and
+/// an unresolvable prefix is reported (`E212`) and yields [`Type::Error`].
 pub fn resolve_vhdl_type(
     ty: &aion_vhdl_parser::ast::TypeIndication,
+    ranges: &RangeEnv,
     types: &mut TypeDb,
     env: &ConstEnv,
     source_db: &SourceDb,
@@ -174,9 +180,23 @@ pub fn resolve_vhdl_type(
             let is_signed = type_name == "signed";
             if let Some(constraint) = &ty.constraint {
                 match constraint {
-                    aion_vhdl_parser::ast::Constraint::Index(ranges, _) => {
+                    aion_vhdl_parser::ast::Constraint::Index(index_ranges, _) => {
+                        if let Some(dr @ aion_vhdl_parser::ast::DiscreteRange::Attribute(_)) =
+                            index_ranges.first()
+                        {
+                            return match resolve_vhdl_discrete_range(
+                                dr, ranges, env, source_db, interner, sink,
+                            ) {
+                                // Same width rule as an explicit `L downto R`.
+                                Some(r) => types.intern(Type::BitVec {
+                                    width: r.left.abs_diff(r.right) as u32 + 1,
+                                    signed: is_signed,
+                                }),
+                                None => types.intern(Type::Error),
+                            };
+                        }
                         if let Some(aion_vhdl_parser::ast::DiscreteRange::Range(rc)) =
-                            ranges.first()
+                            index_ranges.first()
                         {
                             let left = const_eval::eval_vhdl_expr(
                                 &rc.left, source_db, interner, env, sink,
@@ -354,7 +374,15 @@ mod tests {
             constraint: None,
             span: aion_source::Span::DUMMY,
         };
-        let tid = resolve_vhdl_type(&ti, &mut types, &env, &sdb, &interner, &sink);
+        let tid = resolve_vhdl_type(
+            &ti,
+            &RangeEnv::new(),
+            &mut types,
+            &env,
+            &sdb,
+            &interner,
+            &sink,
+        );
         assert_eq!(*types.get(tid), Type::Bit);
     }
 
@@ -370,7 +398,15 @@ mod tests {
             constraint: None,
             span: aion_source::Span::DUMMY,
         };
-        let tid = resolve_vhdl_type(&ti, &mut types, &env, &sdb, &interner, &sink);
+        let tid = resolve_vhdl_type(
+            &ti,
+            &RangeEnv::new(),
+            &mut types,
+            &env,
+            &sdb,
+            &interner,
+            &sink,
+        );
         assert_eq!(*types.get(tid), Type::Integer);
     }
 
@@ -401,7 +437,15 @@ mod tests {
             )),
             span: aion_source::Span::DUMMY,
         };
-        let tid = resolve_vhdl_type(&ti, &mut types, &env, &sdb, &interner, &sink);
+        let tid = resolve_vhdl_type(
+            &ti,
+            &RangeEnv::new(),
+            &mut types,
+            &env,
+            &sdb,
+            &interner,
+            &sink,
+        );
         assert_eq!(
             *types.get(tid),
             Type::BitVec {
@@ -423,7 +467,15 @@ mod tests {
             constraint: None,
             span: aion_source::Span::DUMMY,
         };
-        let tid = resolve_vhdl_type(&ti, &mut types, &env, &sdb, &interner, &sink);
+        let tid = resolve_vhdl_type(
+            &ti,
+            &RangeEnv::new(),
+            &mut types,
+            &env,
+            &sdb,
+            &interner,
+            &sink,
+        );
         assert_eq!(*types.get(tid), Type::Error);
         assert!(sink.has_errors());
     }
