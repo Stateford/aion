@@ -90,14 +90,15 @@ crates/
 - For functions: describe what it does, not just what it returns.
 - Use `/check-docs <crate>` to run the doc-checker subagent for a thorough audit.
 
-### 6. Update PROGRESS.md After Every Task
+### 6. Add a Progress Entry After Every Task
 
-- After completing any task, update `PROGRESS.md` with:
+- After completing any task, add a **new file** `progress/YYYY-MM-DD-<slug>.md` (see `progress/README.md`) with:
   - What was implemented
   - What tests were added
   - Current status of the phase
   - Any blockers or decisions made
 - Keep entries concise but informative.
+- **Do not add entries to `PROGRESS.md`.** Every branch prepending to the same file made every open PR conflict whenever anything merged; one file per entry never conflicts. `PROGRESS.md` keeps the current phase and the history from before this convention, and is only edited when the phase itself changes.
 
 ## Architecture Principles
 
@@ -157,4 +158,4 @@ crates/
 
 ## Current Phase
 
-Check `PROGRESS.md` for the current implementation phase and what to work on next.
+Check `PROGRESS.md` for the current implementation phase, and the newest files in `progress/` (`ls -r progress/`) for recent work and what to work on next.

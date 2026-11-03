@@ -4,7 +4,7 @@ Implement the crate or feature described by: $ARGUMENTS
 
 1. **Read the technical spec** — Open `docs/aion-technical-spec.md` and find the section relevant to what you're implementing. Follow the type signatures, interfaces, and algorithms specified there exactly.
 
-2. **Check PROGRESS.md** — See what's already done and what the current phase expects.
+2. **Check PROGRESS.md and `progress/`** — See the current phase, and what's already done (`ls -r progress/` lists the newest entries first).
 
 3. **Implement the code** — Follow the architecture principles in CLAUDE.md. Use the exact types from the technical spec.
 
@@ -16,7 +16,7 @@ Implement the crate or feature described by: $ARGUMENTS
 
 7. **Run fmt** — `cargo fmt` to ensure formatting.
 
-8. **Update PROGRESS.md** — Record what was implemented, tests added, and next steps.
+8. **Add a progress entry** — Create `progress/YYYY-MM-DD-<slug>.md` recording what was implemented, tests added, and next steps (see `progress/README.md`). Don't edit `PROGRESS.md`.
 
 ## Quality Checklist (verify before finishing)
 
@@ -30,4 +30,4 @@ Implement the crate or feature described by: $ARGUMENTS
 - [ ] `cargo test -p aion_<crate>` passes
 - [ ] `cargo clippy -p aion_<crate> -- -D warnings` passes (this catches missing docs)
 - [ ] `cargo fmt --check` passes
-- [ ] PROGRESS.md is updated
+- [ ] A `progress/` entry is added

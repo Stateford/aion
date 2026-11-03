@@ -24,8 +24,9 @@ Generate a changelog summary from git history and PROGRESS.md updates. Optionall
    cd "$CLAUDE_PROJECT_DIR" && git diff --stat <range>
    ```
 
-4. **Read PROGRESS.md** for milestone context:
+4. **Read the progress entries** for milestone context: the newest files in `progress/` (one per task), plus the phase line and older history in `PROGRESS.md`:
    ```bash
+   ls -r "$CLAUDE_PROJECT_DIR/progress/" | head -20
    head -100 "$CLAUDE_PROJECT_DIR/PROGRESS.md"
    ```
 
