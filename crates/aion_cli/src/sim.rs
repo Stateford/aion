@@ -146,6 +146,11 @@ pub fn run(args: &SimArgs, global: &GlobalArgs) -> Result<i32, Box<dyn std::erro
         eprintln!("ASSERTION FAILED: {failure}");
     }
 
+    // Print runtime warnings (e.g. out-of-range part-select writes)
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+
     // Step 10: Print summary
     if !global.quiet {
         let time_str = format_sim_time(&result.final_time);

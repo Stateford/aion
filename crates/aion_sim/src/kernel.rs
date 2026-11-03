@@ -12,7 +12,7 @@ use aion_common::{Interner, Logic, LogicVec};
 use aion_ir::arena::Arena;
 use aion_ir::{
     AssignKind, CellKind, ConstValue, Design, Edge, Expr, ModuleId, Process, ProcessKind,
-    Sensitivity, SignalId, SignalKind, SignalRef, Statement, TypeDb,
+    Sensitivity, SignalId, SignalKind, SignalRef, Statement, Type, TypeDb,
 };
 
 use crate::error::SimError;
@@ -107,6 +107,10 @@ pub struct SimResult {
     pub display_output: Vec<String>,
     /// Assertion failure messages collected during the run.
     pub assertion_failures: Vec<String>,
+    /// Runtime warnings collected during the run, such as a part-select
+    /// write that lies (partly) outside its target signal. Each distinct
+    /// problem is reported once.
+    pub warnings: Vec<String>,
 }
 
 /// The result of a single delta-cycle step.
@@ -150,6 +154,11 @@ pub struct SimKernel {
     display_output: Vec<String>,
     /// Collected assertion failure messages.
     assertion_failures: Vec<String>,
+    /// Collected runtime warnings (see [`SimResult::warnings`]).
+    warnings: Vec<String>,
+    /// Out-of-range part-select writes `(signal, high, low)` already warned
+    /// about, so a write repeated every clock cycle is reported once.
+    warned_ranges: HashSet<(SimSignalId, u32, u32)>,
     /// Optional time limit in femtoseconds.
     time_limit: Option<u64>,
     /// Mapping from SimSignalId to the processes sensitive to it.
@@ -205,6 +214,8 @@ impl SimKernel {
             finished: false,
             display_output: Vec::new(),
             assertion_failures: Vec::new(),
+            warnings: Vec::new(),
+            warned_ranges: HashSet::new(),
             time_limit: None,
             sensitivity_map: HashMap::new(),
             max_delta_per_step: 10_000,
@@ -335,23 +346,32 @@ impl SimKernel {
             }
         }
 
-        // Apply events to signals
-        let mut changed_signals = HashSet::new();
+        // Apply events to signals. A signal's previous value is captured
+        // once per delta, before the first of its events, so several events
+        // on one signal in the same delta are judged by the value it had
+        // when the delta started: 0 -> 1 -> 0 is no edge, and 0 -> x -> 1 is
+        // a single posedge.
+        let mut touched: Vec<SimSignalId> = Vec::new();
+        let mut seen = HashSet::new();
         for evt in &events {
             let sig = self.signals.get_mut(evt.signal);
-            sig.previous_value = sig.value.clone();
-
-            // Apply the new value
-            let mut new_val = sig.value.clone();
-            for i in 0..new_val.width().min(evt.value.width()) {
-                new_val.set(i, evt.value.get(i));
+            if seen.insert(evt.signal) {
+                sig.previous_value = sig.value.clone();
+                touched.push(evt.signal);
             }
-
-            if new_val != sig.value {
-                sig.value = new_val;
-                changed_signals.insert(evt.signal);
-            }
+            // An event carries a whole-signal value. Fit it to the signal's
+            // width (zero-extend or truncate) so a narrower value, e.g. from
+            // `schedule_event`, never leaves stale upper bits behind and the
+            // stored width never changes.
+            sig.value = apply_write(&sig.value, &evt.value, None);
         }
+        let changed_signals: HashSet<SimSignalId> = touched
+            .into_iter()
+            .filter(|&id| {
+                let sig = self.signals.get(id);
+                sig.value != sig.previous_value
+            })
+            .collect();
 
         // Record waveform changes
         if self.recorder.is_some() {
@@ -405,13 +425,15 @@ impl SimKernel {
             }
 
             let name = format!("{prefix}.{}", interner.resolve(signal.name));
-            let width = self.types.bit_width(signal.ty).unwrap_or(1);
+            let (width, signed) = signal_width_and_sign(&self.types, signal.ty);
 
             let init_value = match &signal.init {
                 // Fit the declared value to the signal's width.
                 Some(ConstValue::Logic(lv)) => apply_write(&LogicVec::new(width), lv, None),
-                Some(ConstValue::Int(v)) => LogicVec::from_u64(*v as u64, width),
-                Some(ConstValue::Bool(b)) => LogicVec::from_bool(*b),
+                Some(ConstValue::Int(v)) => int_to_logic(*v, width),
+                Some(ConstValue::Bool(b)) => {
+                    apply_write(&LogicVec::new(width), &LogicVec::from_bool(*b), None)
+                }
                 _ => match signal.kind {
                     SignalKind::Wire | SignalKind::Port => LogicVec::new(width),
                     SignalKind::Reg | SignalKind::Latch | SignalKind::Variable => {
@@ -427,7 +449,7 @@ impl SimKernel {
 
             let sim_id = self
                 .signals
-                .alloc(SimSignalState::new(name, width, init_value));
+                .alloc(SimSignalState::new(name, width, init_value).with_signed(signed));
             signal_map.insert(sig_id, sim_id);
             if signal.kind == SignalKind::Variable {
                 self.variables.insert(sim_id);
@@ -864,6 +886,7 @@ impl SimKernel {
             total_deltas: self.total_deltas,
             display_output: self.display_output.clone(),
             assertion_failures: self.assertion_failures.clone(),
+            warnings: self.warnings.clone(),
         })
     }
 
@@ -1097,6 +1120,7 @@ impl SimKernel {
         let mut index_map: HashMap<SimSignalId, usize> = HashMap::new();
 
         for update in updates {
+            self.check_write_range(&update);
             if let Some(&idx) = index_map.get(&update.target) {
                 // Merge into existing entry
                 let (_, ref mut val) = merged[idx];
@@ -1132,8 +1156,39 @@ impl SimKernel {
         }
         // Resize to the signal's width: `reg [7:0] c; initial c = 0;` must
         // keep `c` 8 bits wide, not adopt the literal's width.
+        self.check_write_range(update);
         let sig = self.signals.get_mut(update.target);
         sig.value = apply_write(&sig.value, &update.value, update.range);
+    }
+
+    /// Records a warning, once per signal and range, if a part-select write
+    /// lies (partly) outside its target signal.
+    ///
+    /// Such a write never panics: the bits outside the signal are ignored,
+    /// as IEEE 1364-2005 5.2.1 requires for out-of-range writes, and the
+    /// signal keeps its declared width. Reporting it makes the likely design
+    /// error visible instead of silently dropping data.
+    fn check_write_range(&mut self, update: &PendingUpdate) {
+        let Some((high, low)) = update.range else {
+            return;
+        };
+        let sig = self.signals.get(update.target);
+        if high >= low && high < sig.width {
+            return;
+        }
+        if !self.warned_ranges.insert((update.target, high, low)) {
+            return;
+        }
+        let declared = if sig.width == 0 {
+            "no bits".to_string()
+        } else {
+            format!("[{}:0]", sig.width - 1)
+        };
+        self.warnings.push(format!(
+            "write to `{}[{high}:{low}]` at {} fs is outside the signal's range {declared}; \
+             the out-of-range bits are ignored",
+            sig.name, self.current_time.fs
+        ));
     }
 
     /// Returns all signal names and their flat IDs.
@@ -1180,6 +1235,12 @@ impl SimKernel {
     /// Returns collected assertion failures and clears the buffer.
     pub fn take_assertion_failures(&mut self) -> Vec<String> {
         std::mem::take(&mut self.assertion_failures)
+    }
+
+    /// Returns collected runtime warnings (see [`SimResult::warnings`]) and
+    /// clears the buffer.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Runs the simulation until the given target time in femtoseconds.
@@ -1309,7 +1370,58 @@ impl SimKernel {
     }
 }
 
-/// Checks if a signal has experienced the specified edge.
+/// Returns the width and signedness the simulator uses for a signal of type
+/// `ty`.
+///
+/// A Verilog `integer` (and a VHDL `integer`) is a 32-bit signed vector; a
+/// `BitVec` carries its own width and signedness; any other type falls back
+/// to [`TypeDb::bit_width`] (1 bit if the type has no bit width).
+fn signal_width_and_sign(types: &TypeDb, ty: aion_ir::TypeId) -> (u32, bool) {
+    match types.get(ty) {
+        Type::Integer => (32, true),
+        Type::BitVec { width, signed } => (*width, *signed),
+        _ => (types.bit_width(ty).unwrap_or(1), false),
+    }
+}
+
+/// Converts an integer initial value to a `width`-bit vector, truncating or
+/// sign-extending it (so `-1` fills every bit of a 100-bit signal).
+fn int_to_logic(value: i64, width: u32) -> LogicVec {
+    let mut v = LogicVec::new(width);
+    for i in 0..width {
+        let bit = if i < 64 {
+            (value >> i) & 1 == 1
+        } else {
+            value < 0
+        };
+        if bit {
+            v.set(i, Logic::One);
+        }
+    }
+    v
+}
+
+/// Returns `true` if `prev -> curr` is a positive edge per IEEE 1364-2005
+/// Table 9-2: `0 -> 1`, `0 -> x/z`, or `x/z -> 1`.
+fn is_posedge(prev: Logic, curr: Logic) -> bool {
+    matches!(
+        (prev, curr),
+        (Logic::Zero, Logic::One | Logic::X | Logic::Z) | (Logic::X | Logic::Z, Logic::One)
+    )
+}
+
+/// Returns `true` if `prev -> curr` is a negative edge per IEEE 1364-2005
+/// Table 9-2: `1 -> 0`, `1 -> x/z`, or `x/z -> 0`.
+fn is_negedge(prev: Logic, curr: Logic) -> bool {
+    matches!(
+        (prev, curr),
+        (Logic::One, Logic::Zero | Logic::X | Logic::Z) | (Logic::X | Logic::Z, Logic::Zero)
+    )
+}
+
+/// Checks if a signal has experienced the specified edge, judged on its
+/// least-significant bit with the full IEEE 1364 edge table (so a reset
+/// that starts at X and is driven to 1 is a posedge). `x <-> z` is no edge.
 fn check_edge(prev: &LogicVec, curr: &LogicVec, edge: Edge) -> bool {
     if prev.width() == 0 || curr.width() == 0 {
         return false;
@@ -1317,12 +1429,9 @@ fn check_edge(prev: &LogicVec, curr: &LogicVec, edge: Edge) -> bool {
     let prev_bit = prev.get(0);
     let curr_bit = curr.get(0);
     match edge {
-        Edge::Posedge => prev_bit == Logic::Zero && curr_bit == Logic::One,
-        Edge::Negedge => prev_bit == Logic::One && curr_bit == Logic::Zero,
-        Edge::Both => {
-            (prev_bit == Logic::Zero && curr_bit == Logic::One)
-                || (prev_bit == Logic::One && curr_bit == Logic::Zero)
-        }
+        Edge::Posedge => is_posedge(prev_bit, curr_bit),
+        Edge::Negedge => is_negedge(prev_bit, curr_bit),
+        Edge::Both => is_posedge(prev_bit, curr_bit) || is_negedge(prev_bit, curr_bit),
     }
 }
 
@@ -3542,6 +3651,218 @@ mod tests {
             // Nothing queued: a no-op.
             assert!(!kernel.apply_nba_region());
         }
+
+        // ---- Width semantics and edges (#6: SIM-5, SIM-10, SIM-12) ----
+
+        #[test]
+        fn sim10_x_to_one_reset_triggers_posedge() {
+            // Repro N: rst starts at X; `#1 rst = 1` must fire posedge rst.
+            let (design, interner) = build(
+                &[("rst", 1, None), ("hit", 1, Some(0))],
+                vec![
+                    initial(dly(1, ba(s(0), lit(1, 1)))),
+                    at_posedge(0, ba(s(1), lit(1, 1))),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            assert_eq!(val(&kernel, "hit"), Some(1));
+        }
+
+        #[test]
+        fn sim10_zero_to_x_is_a_posedge_but_x_to_z_is_not() {
+            let (design, interner) = build(
+                &[("clk", 1, Some(0)), ("hits", 8, Some(0))],
+                vec![
+                    initial(blk(vec![
+                        dly(
+                            1,
+                            ba(s(0), Expr::Literal(LogicVec::from_binary_str("x").unwrap())),
+                        ),
+                        dly(
+                            1,
+                            ba(s(0), Expr::Literal(LogicVec::from_binary_str("z").unwrap())),
+                        ),
+                    ])),
+                    at_posedge(0, ba(s(1), add(rd(1), lit(1, 8)))),
+                ],
+                vec![],
+            );
+            let (kernel, _) = run(&design, &interner);
+            // 0 -> x is a posedge; x -> z is no edge.
+            assert_eq!(val(&kernel, "hits"), Some(1));
+        }
+
+        #[test]
+        fn sim10_previous_value_captured_once_per_delta() {
+            // Two events on rst in one delta: 0 -> x -> 1 (or 0 -> 1 -> x,
+            // the heap order is unspecified). Either way the delta starts at
+            // 0 and ends at 1 or x, a posedge. Judging by the last event
+            // alone (x -> 1 or 1 -> x) used to miss it.
+            let (design, interner) = build(
+                &[("rst", 1, Some(0)), ("hit", 1, Some(0))],
+                vec![at_posedge(0, ba(s(1), lit(1, 1)))],
+                vec![],
+            );
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            let rst = kernel.find_signal("top.rst").unwrap();
+            let t = SimTime::from_ns(1);
+            kernel.schedule_event(t, rst, LogicVec::from_binary_str("x").unwrap());
+            kernel.schedule_event(t, rst, LogicVec::from_bool(true));
+            kernel.run_to_completion().unwrap();
+            assert_eq!(val(&kernel, "hit"), Some(1));
+        }
+
+        #[test]
+        fn sim12_narrow_event_zero_extends_instead_of_keeping_upper_bits() {
+            // Repro O at the kernel level: an 8-bit signal at 0xFF receiving
+            // a 4-bit 0 used to keep its upper nibble (11110000).
+            let (design, interner) = build(&[("y", 8, Some(0xFF))], vec![], vec![]);
+            let mut kernel = SimKernel::new(&design, &interner).unwrap();
+            let y = kernel.find_signal("top.y").unwrap();
+            kernel.schedule_event(SimTime::from_ns(1), y, LogicVec::from_u64(0, 4));
+            kernel.run_to_completion().unwrap();
+            assert_eq!(kernel.signal_value(y).width(), 8);
+            assert_eq!(val(&kernel, "y"), Some(0));
+            // A wider event is truncated, never widening the signal.
+            kernel.schedule_event(SimTime::from_ns(2), y, LogicVec::from_u64(0x1AB, 12));
+            kernel.run_to_completion().unwrap();
+            assert_eq!(kernel.signal_value(y).width(), 8);
+            assert_eq!(val(&kernel, "y"), Some(0xAB));
+        }
+
+        #[test]
+        fn sim5_narrow_write_then_bit_write_keeps_width() {
+            // Repro E: `y = a; y[7] = 1;` with 4-bit a panicked.
+            let (design, interner) = build(
+                &[("y", 8, None), ("a", 4, Some(0))],
+                vec![initial(blk(vec![
+                    ba(s(0), rd(1)),
+                    ba(slice(0, 7, 7), lit(1, 1)),
+                ]))],
+                vec![],
+            );
+            let (kernel, result) = run(&design, &interner);
+            let y = kernel.find_signal("top.y").unwrap();
+            assert_eq!(kernel.signal_value(y).width(), 8);
+            assert_eq!(val(&kernel, "y"), Some(0x80));
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        }
+
+        #[test]
+        fn sim5_out_of_range_slice_write_warns_once_and_is_ignored() {
+            // x[11:8] on an 8-bit x: no panic, x unchanged, one warning even
+            // though the write happens at t=0 and again on every clock.
+            let (design, interner) = build(
+                &[("x", 8, Some(0x12)), ("clk", 1, None)],
+                vec![
+                    initial(ba(slice(0, 11, 8), lit(0xF, 4))),
+                    clock(1, 3),
+                    at_posedge(1, ba(slice(0, 11, 8), lit(0xF, 4))),
+                ],
+                vec![],
+            );
+            let (mut kernel, result) = run(&design, &interner);
+            assert_eq!(val(&kernel, "x"), Some(0x12));
+            assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+            assert!(
+                result.warnings[0].contains("top.x[11:8]") && result.warnings[0].contains("[7:0]"),
+                "{}",
+                result.warnings[0]
+            );
+            assert_eq!(kernel.take_warnings().len(), 1);
+            assert!(kernel.take_warnings().is_empty());
+        }
+
+        #[test]
+        fn sim5_partly_out_of_range_write_keeps_in_range_bits() {
+            // x[9:6] = 4'b1111 on an 8-bit x sets bits 7:6 and warns.
+            let (design, interner) = build(
+                &[("x", 8, Some(0))],
+                vec![initial(ba(slice(0, 9, 6), lit(0xF, 4)))],
+                vec![],
+            );
+            let (kernel, result) = run(&design, &interner);
+            assert_eq!(val(&kernel, "x"), Some(0xC0));
+            assert_eq!(result.warnings.len(), 1);
+        }
+
+        #[test]
+        fn integer_signals_are_32_bit_signed() {
+            let interner = Interner::new();
+            let mut types = TypeDb::new();
+            let int_ty = types.intern(Type::Integer);
+            let s16 = types.intern(Type::BitVec {
+                width: 16,
+                signed: true,
+            });
+            let mut top = empty_module(0, interner.get_or_intern("top"));
+            for (i, (name, ty, init)) in [
+                ("i", int_ty, Some(ConstValue::Int(-2))),
+                ("b", s16, Some(ConstValue::Bool(true))),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                top.signals.alloc(Signal {
+                    id: SignalId::from_raw(i as u32),
+                    name: interner.get_or_intern(name),
+                    ty,
+                    kind: SignalKind::Reg,
+                    init,
+                    clock_domain: None,
+                    span: Span::DUMMY,
+                });
+            }
+            let mut modules = Arena::new();
+            modules.alloc(top);
+            let design = Design {
+                modules,
+                top: ModuleId::from_raw(0),
+                types,
+                source_map: aion_ir::SourceMap::new(),
+            };
+            let kernel = SimKernel::new(&design, &interner).unwrap();
+            let i = kernel.find_signal("top.i").unwrap();
+            assert_eq!(kernel.signal_value(i).width(), 32);
+            assert_eq!(val(&kernel, "i"), Some(0xFFFF_FFFE));
+            assert!(kernel.signals.get(i).signed);
+            // A Bool initial value is fitted to the declared width.
+            let b = kernel.find_signal("top.b").unwrap();
+            assert_eq!(kernel.signal_value(b).width(), 16);
+            assert_eq!(val(&kernel, "b"), Some(1));
+        }
+
+        #[test]
+        fn int_to_logic_sign_extends_wide_and_truncates_narrow() {
+            let v = int_to_logic(-1, 100);
+            assert!((0..100).all(|i| v.get(i) == Logic::One));
+            assert_eq!(int_to_logic(0x1FF, 8).to_u64(), Some(0xFF));
+            assert_eq!(int_to_logic(5, 70).get(69), Logic::Zero);
+        }
+    }
+
+    #[test]
+    fn check_edge_follows_ieee_edge_table() {
+        let b = |s: &str| LogicVec::from_binary_str(s).unwrap();
+        // Posedge: 0->1, 0->x, 0->z, x->1, z->1.
+        for (p, c) in [("0", "1"), ("0", "x"), ("0", "z"), ("x", "1"), ("z", "1")] {
+            assert!(check_edge(&b(p), &b(c), Edge::Posedge), "{p}->{c}");
+            assert!(!check_edge(&b(p), &b(c), Edge::Negedge), "{p}->{c}");
+            assert!(check_edge(&b(p), &b(c), Edge::Both), "{p}->{c}");
+        }
+        // Negedge: 1->0, 1->x, 1->z, x->0, z->0.
+        for (p, c) in [("1", "0"), ("1", "x"), ("1", "z"), ("x", "0"), ("z", "0")] {
+            assert!(check_edge(&b(p), &b(c), Edge::Negedge), "{p}->{c}");
+            assert!(!check_edge(&b(p), &b(c), Edge::Posedge), "{p}->{c}");
+            assert!(check_edge(&b(p), &b(c), Edge::Both), "{p}->{c}");
+        }
+        // x <-> z and no change are not edges.
+        for (p, c) in [("x", "z"), ("z", "x"), ("x", "x"), ("0", "0")] {
+            assert!(!check_edge(&b(p), &b(c), Edge::Both), "{p}->{c}");
+        }
+        // Zero-width values never have an edge.
+        assert!(!check_edge(&LogicVec::new(0), &b("1"), Edge::Posedge));
     }
 
     // ---- Unified process dispatch (#4: SIM-1, SIM-2, SIM-21) ----

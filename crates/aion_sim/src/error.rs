@@ -31,6 +31,10 @@ pub enum SimError {
     },
 
     /// Division by zero encountered during expression evaluation.
+    ///
+    /// The evaluator no longer returns this: following IEEE 1364-2005
+    /// 5.1.5, `x / 0` and `x % 0` evaluate to all-X instead of aborting the
+    /// simulation. The variant is kept so code matching on it still builds.
     #[error("division by zero")]
     DivisionByZero,
 
