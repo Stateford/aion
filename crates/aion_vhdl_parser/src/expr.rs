@@ -413,7 +413,7 @@ impl VhdlParser<'_> {
     }
 
     /// Parses a parenthesized expression or aggregate.
-    fn parse_paren_or_aggregate(&mut self) -> Expr {
+    pub(crate) fn parse_paren_or_aggregate(&mut self) -> Expr {
         let start = self.current_span();
         self.expect(VhdlToken::LeftParen);
 

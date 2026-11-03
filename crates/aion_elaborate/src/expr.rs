@@ -1000,6 +1000,24 @@ pub fn lower_vhdl_to_signal_ref(
                 SignalRef::Const(LogicVec::all_zero(1))
             }
         }
+        // Positional aggregate target `(a, b) <= v;`: elements take the
+        // value's elements left to right, exactly like the concatenation
+        // `a & b`, so it lowers to a concat whose first part is the MSB.
+        Expr::Aggregate { elements, span } => {
+            if elements.iter().any(|e| !e.choices.is_empty()) {
+                sink.emit(errors::error_unsupported(
+                    "named association in an aggregate assignment target",
+                    *span,
+                ));
+                return SignalRef::Const(LogicVec::all_zero(1));
+            }
+            SignalRef::Concat(
+                elements
+                    .iter()
+                    .map(|e| lower_vhdl_to_signal_ref(&e.value, sig_env, interner, sink))
+                    .collect(),
+            )
+        }
         _ => SignalRef::Const(LogicVec::all_zero(1)),
     }
 }

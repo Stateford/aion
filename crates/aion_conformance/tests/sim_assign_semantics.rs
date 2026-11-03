@@ -377,6 +377,62 @@ endmodule
     assert_eq!(value(&kernel, "r"), Some(0x0F));
 }
 
+#[test]
+fn vhdl_conditional_and_selected_assignments_simulate() {
+    // Concurrent and VHDL-2008 sequential conditional / selected signal
+    // assignments, `unaffected`, and an aggregate target (#16).
+    let src = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity tb is
+end entity;
+
+architecture sim of tb is
+  signal s   : std_logic := '1';
+  signal t   : std_logic := '0';
+  signal on1 : std_logic := '1';
+  signal off : std_logic := '0';
+  signal a   : std_logic_vector(3 downto 0) := x"A";
+  signal b   : std_logic_vector(3 downto 0) := x"5";
+  signal c   : std_logic_vector(3 downto 0) := x"F";
+  signal d   : std_logic_vector(3 downto 0) := "1001";
+  signal y1, y2, y3, y4, y5, y6 : std_logic_vector(3 downto 0);
+  signal l1 : std_logic_vector(3 downto 0);
+  signal l2 : std_logic_vector(3 downto 0) := x"3";
+  signal hi, lo : std_logic_vector(1 downto 0);
+begin
+  y1 <= a when s = '1' else b;
+  y2 <= a when t = '1' else b when s = '0' else c;
+  with s select y3 <= a when '0', b when others;
+  with t select y4 <= transport a when '0', unaffected when others;
+  l1 <= a when on1 = '1';
+  l2 <= a when off = '1';
+  (hi, lo) <= d;
+  process (all)
+    variable v : std_logic_vector(3 downto 0);
+  begin
+    v := b when s = '1' else c;
+    y5 <= v when t = '1' else a;
+    with s select y6 <= v when '1', c when others;
+  end process;
+end architecture;
+"#;
+    let (kernel, _) = simulate("tb.vhd", src, "tb");
+    assert_eq!(value(&kernel, "y1"), Some(0xA));
+    assert_eq!(value(&kernel, "y2"), Some(0xF));
+    assert_eq!(value(&kernel, "y3"), Some(0x5));
+    assert_eq!(value(&kernel, "y4"), Some(0xA));
+    // `l1` follows `a` while enabled; `l2` keeps its initial value (closed latch).
+    assert_eq!(value(&kernel, "l1"), Some(0xA));
+    assert_eq!(value(&kernel, "l2"), Some(0x3));
+    // `(hi, lo) <= "1001"`: leftmost elements go to `hi`.
+    assert_eq!(value(&kernel, "hi"), Some(0b10));
+    assert_eq!(value(&kernel, "lo"), Some(0b01));
+    assert_eq!(value(&kernel, "y5"), Some(0xA));
+    assert_eq!(value(&kernel, "y6"), Some(0x5));
+}
+
 /// Source for the unary-plus simulation tests; `NET` is `wire` (Verilog) or
 /// `logic` (SV).
 const UNARY_PLUS_SRC: &str = r#"

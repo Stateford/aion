@@ -5,6 +5,37 @@
 
 ---
 
+## 2026-11-02 — VHDL Parser: Conditional / Selected Signal Assignments, Force/Release (Fixes #16)
+
+- **AST:** new `ConditionalSignalAssignment` / `SelectedSignalAssignment`, used by both the concurrent and the VHDL-2008 sequential statements. Their alternatives are `ConditionalWaveform` / `SelectedWaveform`, each holding a `SignalWaveform` (`Elements` or `Unaffected`). Simple assignments gain `delay: Option<DelayMechanism>` (`Transport`, `Inertial { reject }`). Sequential-only variants: `ConditionalVariableAssignment`, `SelectedVariableAssignment`, `ForceAssignment`, `SelectedForceAssignment` and `ReleaseAssignment` (with `ForceMode::{In, Out}`). `y <= unaffected;` is stored as a one-alternative conditional, so `waveforms` on a simple assignment always holds at least one element.
+- **Parser:**
+  - Handles `wf when c else wf ...` (with or without a final `else`), `with e select[?] t <= wf when choices, ...`, and the delay mechanisms `transport`, `inertial` and `reject t inertial`. The same chains work for `:=` and for `force [in|out]`; `release [in|out]` is parsed too.
+  - Aggregate targets `(a, b) <= ...` are accepted. Labeled forms such as `lbl : y <= ...` and `lbl : with ...` are told apart from instantiations by a `<=` lookahead.
+  - The lexer now emits `VhdlToken::Question` for a lone `?`; `select?` is the only place the parser accepts it.
+  - Choice-list parsing is shared with `case` alternatives (`parse_choices`).
+- **Error recovery:**
+  - The new `finish_statement` reports a missing or garbled `;` once and then skips to the next `;` or `end`, so nothing cascades.
+  - A `when` followed by `=>` is treated as the next case alternative (a forgotten `;`), not as a condition.
+  - Force/release or `:=` in concurrent code, a selected `release`, and a selected alternative without `when` each produce exactly one error.
+- **Elaboration:**
+  - A concurrent conditional with a final `else` and no `unaffected` becomes a continuous assignment of a nested ternary (mux).
+  - One without a final `else`, or with `unaffected`, becomes a combinational `process (all)` with an `If` chain whose uncovered paths leave the target unchanged (latch semantics).
+  - `q <= d when rising_edge(clk);` becomes a sequential process sensitive to the clock edge. Signals read by the conditions before the edge (async reset) get `Edge::Both`.
+  - Selected assignments become a `Case` (concurrent ones inside a `process (all)`).
+  - Sequential and variable forms lower to `If` / `Case` with non-blocking / blocking assignments. Process edge detection now also scans conditional assignments.
+  - Positional aggregate targets lower to `SignalRef::Concat`, leftmost element = MSB.
+- **Rejected with E210 (unsupported) instead of being dropped:** force/release (simulation overrides), range choices in selected assignments, `select?` choices containing `'-'`, and named aggregate targets.
+- **Ignored, as documented:** the delay mechanism, like `after`, only shapes simulation timing, and the IR models zero-delay assignments.
+- **Tests:**
+  - 39 parser tests in `stmt.rs` (every form, the issue's three repros, and error recovery);
+  - 2 lexer and 2 AST serde/span tests;
+  - 17 elaborator tests (IR shape for each lowering, sensitivity, diagnostics, helpers);
+  - 1 end-to-end simulation test in `aion_conformance/tests/sim_assign_semantics.rs`.
+- **Known gaps:**
+  - Multi-element waveforms still use only the first element, as before.
+  - `case` statements still silently drop range choices (existing behaviour, not changed here).
+  - Concurrent `guarded` assignments and `postponed` are not parsed (blocks are #17).
+  - The existing elaborator lowers VHDL string literals and `&` imprecisely, which also affects choices written as string literals.
 ## 2026-11-02 — VHDL Parser: Lexer Correctness for Comments, Literals, Ticks and UTF-8 (Fixes #22)
 
 - **UTF-8 (VHDL-5):** a non-ASCII character outside literals and comments now gives one `Error` token whose span covers the whole character. The message names it (`'‘' (U+2018)`). Smart quotes, primes and typographic dashes get a help line pointing to `'`, `"` or `-`. NBSP and vertical tab count as separators. The renderer side of the panic (clamping spans to char boundaries, character-based caret columns) landed separately in #59; this change adds smart-quote renderer tests on top of it.

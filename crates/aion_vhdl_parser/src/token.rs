@@ -297,6 +297,8 @@ pub enum VhdlToken {
     MatchGreaterEquals,
     /// `??`
     ConditionOp,
+    /// `?` on its own (VHDL-2008 matching `select?` / `case?`)
+    Question,
     /// `^`
     Caret,
     /// `@`

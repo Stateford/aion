@@ -9,6 +9,7 @@ use aion_common::Interner;
 use aion_diagnostics::DiagnosticSink;
 use aion_ir::expr::{BinaryOp, Expr as IrExpr};
 use aion_ir::ids::TypeId;
+use aion_ir::signal::SignalRef;
 use aion_ir::stmt::{AssignKind, CaseArm as IrCaseArm, Statement as IrStmt};
 use aion_source::SourceDb;
 
@@ -918,6 +919,10 @@ pub fn lower_vhdl_stmt(
     match stmt {
         SequentialStatement::SignalAssignment {
             target,
+            // The delay mechanism, like `after`, only shapes simulation
+            // timing; the IR models zero-delay assignment (see
+            // `first_waveform_value`).
+            delay: _,
             waveforms,
             span,
         } => {
@@ -948,6 +953,68 @@ pub fn lower_vhdl_stmt(
                 kind: AssignKind::Blocking,
                 span: *span,
             }
+        }
+        SequentialStatement::ConditionalSignalAssignment(ca) => {
+            lower_vhdl_conditional_signal_assignment(ca, sig_env, source_db, interner, sink)
+        }
+        SequentialStatement::SelectedSignalAssignment(sa) => {
+            lower_vhdl_selected_signal_assignment(sa, sig_env, source_db, interner, sink)
+        }
+        SequentialStatement::ConditionalVariableAssignment(cv) => {
+            let tgt = lower_vhdl_to_signal_ref(&cv.target, sig_env, interner, sink);
+            let alts = cv
+                .alternatives
+                .iter()
+                .map(|a| (a.condition.as_ref(), Some(&a.value), a.span));
+            let lower = VhdlLowering {
+                sig_env,
+                source_db,
+                interner,
+                sink,
+            };
+            lower.if_chain(&tgt, AssignKind::Blocking, alts)
+        }
+        SequentialStatement::SelectedVariableAssignment(sv) => {
+            let tgt = lower_vhdl_to_signal_ref(&sv.target, sig_env, interner, sink);
+            let alts = sv
+                .alternatives
+                .iter()
+                .map(|a| (a.choices.as_slice(), Some(&a.value), a.span));
+            let lower = VhdlLowering {
+                sig_env,
+                source_db,
+                interner,
+                sink,
+            };
+            lower.selected_case(
+                &sv.selector,
+                sv.matching,
+                &tgt,
+                AssignKind::Blocking,
+                alts,
+                sv.span,
+            )
+        }
+        SequentialStatement::ForceAssignment(fa) => {
+            sink.emit(errors::error_unsupported(
+                "VHDL-2008 `force` assignment (simulation override)",
+                fa.span,
+            ));
+            IrStmt::Nop
+        }
+        SequentialStatement::SelectedForceAssignment(fa) => {
+            sink.emit(errors::error_unsupported(
+                "VHDL-2008 selected `force` assignment (simulation override)",
+                fa.span,
+            ));
+            IrStmt::Nop
+        }
+        SequentialStatement::ReleaseAssignment(ra) => {
+            sink.emit(errors::error_unsupported(
+                "VHDL-2008 `release` assignment (simulation override)",
+                ra.span,
+            ));
+            IrStmt::Nop
         }
         SequentialStatement::If(if_stmt) => {
             lower_vhdl_if(if_stmt, sig_env, source_db, interner, sink)
@@ -1165,6 +1232,282 @@ fn lower_vhdl_stmt_list(
     }
 }
 
+/// Returns the value of the first element of a VHDL waveform, or `None` for
+/// `unaffected`.
+///
+/// As for simple signal assignments, only the first element's value is
+/// used. `after` clauses and delay mechanisms (`transport`,
+/// `[reject t] inertial`) only shape the simulation timing of the projected
+/// waveform; the IR models zero-delay assignments and synthesis ignores
+/// delays, so they are dropped here deliberately.
+pub fn first_waveform_value(
+    waveform: &aion_vhdl_parser::ast::SignalWaveform,
+) -> Option<&aion_vhdl_parser::ast::Expr> {
+    match waveform {
+        aion_vhdl_parser::ast::SignalWaveform::Elements(elems) => elems.first().map(|w| &w.value),
+        aion_vhdl_parser::ast::SignalWaveform::Unaffected(_) => None,
+    }
+}
+
+/// Lowers a VHDL conditional signal assignment
+/// (`t <= a when c1 else b when c2 else c;`) to a priority chain of IR `If`
+/// statements with non-blocking assignments.
+///
+/// Alternatives without a final `else`, and `unaffected` alternatives, leave
+/// the target untouched in that branch (an empty branch), which matches the
+/// VHDL semantics of "no new transaction". Used both for the VHDL-2008
+/// sequential form and as the body of the process equivalent to the
+/// concurrent form.
+pub fn lower_vhdl_conditional_signal_assignment(
+    ca: &aion_vhdl_parser::ast::ConditionalSignalAssignment,
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrStmt {
+    let tgt = lower_vhdl_to_signal_ref(&ca.target, sig_env, interner, sink);
+    let alts = ca.alternatives.iter().map(|a| {
+        (
+            a.condition.as_ref(),
+            first_waveform_value(&a.waveform),
+            a.span,
+        )
+    });
+    let lower = VhdlLowering {
+        sig_env,
+        source_db,
+        interner,
+        sink,
+    };
+    lower.if_chain(&tgt, AssignKind::NonBlocking, alts)
+}
+
+/// Lowers a VHDL selected signal assignment
+/// (`with s select t <= a when c1, b when others;`) to an IR `Case`
+/// statement with non-blocking assignments; `others` becomes the default arm.
+///
+/// Range choices and `select?` choices containing `'-'` don't-cares cannot
+/// be expressed as IR case patterns yet and are reported as unsupported
+/// (E210) instead of being silently dropped.
+pub fn lower_vhdl_selected_signal_assignment(
+    sa: &aion_vhdl_parser::ast::SelectedSignalAssignment,
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrStmt {
+    let tgt = lower_vhdl_to_signal_ref(&sa.target, sig_env, interner, sink);
+    let alts = sa.alternatives.iter().map(|a| {
+        (
+            a.choices.as_slice(),
+            first_waveform_value(&a.waveform),
+            a.span,
+        )
+    });
+    let lower = VhdlLowering {
+        sig_env,
+        source_db,
+        interner,
+        sink,
+    };
+    lower.selected_case(
+        &sa.selector,
+        sa.matching,
+        &tgt,
+        AssignKind::NonBlocking,
+        alts,
+        sa.span,
+    )
+}
+
+/// Lowers the alternatives of a VHDL conditional signal assignment to a
+/// nested IR ternary (mux) expression `c1 ? a : (c2 ? b : c)`.
+///
+/// Returns `None` when the assignment is not a pure mux: when the last
+/// alternative still has a condition (the target must hold its value, so a
+/// latch-style `If` chain is needed) or when any alternative is
+/// `unaffected`. Nothing is lowered (and no diagnostic emitted) in that case.
+pub fn lower_vhdl_conditional_value(
+    alternatives: &[aion_vhdl_parser::ast::ConditionalWaveform],
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> Option<IrExpr> {
+    let (last, rest) = alternatives.split_last()?;
+    if last.condition.is_some() {
+        return None;
+    }
+    let values: Vec<_> = alternatives
+        .iter()
+        .map(|a| first_waveform_value(&a.waveform))
+        .collect::<Option<_>>()?;
+
+    let mut acc = lower_vhdl_expr(values[rest.len()], sig_env, source_db, interner, sink);
+    for (alt, value) in rest.iter().zip(&values).rev() {
+        let cond = alt.condition.as_ref()?;
+        acc = IrExpr::Ternary {
+            condition: Box::new(lower_vhdl_expr(cond, sig_env, source_db, interner, sink)),
+            true_val: Box::new(lower_vhdl_expr(value, sig_env, source_db, interner, sink)),
+            false_val: Box::new(acc),
+            ty: TypeId::from_raw(0),
+            span: alt.span,
+        };
+    }
+    Some(acc)
+}
+
+/// Bundles the lowering context for the VHDL conditional/selected
+/// assignment helpers.
+struct VhdlLowering<'a> {
+    sig_env: &'a SignalEnv,
+    source_db: &'a SourceDb,
+    interner: &'a Interner,
+    sink: &'a DiagnosticSink,
+}
+
+impl VhdlLowering<'_> {
+    /// Lowers a VHDL expression in this context.
+    fn expr(&self, e: &aion_vhdl_parser::ast::Expr) -> IrExpr {
+        lower_vhdl_expr(e, self.sig_env, self.source_db, self.interner, self.sink)
+    }
+
+    /// Builds `target <= value` (or `:=`), or `Nop` for `unaffected`.
+    fn assign(
+        &self,
+        target: &SignalRef,
+        kind: AssignKind,
+        value: Option<&aion_vhdl_parser::ast::Expr>,
+        span: aion_source::Span,
+    ) -> IrStmt {
+        match value {
+            Some(v) => IrStmt::Assign {
+                target: target.clone(),
+                value: self.expr(v),
+                kind,
+                span,
+            },
+            None => IrStmt::Nop,
+        }
+    }
+
+    /// Builds a priority `If` chain from `(condition, value, span)`
+    /// alternatives, where a `None` condition is the trailing `else` and a
+    /// `None` value is `unaffected`.
+    fn if_chain<'e>(
+        &self,
+        target: &SignalRef,
+        kind: AssignKind,
+        alternatives: impl DoubleEndedIterator<
+            Item = (
+                Option<&'e aion_vhdl_parser::ast::Expr>,
+                Option<&'e aion_vhdl_parser::ast::Expr>,
+                aion_source::Span,
+            ),
+        >,
+    ) -> IrStmt {
+        let mut else_part: Option<Box<IrStmt>> = None;
+        for (condition, value, span) in alternatives.rev() {
+            let body = self.assign(target, kind, value, span);
+            else_part = Some(Box::new(match condition {
+                // The parser only produces an unconditional alternative last.
+                None => body,
+                Some(c) => IrStmt::If {
+                    condition: self.expr(c),
+                    then_body: Box::new(body),
+                    else_body: else_part,
+                    span,
+                },
+            }));
+        }
+        else_part.map_or(IrStmt::Nop, |s| *s)
+    }
+
+    /// Builds an IR `Case` over `selector` from `(choices, value, span)`
+    /// alternatives; an alternative containing `others` becomes the default.
+    fn selected_case<'e>(
+        &self,
+        selector: &aion_vhdl_parser::ast::Expr,
+        matching: bool,
+        target: &SignalRef,
+        kind: AssignKind,
+        alternatives: impl Iterator<
+            Item = (
+                &'e [aion_vhdl_parser::ast::Choice],
+                Option<&'e aion_vhdl_parser::ast::Expr>,
+                aion_source::Span,
+            ),
+        >,
+        span: aion_source::Span,
+    ) -> IrStmt {
+        use aion_vhdl_parser::ast::Choice;
+        let subject = self.expr(selector);
+        let mut arms = Vec::new();
+        let mut default = None;
+        for (choices, value, alt_span) in alternatives {
+            let body = self.assign(target, kind, value, alt_span);
+            if choices.iter().any(|c| matches!(c, Choice::Others(_))) {
+                default = Some(Box::new(body));
+                continue;
+            }
+            let mut patterns = Vec::new();
+            for choice in choices {
+                match choice {
+                    Choice::Expr(e) if matching && vhdl_has_dont_care(e, self.source_db) => {
+                        self.sink.emit(errors::error_unsupported(
+                            "`select?` choice with '-' don't-care bits",
+                            e.span(),
+                        ));
+                    }
+                    Choice::Expr(e) => patterns.push(self.expr(e)),
+                    Choice::Range(r) => {
+                        self.sink.emit(errors::error_unsupported(
+                            "range choice in a selected assignment",
+                            r.span,
+                        ));
+                    }
+                    Choice::Others(_) => {}
+                }
+            }
+            if !patterns.is_empty() {
+                arms.push(IrCaseArm {
+                    patterns,
+                    body,
+                    span: alt_span,
+                });
+            }
+        }
+        IrStmt::Case {
+            subject,
+            arms,
+            default,
+            span,
+        }
+    }
+}
+
+/// Returns `true` if a VHDL choice expression contains a character, string
+/// or bit-string literal with a `'-'` (don't-care) element, which only has
+/// matching semantics under `select?` / `case?`.
+fn vhdl_has_dont_care(expr: &aion_vhdl_parser::ast::Expr, source_db: &SourceDb) -> bool {
+    use aion_vhdl_parser::ast::Expr;
+    match expr {
+        Expr::CharLiteral { span }
+        | Expr::StringLiteral { span }
+        | Expr::BitStringLiteral { span } => source_db.snippet(*span).contains('-'),
+        Expr::Binary { left, right, .. } => {
+            vhdl_has_dont_care(left, source_db) || vhdl_has_dont_care(right, source_db)
+        }
+        Expr::Paren { inner, .. } | Expr::Qualified { expr: inner, .. } => {
+            vhdl_has_dont_care(inner, source_db)
+        }
+        Expr::Aggregate { elements, .. } => elements
+            .iter()
+            .any(|e| vhdl_has_dont_care(&e.value, source_db)),
+        _ => false,
+    }
+}
+
 /// Evaluates a Verilog delay expression to femtoseconds.
 ///
 /// Tries to const-evaluate the expression; if it resolves to an integer,
@@ -1369,6 +1712,7 @@ mod tests {
                 parts: vec![],
                 span: Span::DUMMY,
             }),
+            delay: None,
             waveforms: vec![aion_vhdl_parser::ast::Waveform {
                 value: aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
                     primary: d,
@@ -1988,6 +2332,415 @@ mod tests {
         assert_eq!(w204.len(), 1, "{diags:?}");
         assert!(w204[0].message.contains("`t`"), "{}", w204[0].message);
         assert_eq!(find(&objects, "p.t").2, None);
+    }
+
+    // ========================================================================
+    // VHDL conditional / selected / force assignments (#16)
+    // ========================================================================
+
+    /// Elaborates an architecture body (declarations, `begin`, statements)
+    /// for a fixed test entity and returns the top module's IR, a signal
+    /// lookup by name, and every diagnostic.
+    fn elab_vhdl_arch(
+        arch_body: &str,
+    ) -> (
+        aion_ir::module::Module,
+        std::collections::HashMap<String, SignalId>,
+        Vec<aion_diagnostics::Diagnostic>,
+    ) {
+        let src = format!(
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\
+             entity t is port (\n\
+               clk, rst, en, s : in std_logic;\n\
+               sel : in std_logic_vector(1 downto 0);\n\
+               a, b, c, d : in std_logic_vector(3 downto 0);\n\
+               y, q, z : out std_logic_vector(3 downto 0);\n\
+               hi, lo : out std_logic_vector(1 downto 0));\n\
+             end entity;\n\
+             architecture rtl of t is\n{arch_body}\nend architecture;"
+        );
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source("t.vhd", src);
+        let parsed = crate::ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![aion_vhdl_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            )],
+        };
+        let config: aion_config::ProjectConfig =
+            toml::from_str("[project]\nname = \"t\"\nversion = \"0.1.0\"\ntop = \"t\"\n").unwrap();
+        let design = crate::elaborate(&parsed, &config, &source_db, &interner, &sink).unwrap();
+        let module = design.modules[design.top].clone();
+        let names = module
+            .signals
+            .iter()
+            .map(|(id, sig)| (interner.resolve(sig.name).to_string(), id))
+            .collect();
+        (module, names, sink.diagnostics())
+    }
+
+    /// Returns `true` if `e` reads exactly the whole signal `id`.
+    fn is_sig(e: &IrExpr, id: SignalId) -> bool {
+        matches!(e, IrExpr::Signal(SignalRef::Signal(s)) if *s == id)
+    }
+
+    fn errors_of(diags: &[aion_diagnostics::Diagnostic]) -> Vec<&aion_diagnostics::Diagnostic> {
+        diags
+            .iter()
+            .filter(|d| d.severity == aion_diagnostics::Severity::Error)
+            .collect()
+    }
+
+    fn assert_no_errors(diags: &[aion_diagnostics::Diagnostic]) {
+        let errs = errors_of(diags);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    fn only_process(module: &aion_ir::module::Module) -> &aion_ir::process::Process {
+        assert_eq!(module.processes.len(), 1, "{:?}", module.processes);
+        module.processes.values().next().unwrap()
+    }
+
+    #[test]
+    fn vhdl_concurrent_conditional_lowers_to_ternary_mux() {
+        let (m, sig, diags) =
+            elab_vhdl_arch("begin\n y <= a when sel = \"00\" else b when sel = \"01\" else c;");
+        assert_no_errors(&diags);
+        assert!(m.processes.is_empty(), "complete mux needs no process");
+        assert_eq!(m.assignments.len(), 1);
+        let asg = &m.assignments[0];
+        assert_eq!(asg.target, SignalRef::Signal(sig["y"]));
+        let IrExpr::Ternary {
+            true_val,
+            false_val,
+            ..
+        } = &asg.value
+        else {
+            panic!("expected ternary, got {:?}", asg.value);
+        };
+        assert!(is_sig(true_val, sig["a"]));
+        let IrExpr::Ternary {
+            true_val: t2,
+            false_val: f2,
+            ..
+        } = &**false_val
+        else {
+            panic!("expected nested ternary, got {false_val:?}");
+        };
+        assert!(is_sig(t2, sig["b"]));
+        assert!(is_sig(f2, sig["c"]));
+    }
+
+    #[test]
+    fn vhdl_concurrent_conditional_without_else_is_latching_process() {
+        let (m, sig, diags) = elab_vhdl_arch("begin\n q <= d when en = '1';");
+        assert_no_errors(&diags);
+        assert!(m.assignments.is_empty());
+        let p = only_process(&m);
+        assert_eq!(p.kind, aion_ir::process::ProcessKind::Combinational);
+        assert!(matches!(p.sensitivity, aion_ir::process::Sensitivity::All));
+        let IrStmt::If {
+            then_body,
+            else_body,
+            ..
+        } = &p.body
+        else {
+            panic!("expected if, got {:?}", p.body);
+        };
+        assert!(else_body.is_none(), "target must hold when en = '0'");
+        assert!(matches!(
+            &**then_body,
+            IrStmt::Assign { target, kind: AssignKind::NonBlocking, .. }
+                if *target == SignalRef::Signal(sig["q"])
+        ));
+    }
+
+    #[test]
+    fn vhdl_concurrent_conditional_unaffected_branch_is_empty() {
+        let (m, _, diags) = elab_vhdl_arch("begin\n y <= a when en = '1' else unaffected;");
+        assert_no_errors(&diags);
+        assert!(m.assignments.is_empty());
+        let IrStmt::If {
+            then_body,
+            else_body,
+            ..
+        } = &only_process(&m).body
+        else {
+            panic!("expected if");
+        };
+        assert!(matches!(&**then_body, IrStmt::Assign { .. }));
+        assert!(matches!(else_body.as_deref(), Some(IrStmt::Nop)));
+    }
+
+    #[test]
+    fn vhdl_concurrent_all_unaffected_emits_nothing() {
+        let (m, _, diags) = elab_vhdl_arch("begin\n y <= unaffected;");
+        assert_no_errors(&diags);
+        assert!(m.assignments.is_empty());
+        assert!(m.processes.is_empty());
+    }
+
+    #[test]
+    fn vhdl_concurrent_clocked_conditional_is_sequential_process() {
+        use aion_ir::process::{Edge, ProcessKind, Sensitivity};
+        let (m, sig, diags) = elab_vhdl_arch("begin\n q <= d when rising_edge(clk);");
+        assert_no_errors(&diags);
+        let p = only_process(&m);
+        assert_eq!(p.kind, ProcessKind::Sequential);
+        let Sensitivity::EdgeList(edges) = &p.sensitivity else {
+            panic!("expected edge list, got {:?}", p.sensitivity);
+        };
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].signal, sig["clk"]);
+        assert_eq!(edges[0].edge, Edge::Posedge);
+        assert!(matches!(
+            p.body,
+            IrStmt::If {
+                else_body: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn vhdl_concurrent_async_reset_conditional_sensitivity() {
+        use aion_ir::process::{Edge, Sensitivity};
+        let (m, sig, diags) = elab_vhdl_arch(
+            "begin\n q <= (others => '0') when rst = '1' else d when falling_edge(clk);",
+        );
+        assert_no_errors(&diags);
+        let p = only_process(&m);
+        let Sensitivity::EdgeList(edges) = &p.sensitivity else {
+            panic!("expected edge list, got {:?}", p.sensitivity);
+        };
+        let pairs: Vec<_> = edges.iter().map(|e| (e.signal, e.edge)).collect();
+        // The clock edge, then the asynchronous reset; `d` is data only.
+        assert_eq!(
+            pairs,
+            vec![(sig["clk"], Edge::Negedge), (sig["rst"], Edge::Both)]
+        );
+        // if rst = '1' then q <= 0; elsif falling_edge(clk) then q <= d;
+        let IrStmt::If { else_body, .. } = &p.body else {
+            panic!("expected if");
+        };
+        assert!(matches!(
+            else_body.as_deref(),
+            Some(IrStmt::If {
+                else_body: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn vhdl_concurrent_selected_lowers_to_case_process() {
+        let (m, sig, diags) = elab_vhdl_arch(
+            "begin\n with sel select y <= a when \"00\" | \"01\", b when \"10\", c when others;",
+        );
+        assert_no_errors(&diags);
+        assert!(m.assignments.is_empty());
+        let p = only_process(&m);
+        assert_eq!(p.kind, aion_ir::process::ProcessKind::Combinational);
+        assert!(matches!(p.sensitivity, aion_ir::process::Sensitivity::All));
+        let IrStmt::Case {
+            subject,
+            arms,
+            default,
+            ..
+        } = &p.body
+        else {
+            panic!("expected case, got {:?}", p.body);
+        };
+        assert!(is_sig(subject, sig["sel"]));
+        assert_eq!(arms.len(), 2);
+        assert_eq!(arms[0].patterns.len(), 2);
+        assert_eq!(arms[1].patterns.len(), 1);
+        assert!(matches!(
+            default.as_deref(),
+            Some(IrStmt::Assign { value: IrExpr::Signal(SignalRef::Signal(id)), .. }) if *id == sig["c"]
+        ));
+    }
+
+    #[test]
+    fn vhdl_selected_range_choice_is_reported_not_dropped() {
+        let (_, _, diags) = elab_vhdl_arch(
+            "signal n : integer range 0 to 7;\nbegin\n with n select y <= a when 0 to 3, b when others;",
+        );
+        let errs = errors_of(&diags);
+        assert_eq!(errs.len(), 1, "{diags:?}");
+        assert_eq!(errs[0].code, errors::E210);
+        assert!(errs[0].message.contains("range choice"));
+    }
+
+    #[test]
+    fn vhdl_matching_select_dont_care_is_reported() {
+        let (_, _, diags) =
+            elab_vhdl_arch("begin\n with sel select? y <= a when \"1-\", b when others;");
+        let errs = errors_of(&diags);
+        assert_eq!(errs.len(), 1, "{diags:?}");
+        assert!(errs[0].message.contains("don't-care"));
+
+        // Without '-' choices, `select?` behaves like `select` for 0/1 values.
+        let (m, _, diags) =
+            elab_vhdl_arch("begin\n with sel select? y <= a when \"10\", b when others;");
+        assert_no_errors(&diags);
+        assert!(matches!(only_process(&m).body, IrStmt::Case { .. }));
+    }
+
+    #[test]
+    fn vhdl_sequential_conditional_and_selected_assignment_kinds() {
+        let kinds = assign_kinds(
+            "t.vhd",
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\
+             entity t is port (s, a, b : in std_logic; y, z : out std_logic); end entity;\n\
+             architecture rtl of t is\n\
+             begin\n\
+               process (all)\n\
+                 variable v : std_logic;\n\
+               begin\n\
+                 y <= a when s = '1' else b;\n\
+                 v := b when s = '1' else a;\n\
+                 with s select z <= v when '1', a when others;\n\
+               end process;\n\
+             end architecture;",
+            "t",
+        );
+        let kinds: Vec<_> = kinds.into_iter().map(|(_, k)| k).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AssignKind::NonBlocking,
+                AssignKind::NonBlocking,
+                AssignKind::Blocking,
+                AssignKind::Blocking,
+                AssignKind::NonBlocking,
+                AssignKind::NonBlocking,
+            ]
+        );
+    }
+
+    #[test]
+    fn vhdl_selected_variable_assignment_lowers_to_blocking_case() {
+        let (m, sig, diags) = elab_vhdl_arch(
+            "begin\n process (all)\n variable v : std_logic_vector(3 downto 0);\n begin\n \
+             with sel select v := a when \"00\", b when others;\n y <= v;\n end process;",
+        );
+        assert_no_errors(&diags);
+        let IrStmt::Block { stmts, .. } = &only_process(&m).body else {
+            panic!("expected block");
+        };
+        let IrStmt::Case { arms, default, .. } = &stmts[0] else {
+            panic!("expected case, got {:?}", stmts[0]);
+        };
+        assert!(matches!(
+            arms[0].body,
+            IrStmt::Assign {
+                kind: AssignKind::Blocking,
+                ..
+            }
+        ));
+        assert!(default.is_some());
+        assert!(!sig.contains_key("v"), "process variables are scoped");
+    }
+
+    #[test]
+    fn vhdl_sequential_clocked_conditional_makes_process_sequential() {
+        let (m, _, diags) = elab_vhdl_arch(
+            "begin\n process (clk)\n begin\n q <= d when rising_edge(clk);\n end process;",
+        );
+        assert_no_errors(&diags);
+        assert_eq!(
+            only_process(&m).kind,
+            aion_ir::process::ProcessKind::Sequential
+        );
+    }
+
+    #[test]
+    fn vhdl_force_and_release_are_rejected() {
+        let (_, _, diags) = elab_vhdl_arch(
+            "begin\n process\n begin\n y <= force a;\n \
+             with s select y <= force a when '1', b when others;\n y <= release;\n \
+             wait;\n end process;",
+        );
+        let errs = errors_of(&diags);
+        assert_eq!(errs.len(), 3, "{diags:?}");
+        assert!(errs.iter().all(|e| e.code == errors::E210));
+        assert!(errs[0].message.contains("force"));
+        assert!(errs[2].message.contains("release"));
+    }
+
+    #[test]
+    fn vhdl_aggregate_target_lowers_to_concat() {
+        let (m, sig, diags) = elab_vhdl_arch("begin\n (hi, lo) <= a;");
+        assert_no_errors(&diags);
+        assert_eq!(
+            m.assignments[0].target,
+            SignalRef::Concat(vec![
+                SignalRef::Signal(sig["hi"]),
+                SignalRef::Signal(sig["lo"])
+            ])
+        );
+    }
+
+    #[test]
+    fn vhdl_named_aggregate_target_is_reported() {
+        let (_, _, diags) = elab_vhdl_arch("begin\n (1 => hi, 0 => lo) <= a;");
+        let errs = errors_of(&diags);
+        assert_eq!(errs.len(), 1, "{diags:?}");
+        assert!(errs[0].message.contains("aggregate assignment target"));
+    }
+
+    #[test]
+    fn vhdl_delay_mechanism_is_ignored_for_lowering() {
+        let (m, sig, diags) = elab_vhdl_arch(
+            "begin\n y <= transport a after 1 ns;\n z <= reject 1 ns inertial b when en = '1' else c;",
+        );
+        assert_no_errors(&diags);
+        assert_eq!(m.assignments.len(), 2);
+        assert!(is_sig(&m.assignments[0].value, sig["a"]));
+        assert!(matches!(m.assignments[1].value, IrExpr::Ternary { .. }));
+    }
+
+    #[test]
+    fn first_waveform_value_and_conditional_value_helpers() {
+        use aion_vhdl_parser::ast::{ConditionalWaveform, SignalWaveform, Waveform};
+        let (sdb, interner, sink, mut env) = setup();
+        let a = interner.get_or_intern("a");
+        let c = interner.get_or_intern("c");
+        env.insert(a, SignalId::from_raw(0));
+        env.insert(c, SignalId::from_raw(1));
+        let wf = |id| {
+            SignalWaveform::Elements(vec![Waveform {
+                value: vhdl_name(id),
+                after: None,
+                span: Span::DUMMY,
+            }])
+        };
+        assert!(first_waveform_value(&wf(a)).is_some());
+        assert!(first_waveform_value(&SignalWaveform::Unaffected(Span::DUMMY)).is_none());
+
+        let guarded = ConditionalWaveform {
+            waveform: wf(a),
+            condition: Some(vhdl_name(c)),
+            span: Span::DUMMY,
+        };
+        let fallback = ConditionalWaveform {
+            waveform: wf(c),
+            condition: None,
+            span: Span::DUMMY,
+        };
+        let complete = [guarded.clone(), fallback];
+        assert!(matches!(
+            lower_vhdl_conditional_value(&complete, &env, &sdb, &interner, &sink),
+            Some(IrExpr::Ternary { .. })
+        ));
+        // No final else: not a pure mux.
+        assert!(lower_vhdl_conditional_value(&[guarded], &env, &sdb, &interner, &sink).is_none());
+        assert!(lower_vhdl_conditional_value(&[], &env, &sdb, &interner, &sink).is_none());
+        assert!(!sink.has_errors());
     }
 
     #[test]
