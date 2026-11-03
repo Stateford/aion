@@ -48,8 +48,11 @@ pub fn lower_verilog_expr(
             IrExpr::Literal(LogicVec::all_zero(1))
         }
         Expr::Unary { op, operand, span } => {
-            let ir_op = map_verilog_unary_op(*op);
             let ir_operand = lower_verilog_expr(operand, sig_env, source_db, interner, sink);
+            // Unary plus is the identity: lower to the operand itself.
+            let Some(ir_op) = map_verilog_unary_op(*op) else {
+                return ir_operand;
+            };
             IrExpr::Unary {
                 op: ir_op,
                 operand: Box::new(ir_operand),
@@ -226,8 +229,11 @@ pub fn lower_sv_expr(
         Expr::RealLiteral { span } => lower_verilog_literal(*span, source_db),
         Expr::StringLiteral { .. } => IrExpr::Literal(LogicVec::all_zero(1)),
         Expr::Unary { op, operand, span } => {
-            let ir_op = map_sv_unary_op(*op);
             let ir_operand = lower_sv_expr(operand, sig_env, source_db, interner, sink);
+            // Unary plus is the identity: lower to the operand itself.
+            let Some(ir_op) = map_sv_unary_op(*op) else {
+                return ir_operand;
+            };
             IrExpr::Unary {
                 op: ir_op,
                 operand: Box::new(ir_operand),
@@ -427,8 +433,11 @@ pub fn lower_vhdl_expr(
             }
         }
         Expr::Unary { op, operand, span } => {
-            let (ir_op, complement) = map_vhdl_unary_op(*op);
             let ir_operand = lower_vhdl_expr(operand, sig_env, source_db, interner, sink);
+            // Unary plus is the identity: lower to the operand itself.
+            let Some((ir_op, complement)) = map_vhdl_unary_op(*op) else {
+                return ir_operand;
+            };
             let reduced = IrExpr::Unary {
                 op: ir_op,
                 operand: Box::new(ir_operand),
@@ -932,17 +941,20 @@ fn extract_vhdl_func_name(expr: &aion_vhdl_parser::ast::Expr, interner: &Interne
 // ---------------------------------------------------------------------------
 
 /// Maps a Verilog unary operator to an IR unary operator.
-fn map_verilog_unary_op(op: aion_verilog_parser::ast::UnaryOp) -> UnaryOp {
+///
+/// Returns `None` for unary plus, which is the identity and must be lowered
+/// to its operand with no IR node.
+fn map_verilog_unary_op(op: aion_verilog_parser::ast::UnaryOp) -> Option<UnaryOp> {
     use aion_verilog_parser::ast::UnaryOp as V;
-    match op {
-        V::Plus => UnaryOp::Neg, // unary plus is identity, but we map it
+    Some(match op {
+        V::Plus => return None,
         V::Minus => UnaryOp::Neg,
         V::LogNot => UnaryOp::LogicNot,
         V::BitNot => UnaryOp::Not,
         V::RedAnd | V::RedNand => UnaryOp::RedAnd,
         V::RedOr | V::RedNor => UnaryOp::RedOr,
         V::RedXor | V::RedXnor => UnaryOp::RedXor,
-    }
+    })
 }
 
 /// Maps a Verilog binary operator to an IR binary operator.
@@ -972,10 +984,13 @@ fn map_verilog_binary_op(op: aion_verilog_parser::ast::BinaryOp) -> BinaryOp {
 }
 
 /// Maps a SystemVerilog unary operator to an IR unary operator.
-fn map_sv_unary_op(op: aion_sv_parser::ast::UnaryOp) -> UnaryOp {
+///
+/// Returns `None` for unary plus, which is the identity and must be lowered
+/// to its operand with no IR node.
+fn map_sv_unary_op(op: aion_sv_parser::ast::UnaryOp) -> Option<UnaryOp> {
     use aion_sv_parser::ast::UnaryOp as S;
-    match op {
-        S::Plus => UnaryOp::Neg, // identity
+    Some(match op {
+        S::Plus => return None,
         S::Minus => UnaryOp::Neg,
         S::LogNot => UnaryOp::LogicNot,
         S::BitNot => UnaryOp::Not,
@@ -983,7 +998,7 @@ fn map_sv_unary_op(op: aion_sv_parser::ast::UnaryOp) -> UnaryOp {
         S::RedOr | S::RedNor => UnaryOp::RedOr,
         S::RedXor | S::RedXnor => UnaryOp::RedXor,
         S::PreIncr | S::PreDecr => UnaryOp::Neg, // approximate
-    }
+    })
 }
 
 /// Maps a SystemVerilog binary operator to an IR binary operator.
@@ -1043,12 +1058,15 @@ fn map_vhdl_binary_op(op: aion_vhdl_parser::ast::BinaryOp) -> BinaryOp {
 /// complemented with an outer `Not`: the IR has no NAND/NOR/XNOR reductions,
 /// so the VHDL-2008 `nand v`, `nor v` and `xnor v` reductions lower to
 /// `not (and v)`, `not (or v)` and `not (xor v)`.
-fn map_vhdl_unary_op(op: aion_vhdl_parser::ast::UnaryOp) -> (UnaryOp, bool) {
+///
+/// Returns `None` for unary `+`, which is the identity and must be lowered
+/// to its operand with no IR node.
+fn map_vhdl_unary_op(op: aion_vhdl_parser::ast::UnaryOp) -> Option<(UnaryOp, bool)> {
     use aion_vhdl_parser::ast::UnaryOp as V;
-    match op {
+    Some(match op {
         V::Not => (UnaryOp::Not, false),
         V::Abs => (UnaryOp::Neg, false), // approximate
-        V::Pos => (UnaryOp::Neg, false), // identity
+        V::Pos => return None,
         V::Neg => (UnaryOp::Neg, false),
         // VHDL-2008 condition operator (??) treated as boolean test
         V::Condition => (UnaryOp::Not, false),
@@ -1058,7 +1076,7 @@ fn map_vhdl_unary_op(op: aion_vhdl_parser::ast::UnaryOp) -> (UnaryOp, bool) {
         V::RedNand => (UnaryOp::RedAnd, true),
         V::RedNor => (UnaryOp::RedOr, true),
         V::RedXnor => (UnaryOp::RedXor, true),
-    }
+    })
 }
 
 /// Maps a SystemVerilog compound operator to an IR binary operator.
@@ -1535,7 +1553,6 @@ mod tests {
     fn map_all_verilog_unary_ops() {
         use aion_verilog_parser::ast::UnaryOp as V;
         let ops = [
-            V::Plus,
             V::Minus,
             V::LogNot,
             V::BitNot,
@@ -1547,8 +1564,27 @@ mod tests {
             V::RedXnor,
         ];
         for op in ops {
-            let _ = map_verilog_unary_op(op);
+            assert!(map_verilog_unary_op(op).is_some(), "{op:?}");
         }
+        assert_eq!(map_verilog_unary_op(V::Minus), Some(UnaryOp::Neg));
+    }
+
+    #[test]
+    fn unary_plus_maps_to_no_ir_op() {
+        assert_eq!(
+            map_verilog_unary_op(aion_verilog_parser::ast::UnaryOp::Plus),
+            None
+        );
+        assert_eq!(map_sv_unary_op(aion_sv_parser::ast::UnaryOp::Plus), None);
+        assert_eq!(map_vhdl_unary_op(aion_vhdl_parser::ast::UnaryOp::Pos), None);
+        assert_eq!(
+            map_sv_unary_op(aion_sv_parser::ast::UnaryOp::Minus),
+            Some(UnaryOp::Neg)
+        );
+        assert_eq!(
+            map_vhdl_unary_op(aion_vhdl_parser::ast::UnaryOp::Neg),
+            Some((UnaryOp::Neg, false))
+        );
     }
 
     #[test]
@@ -1695,8 +1731,8 @@ mod tests {
     #[test]
     fn vhdl_non_reduction_unary_ops_not_complemented() {
         use aion_vhdl_parser::ast::UnaryOp as V;
-        assert_eq!(map_vhdl_unary_op(V::Not), (UnaryOp::Not, false));
-        assert_eq!(map_vhdl_unary_op(V::Neg), (UnaryOp::Neg, false));
+        assert_eq!(map_vhdl_unary_op(V::Not), Some((UnaryOp::Not, false)));
+        assert_eq!(map_vhdl_unary_op(V::Neg), Some((UnaryOp::Neg, false)));
         let (ir, sid, _) = lower_vhdl_unary(V::Not);
         assert!(is_unary_of_signal(&ir, UnaryOp::Not, sid));
     }
@@ -1707,5 +1743,165 @@ mod tests {
         assert!(is_vhdl_builtin("Rising_Edge"));
         assert!(is_vhdl_builtin("to_unsigned"));
         assert!(!is_vhdl_builtin("my_signal"));
+    }
+
+    /// Parses `src` (language chosen by the extension of `file_name`),
+    /// elaborates it with top `top`, and returns the value expression of the
+    /// continuous assignment to `y` together with the [`SignalId`] of `a`.
+    fn elaborate_assign_to_y(file_name: &str, src: &str) -> (IrExpr, SignalId) {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source(file_name, src.to_string());
+        let mut parsed = crate::ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![],
+        };
+        if file_name.ends_with(".sv") {
+            parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else if file_name.ends_with(".vhd") {
+            parsed.vhdl_files.push(aion_vhdl_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else {
+            parsed.verilog_files.push(aion_verilog_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        }
+        let config: aion_config::ProjectConfig =
+            toml::from_str("[project]\nname = \"uplus\"\nversion = \"0.1.0\"\ntop = \"top\"\n")
+                .unwrap();
+        let design = crate::elaborate(&parsed, &config, &source_db, &interner, &sink).unwrap();
+        assert!(!sink.has_errors(), "errors: {:?}", sink.diagnostics());
+        let top = &design.modules[design.top];
+        let sig = |name: &str| {
+            top.signals
+                .iter()
+                .find(|(_, s)| interner.resolve(s.name).eq_ignore_ascii_case(name))
+                .map(|(id, _)| id)
+                .unwrap_or_else(|| panic!("signal {name} not found"))
+        };
+        let (a, y) = (sig("a"), sig("y"));
+        let assign = top
+            .assignments
+            .iter()
+            .find(|asg| matches!(asg.target, SignalRef::Signal(t) if t == y))
+            .expect("assignment to y");
+        (assign.value.clone(), a)
+    }
+
+    /// Asserts that `expr` is exactly the signal `a`.
+    fn assert_is_signal(expr: &IrExpr, a: SignalId) {
+        assert!(
+            matches!(expr, IrExpr::Signal(SignalRef::Signal(s)) if *s == a),
+            "expected bare signal a, got {expr:?}"
+        );
+    }
+
+    /// Asserts that `expr` is a single `Neg` applied directly to signal `a`.
+    fn assert_single_neg(expr: &IrExpr, a: SignalId) {
+        match expr {
+            IrExpr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+                ..
+            } => assert_is_signal(operand, a),
+            other => panic!("expected Neg(a), got {other:?}"),
+        }
+    }
+
+    const VERILOG_UNARY_TMPL: &str =
+        "module top(input wire [7:0] a, output wire [7:0] y); assign y = EXPR; endmodule";
+
+    const VHDL_UNARY_TMPL: &str =
+        "entity top is port (a : in integer; y : out integer); end entity;\n\
+         architecture rtl of top is begin y <= EXPR; end architecture;";
+
+    fn verilog_assign(expr: &str) -> (IrExpr, SignalId) {
+        elaborate_assign_to_y("top.v", &VERILOG_UNARY_TMPL.replace("EXPR", expr))
+    }
+
+    fn sv_assign(expr: &str) -> (IrExpr, SignalId) {
+        let src = VERILOG_UNARY_TMPL.replace("wire", "logic");
+        elaborate_assign_to_y("top.sv", &src.replace("EXPR", expr))
+    }
+
+    fn vhdl_assign(expr: &str) -> (IrExpr, SignalId) {
+        elaborate_assign_to_y("top.vhd", &VHDL_UNARY_TMPL.replace("EXPR", expr))
+    }
+
+    #[test]
+    fn verilog_unary_plus_is_identity() {
+        let (e, a) = verilog_assign("+a");
+        assert_is_signal(&e, a);
+    }
+
+    #[test]
+    fn verilog_unary_minus_is_neg() {
+        let (e, a) = verilog_assign("-a");
+        assert_single_neg(&e, a);
+    }
+
+    #[test]
+    fn verilog_plus_of_minus_is_single_neg() {
+        let (e, a) = verilog_assign("+(-a)");
+        assert_single_neg(&e, a);
+    }
+
+    #[test]
+    fn verilog_minus_of_plus_is_single_neg() {
+        let (e, a) = verilog_assign("-(+a)");
+        assert_single_neg(&e, a);
+    }
+
+    #[test]
+    fn sv_unary_plus_is_identity() {
+        let (e, a) = sv_assign("+a");
+        assert_is_signal(&e, a);
+    }
+
+    #[test]
+    fn sv_unary_minus_is_neg() {
+        let (e, a) = sv_assign("-a");
+        assert_single_neg(&e, a);
+    }
+
+    #[test]
+    fn sv_plus_of_minus_is_single_neg() {
+        let (e, a) = sv_assign("+(-a)");
+        assert_single_neg(&e, a);
+    }
+
+    #[test]
+    fn sv_minus_of_plus_is_single_neg() {
+        let (e, a) = sv_assign("-(+a)");
+        assert_single_neg(&e, a);
+    }
+
+    #[test]
+    fn vhdl_unary_plus_is_identity() {
+        let (e, a) = vhdl_assign("+a");
+        assert_is_signal(&e, a);
+    }
+
+    #[test]
+    fn vhdl_unary_minus_is_neg() {
+        let (e, a) = vhdl_assign("-a");
+        assert_single_neg(&e, a);
+    }
+
+    #[test]
+    fn vhdl_plus_of_minus_is_single_neg() {
+        let (e, a) = vhdl_assign("+(-a)");
+        assert_single_neg(&e, a);
+    }
+
+    #[test]
+    fn vhdl_minus_of_plus_is_single_neg() {
+        let (e, a) = vhdl_assign("-(+a)");
+        assert_single_neg(&e, a);
     }
 }
