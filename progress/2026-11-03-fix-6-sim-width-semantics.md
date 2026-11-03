@@ -113,3 +113,14 @@
   - Unsized based literals (`'hFF`) are unsigned, which is correct. The
     simulator still sizes them at their minimal width, not 32 bits.
   - X/Z literals still lower to 0 in the elaborator.
+
+## Merge follow-up
+
+- After merging the review fixes, synthesis's `expr_is_signed` (added with
+  `BinaryOp::AShr`) did not know about `Expr::SignedLiteral`. So `(s + 1) >>> n`
+  was sign-filled in simulation but logically shifted in synthesis. It now
+  treats `SignedLiteral` as signed, matching the simulator. A unit test covers it.
+- Still open: synthesis does not give unsized decimals the 32-bit
+  context width the simulator now uses. For example, `(c + 1) > c` with an 8-bit
+  `c = 255` is 1 in simulation, but synthesis still evaluates it at 8 bits.
+  This mismatch existed before these changes and needs its own fix.

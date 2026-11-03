@@ -429,6 +429,8 @@ fn expr_is_signed(expr: &Expr, netlist: &Netlist) -> bool {
             netlist.types.get(netlist.signals.get(*id).ty),
             Type::Integer | Type::BitVec { signed: true, .. }
         ),
+        // Unsized decimal and `'s` literals are signed, matching the simulator.
+        Expr::SignedLiteral { .. } => true,
         Expr::Unary {
             op: UnaryOp::Not | UnaryOp::Neg,
             operand,
@@ -1223,6 +1225,14 @@ mod tests {
             &Expr::Literal(LogicVec::from_u64(1, 8)),
             &netlist
         ));
+        let one = || Expr::SignedLiteral {
+            value: LogicVec::from_u64(1, 8),
+            sized: false,
+        };
+        assert!(expr_is_signed(&one(), &netlist));
+        // `(s + 1) >>> n` stays signed, as in the simulator; `(u + 1)` does not.
+        assert!(expr_is_signed(&bin(BinaryOp::Add, rd(s), one()), &netlist));
+        assert!(!expr_is_signed(&bin(BinaryOp::Add, rd(u), one()), &netlist));
     }
 
     #[test]
