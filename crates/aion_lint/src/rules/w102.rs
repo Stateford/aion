@@ -4,7 +4,7 @@ use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Lab
 use aion_ir::{Design, Module, PortDirection, SignalKind};
 
 use crate::helpers::is_signal_driven_in_module;
-use crate::LintRule;
+use crate::{LintContext, LintRule};
 
 /// Detects signals that are declared but never driven by any assignment,
 /// process, or cell output connection.
@@ -30,7 +30,13 @@ impl LintRule for UndrivenSignal {
         Severity::Warning
     }
 
-    fn check_module(&self, module: &Module, _design: &Design, sink: &DiagnosticSink) {
+    fn check_module(
+        &self,
+        module: &Module,
+        _design: &Design,
+        ctx: &LintContext<'_>,
+        sink: &DiagnosticSink,
+    ) {
         for (sig_id, signal) in module.signals.iter() {
             // Skip constants (driven by definition)
             if signal.kind == SignalKind::Const {
@@ -49,10 +55,20 @@ impl LintRule for UndrivenSignal {
             }
 
             if !is_signal_driven_in_module(module, sig_id) {
+                let name = ctx.name(signal.name);
                 sink.emit(
-                    Diagnostic::warning(self.code(), "undriven signal", signal.span)
-                        .with_label(Label::primary(signal.span, "this signal is never assigned"))
-                        .with_help("assign a value or connect to a driver"),
+                    Diagnostic::warning(
+                        self.code(),
+                        format!("undriven signal `{name}`"),
+                        signal.span,
+                    )
+                    .with_label(Label::primary(
+                        signal.span,
+                        format!("`{name}` is never assigned"),
+                    ))
+                    .with_help(format!(
+                        "assign a value to `{name}` or connect it to a driver"
+                    )),
                 );
             }
         }
@@ -62,6 +78,7 @@ impl LintRule for UndrivenSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::test_util::empty_ctx;
     use aion_common::{ContentHash, Ident, LogicVec};
     use aion_ir::*;
     use aion_source::Span;
@@ -107,7 +124,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        UndrivenSignal.check_module(design.modules.get(design.top), &design, &sink);
+        UndrivenSignal.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, DiagnosticCode::new(Category::Warning, 102));
@@ -132,7 +149,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        UndrivenSignal.check_module(design.modules.get(design.top), &design, &sink);
+        UndrivenSignal.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -158,7 +175,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        UndrivenSignal.check_module(design.modules.get(design.top), &design, &sink);
+        UndrivenSignal.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -184,7 +201,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        UndrivenSignal.check_module(design.modules.get(design.top), &design, &sink);
+        UndrivenSignal.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
     }
@@ -203,7 +220,53 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        UndrivenSignal.check_module(design.modules.get(design.top), &design, &sink);
+        UndrivenSignal.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
+    }
+
+    // ---- Signal names in messages (issue #39) ----
+
+    #[test]
+    fn message_names_the_signal() {
+        let interner = aion_common::Interner::new();
+        let db = aion_source::SourceDb::new();
+        let mut module = mk_module();
+        module.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: interner.get_or_intern("floating"),
+            ty: TypeId::from_raw(0),
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module);
+        let sink = DiagnosticSink::new();
+        let ctx = LintContext::new(&interner, &db);
+        UndrivenSignal.check_module(design.modules.get(design.top), &design, &ctx, &sink);
+        let diags = sink.take_all();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "undriven signal `floating`");
+        assert_eq!(diags[0].labels[0].message, "`floating` is never assigned");
+    }
+
+    #[test]
+    fn unresolvable_name_uses_placeholder() {
+        let mut module = mk_module();
+        module.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: Ident::from_raw(77),
+            ty: TypeId::from_raw(0),
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module);
+        let sink = DiagnosticSink::new();
+        UndrivenSignal.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
+        let diags = sink.take_all();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "undriven signal `<unknown>`");
     }
 }

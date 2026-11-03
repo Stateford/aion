@@ -4,7 +4,7 @@ use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Lab
 use aion_ir::{Design, Module, ProcessKind};
 
 use crate::helpers::stmt_has_full_else_coverage;
-use crate::LintRule;
+use crate::{LintContext, LintRule};
 
 /// Detects combinational processes where `if` statements lack `else` branches
 /// or `case` statements lack `default` arms, which causes latch inference.
@@ -30,7 +30,13 @@ impl LintRule for LatchInferred {
         Severity::Warning
     }
 
-    fn check_module(&self, module: &Module, _design: &Design, sink: &DiagnosticSink) {
+    fn check_module(
+        &self,
+        module: &Module,
+        _design: &Design,
+        _ctx: &LintContext<'_>,
+        sink: &DiagnosticSink,
+    ) {
         for (_pid, process) in module.processes.iter() {
             if process.kind != ProcessKind::Combinational {
                 continue;
@@ -59,6 +65,7 @@ impl LintRule for LatchInferred {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::test_util::empty_ctx;
     use aion_common::{ContentHash, Ident, LogicVec};
     use aion_ir::*;
     use aion_source::Span;
@@ -113,7 +120,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        LatchInferred.check_module(design.modules.get(design.top), &design, &sink);
+        LatchInferred.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, DiagnosticCode::new(Category::Warning, 106));
@@ -147,7 +154,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        LatchInferred.check_module(design.modules.get(design.top), &design, &sink);
+        LatchInferred.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -178,7 +185,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        LatchInferred.check_module(design.modules.get(design.top), &design, &sink);
+        LatchInferred.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
     }
@@ -209,7 +216,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        LatchInferred.check_module(design.modules.get(design.top), &design, &sink);
+        LatchInferred.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 }

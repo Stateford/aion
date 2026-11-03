@@ -11,7 +11,7 @@ use aion_config::ProjectConfig;
 use aion_diagnostics::{Diagnostic, DiagnosticSink, Severity};
 use aion_elaborate::ParsedDesign;
 use aion_ir::Design;
-use aion_lint::LintEngine;
+use aion_lint::{LintContext, LintEngine};
 use aion_source::SourceDb;
 
 /// Result of running the full parse → elaborate → lint pipeline.
@@ -80,6 +80,18 @@ pub fn full_pipeline_verilog_with_lint(
 ) -> PipelineResult {
     let config = make_config_with_lint(top, deny, allow);
     run_pipeline_verilog(source, &config)
+}
+
+/// Runs the full pipeline on Verilog source with an explicit [`ProjectConfig`],
+/// e.g. one whose `[lint.naming]` section enables naming-convention checks.
+pub fn full_pipeline_verilog_with_config(source: &str, config: &ProjectConfig) -> PipelineResult {
+    run_pipeline_verilog(source, config)
+}
+
+/// Runs the full pipeline on VHDL source with an explicit [`ProjectConfig`],
+/// e.g. one whose `[lint.naming]` section enables naming-convention checks.
+pub fn full_pipeline_vhdl_with_config(source: &str, config: &ProjectConfig) -> PipelineResult {
+    run_pipeline_vhdl(source, config)
 }
 
 /// Runs the full pipeline on SystemVerilog source text.
@@ -223,7 +235,7 @@ fn finish_pipeline(
         .expect("elaboration should not return internal error");
 
     let engine = LintEngine::new(&config.lint);
-    engine.run(&design, sink);
+    engine.run(&design, &LintContext::new(interner, source_db), sink);
 
     let diagnostics = sink.diagnostics();
     let has_errors = sink.has_errors();
@@ -268,6 +280,31 @@ mod tests {
         let result = full_pipeline_verilog("module top; endmodule", "top");
         assert!(!result.has_errors);
         assert_eq!(result.design.module_count(), 1);
+    }
+
+    #[test]
+    fn pipeline_verilog_with_config_uses_given_config() {
+        let config = make_config_with_lint("top", &[], &["missing-doc"]);
+        let result = full_pipeline_verilog_with_config("module top; endmodule", &config);
+        assert!(!result.has_errors);
+        assert!(!result.diagnostics.iter().any(|d| d.code.number == 202));
+        let unknown_top = full_pipeline_verilog_with_config("module a; endmodule", &config);
+        assert!(unknown_top.has_errors, "top `top` does not exist");
+    }
+
+    #[test]
+    fn pipeline_vhdl_with_config_uses_given_config() {
+        let src = "entity top is end entity;\narchitecture rtl of top is begin end architecture;";
+        let config = make_config_with_lint("top", &["missing-doc"], &[]);
+        let result = full_pipeline_vhdl_with_config(src, &config);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.code.number == 202 && d.severity == aion_diagnostics::Severity::Error),
+            "denied C202 must be an error: {:#?}",
+            result.diagnostics
+        );
     }
 
     #[test]

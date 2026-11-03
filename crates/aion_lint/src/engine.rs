@@ -16,8 +16,8 @@ use aion_config::LintConfig;
 use aion_diagnostics::{Diagnostic, DiagnosticSink, Severity};
 use aion_ir::{Design, Module};
 
-use crate::rules::register_builtin_rules;
-use crate::{LintRule, LINT_INTERNAL_ERROR};
+use crate::rules::{register_builtin_rules, NamingViolation};
+use crate::{LintContext, LintRule, LINT_INTERNAL_ERROR};
 
 /// The lint engine that orchestrates running lint rules on a design.
 ///
@@ -31,6 +31,9 @@ pub struct LintEngine {
     denied: HashSet<String>,
     /// Rule names that should be suppressed (not reported).
     allowed: HashSet<String>,
+    /// The C201 rule configured from `config.naming`, registered by
+    /// [`register_builtin_rules`].
+    pub(crate) naming: NamingViolation,
 }
 
 impl LintEngine {
@@ -38,7 +41,8 @@ impl LintEngine {
     ///
     /// All builtin rules are registered automatically. Rules listed in
     /// `config.deny` are promoted to error severity, and rules listed
-    /// in `config.allow` are suppressed entirely.
+    /// in `config.allow` are suppressed entirely. `config.naming` selects
+    /// the conventions the naming-violation rule (C201) enforces.
     pub fn new(config: &LintConfig) -> Self {
         let denied: HashSet<String> = config.deny.iter().cloned().collect();
         let allowed: HashSet<String> = config.allow.iter().cloned().collect();
@@ -47,6 +51,7 @@ impl LintEngine {
             rules: Vec::new(),
             denied,
             allowed,
+            naming: NamingViolation::new(config.naming.as_ref()),
         };
 
         register_builtin_rules(&mut engine);
@@ -80,7 +85,10 @@ impl LintEngine {
     /// panicking are kept, and an error with code [`LINT_INTERNAL_ERROR`]
     /// (`E199`) naming the rule and carrying the panic message is emitted at
     /// the module's span. Linting then continues with the next rule.
-    pub fn run(&self, design: &Design, sink: &DiagnosticSink) {
+    ///
+    /// `ctx` must carry the interner the design was elaborated with and the
+    /// source database its spans point into; it is passed to every rule.
+    pub fn run(&self, design: &Design, ctx: &LintContext<'_>, sink: &DiagnosticSink) {
         for (_mod_id, module) in design.modules.iter() {
             for rule in &self.rules {
                 let rule_name = rule.name().to_string();
@@ -96,7 +104,7 @@ impl LintEngine {
                 // caught panic cannot leave shared state half-updated; it is
                 // therefore sound to assert unwind safety here.
                 let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                    rule.check_module(module, design, &temp_sink);
+                    rule.check_module(module, design, ctx, &temp_sink);
                 }));
 
                 // Transfer diagnostics, adjusting severity if denied
@@ -187,6 +195,7 @@ fn panic_message(payload: &dyn Any) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::test_util::empty_ctx;
     use aion_diagnostics::{Category, DiagnosticCode};
     use aion_ir::*;
     use aion_source::Span;
@@ -205,7 +214,13 @@ mod tests {
         fn default_severity(&self) -> Severity {
             Severity::Warning
         }
-        fn check_module(&self, _module: &Module, _design: &Design, sink: &DiagnosticSink) {
+        fn check_module(
+            &self,
+            _module: &Module,
+            _design: &Design,
+            _ctx: &LintContext<'_>,
+            sink: &DiagnosticSink,
+        ) {
             sink.emit(Diagnostic::warning(
                 self.code(),
                 "dummy warning",
@@ -258,7 +273,7 @@ mod tests {
         engine.register(Box::new(DummyRule));
         let design = mk_empty_design();
         let sink = DiagnosticSink::new();
-        engine.run(&design, &sink);
+        engine.run(&design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         // DummyRule fires once per module, there's 1 module
         assert!(diags.iter().any(|d| d.message == "dummy warning"));
@@ -276,7 +291,7 @@ mod tests {
         engine.register(Box::new(DummyRule));
         let design = mk_empty_design();
         let sink = DiagnosticSink::new();
-        engine.run(&design, &sink);
+        engine.run(&design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert!(
             !diags.iter().any(|d| d.message == "dummy warning"),
@@ -296,7 +311,7 @@ mod tests {
         engine.register(Box::new(DummyRule));
         let design = mk_empty_design();
         let sink = DiagnosticSink::new();
-        engine.run(&design, &sink);
+        engine.run(&design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         let dummy_diags: Vec<_> = diags
             .iter()
@@ -355,7 +370,13 @@ mod tests {
         fn default_severity(&self) -> Severity {
             Severity::Warning
         }
-        fn check_module(&self, _module: &Module, _design: &Design, sink: &DiagnosticSink) {
+        fn check_module(
+            &self,
+            _module: &Module,
+            _design: &Design,
+            _ctx: &LintContext<'_>,
+            sink: &DiagnosticSink,
+        ) {
             sink.emit(Diagnostic::warning(
                 self.code(),
                 "emitted before panic",
@@ -381,7 +402,13 @@ mod tests {
         fn default_severity(&self) -> Severity {
             Severity::Warning
         }
-        fn check_module(&self, _module: &Module, _design: &Design, _sink: &DiagnosticSink) {
+        fn check_module(
+            &self,
+            _module: &Module,
+            _design: &Design,
+            _ctx: &LintContext<'_>,
+            _sink: &DiagnosticSink,
+        ) {
             panic!("static boom");
         }
     }
@@ -401,7 +428,7 @@ mod tests {
         engine.register(Box::new(DummyRule));
         let design = mk_empty_design();
         let sink = DiagnosticSink::new();
-        engine.run(&design, &sink);
+        engine.run(&design, &empty_ctx(), &sink);
         let diags = sink.take_all();
 
         assert!(
@@ -434,7 +461,7 @@ mod tests {
         engine.register(Box::new(PanickingRule));
         let design = mk_empty_design();
         let sink = DiagnosticSink::new();
-        engine.run(&design, &sink);
+        engine.run(&design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert!(diags.iter().any(|d| d.message == "emitted before panic"));
     }
@@ -448,7 +475,7 @@ mod tests {
         engine.register(Box::new(StrPanickingRule));
         engine.register(Box::new(DummyRule));
         let sink = DiagnosticSink::new();
-        engine.run(&design, &sink);
+        engine.run(&design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         let internal = internal_errors(&diags);
         assert_eq!(internal.len(), 2, "one internal error per module");
@@ -472,7 +499,7 @@ mod tests {
         engine.register(Box::new(PanickingRule));
         let design = mk_empty_design();
         let sink = DiagnosticSink::new();
-        engine.run(&design, &sink);
+        engine.run(&design, &empty_ctx(), &sink);
         assert!(internal_errors(&sink.take_all()).is_empty());
     }
 

@@ -10,3 +10,4 @@ aion_ir = { workspace = true }
 aion_source = { workspace = true }
 aion_diagnostics = { workspace = true }
 aion_config = { workspace = true }
+aion_arch = { workspace = true }

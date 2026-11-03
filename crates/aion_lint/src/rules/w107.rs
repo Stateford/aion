@@ -4,7 +4,7 @@ use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Lab
 use aion_ir::{Design, Expr, Module, SignalRef, Statement};
 
 use crate::helpers::{expr_width, signal_ref_width};
-use crate::LintRule;
+use crate::{LintContext, LintRule};
 
 /// Detects assignments where the RHS is wider than the LHS, causing
 /// implicit truncation of high bits.
@@ -15,7 +15,7 @@ use crate::LintRule;
 /// ([`signal_ref_width`] and [`expr_width`]), so neither rule trusts the
 /// elaborator's placeholder result types. W107 is deliberately more
 /// conservative on the RHS: bit-selects and slices are treated as unknown
-/// width (see [`rhs_width`]), because the elaborator currently lowers indexed
+/// width (see `rhs_width`), because the elaborator currently lowers indexed
 /// part-selects (`a[b +: w]`) as `Slice { high: b, low: w }`, which is
 /// indistinguishable from a real `[b:w]` range in the IR.
 pub struct Truncation;
@@ -37,52 +37,102 @@ impl LintRule for Truncation {
         Severity::Warning
     }
 
-    fn check_module(&self, module: &Module, design: &Design, sink: &DiagnosticSink) {
+    fn check_module(
+        &self,
+        module: &Module,
+        design: &Design,
+        ctx: &LintContext<'_>,
+        sink: &DiagnosticSink,
+    ) {
+        let checker = TruncationChecker {
+            module,
+            design,
+            ctx,
+            code: self.code(),
+            sink,
+        };
+
         // Check continuous assignments
         for assign in &module.assignments {
-            check_truncation(
-                &assign.target,
-                &assign.value,
-                assign.span,
-                module,
-                design,
-                self.code(),
-                sink,
-            );
+            checker.check_assign(&assign.target, &assign.value, assign.span);
         }
 
         // Check process body assignments
         for (_pid, process) in module.processes.iter() {
-            check_stmt_truncation(&process.body, module, design, self.code(), sink);
+            checker.check_stmt(&process.body);
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn check_truncation(
-    target: &SignalRef,
-    value: &Expr,
-    span: aion_source::Span,
-    module: &Module,
-    design: &Design,
+/// The per-module state W107 needs while walking assignments.
+struct TruncationChecker<'m, 'c> {
+    module: &'m Module,
+    design: &'m Design,
+    ctx: &'m LintContext<'c>,
     code: DiagnosticCode,
-    sink: &DiagnosticSink,
-) {
-    let lhs_width = signal_ref_width(target, module, design);
-    let rhs_width = rhs_width(value, design);
-    if let (Some(lw), Some(rw)) = (lhs_width, rhs_width) {
-        if rw > lw {
-            sink.emit(
-                Diagnostic::warning(
-                    code,
-                    format!(
-                        "truncation: {rw}-bit value assigned to {lw}-bit target, losing {} bits",
-                        rw - lw
-                    ),
-                    span,
-                )
-                .with_label(Label::primary(span, "high bits will be truncated")),
-            );
+    sink: &'m DiagnosticSink,
+}
+
+impl TruncationChecker<'_, '_> {
+    /// Reports `target = value` if the value is wider than the target.
+    fn check_assign(&self, target: &SignalRef, value: &Expr, span: aion_source::Span) {
+        let lhs_width = signal_ref_width(target, self.module, self.design);
+        let rhs_width = rhs_width(value, self.design);
+        if let (Some(lw), Some(rw)) = (lhs_width, rhs_width) {
+            if rw > lw {
+                let target_desc = self
+                    .ctx
+                    .signal_ref_name(self.module, target)
+                    .map(|n| format!(" `{n}`"))
+                    .unwrap_or_default();
+                self.sink.emit(
+                    Diagnostic::warning(
+                        self.code,
+                        format!(
+                            "truncation: {rw}-bit value assigned to {lw}-bit target{target_desc}, losing {} bits",
+                            rw - lw
+                        ),
+                        span,
+                    )
+                    .with_label(Label::primary(span, "high bits will be truncated")),
+                );
+            }
+        }
+    }
+
+    /// Checks every assignment nested in `stmt`.
+    fn check_stmt(&self, stmt: &Statement) {
+        match stmt {
+            Statement::Assign {
+                target,
+                value,
+                span,
+                ..
+            } => self.check_assign(target, value, *span),
+            Statement::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.check_stmt(then_body);
+                if let Some(else_b) = else_body {
+                    self.check_stmt(else_b);
+                }
+            }
+            Statement::Case { arms, default, .. } => {
+                for arm in arms {
+                    self.check_stmt(&arm.body);
+                }
+                if let Some(def) = default {
+                    self.check_stmt(def);
+                }
+            }
+            Statement::Block { stmts, .. } => {
+                for s in stmts {
+                    self.check_stmt(s);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -107,52 +157,10 @@ fn rhs_width(expr: &Expr, design: &Design) -> Option<u32> {
     }
 }
 
-fn check_stmt_truncation(
-    stmt: &Statement,
-    module: &Module,
-    design: &Design,
-    code: DiagnosticCode,
-    sink: &DiagnosticSink,
-) {
-    match stmt {
-        Statement::Assign {
-            target,
-            value,
-            span,
-            ..
-        } => {
-            check_truncation(target, value, *span, module, design, code, sink);
-        }
-        Statement::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            check_stmt_truncation(then_body, module, design, code, sink);
-            if let Some(else_b) = else_body {
-                check_stmt_truncation(else_b, module, design, code, sink);
-            }
-        }
-        Statement::Case { arms, default, .. } => {
-            for arm in arms {
-                check_stmt_truncation(&arm.body, module, design, code, sink);
-            }
-            if let Some(def) = default {
-                check_stmt_truncation(def, module, design, code, sink);
-            }
-        }
-        Statement::Block { stmts, .. } => {
-            for s in stmts {
-                check_stmt_truncation(s, module, design, code, sink);
-            }
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::test_util::empty_ctx;
     use aion_common::{ContentHash, Ident, LogicVec};
     use aion_ir::*;
     use aion_source::Span;
@@ -208,7 +216,7 @@ mod tests {
         });
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        Truncation.check_module(design.modules.get(design.top), &design, &sink);
+        Truncation.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("truncation"));
@@ -239,7 +247,7 @@ mod tests {
         });
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        Truncation.check_module(design.modules.get(design.top), &design, &sink);
+        Truncation.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -267,7 +275,7 @@ mod tests {
         });
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        Truncation.check_module(design.modules.get(design.top), &design, &sink);
+        Truncation.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -302,7 +310,7 @@ mod tests {
     fn run_rule(module: Module, types: TypeDb) -> Vec<aion_diagnostics::Diagnostic> {
         let design = mk_design(module, types);
         let sink = DiagnosticSink::new();
-        Truncation.check_module(design.modules.get(design.top), &design, &sink);
+        Truncation.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         sink.take_all()
     }
 
@@ -546,5 +554,59 @@ mod tests {
         let diags = run_rule(module, types);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("losing 4 bits"));
+    }
+
+    // ---- Target names in messages (issue #39) ----
+
+    #[test]
+    fn message_names_the_target_signal() {
+        let interner = aion_common::Interner::new();
+        let db = aion_source::SourceDb::new();
+        let mut module = mk_module();
+        let mut types = TypeDb::new();
+        let ty4 = types.intern(Type::BitVec {
+            width: 4,
+            signed: false,
+        });
+        let sig_id = module.signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: interner.get_or_intern("nibble"),
+            ty: ty4,
+            kind: SignalKind::Wire,
+            init: None,
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(sig_id),
+            value: Expr::Literal(LogicVec::from_u64(0xA5, 8)),
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module, types);
+        let sink = DiagnosticSink::new();
+        let ctx = LintContext::new(&interner, &db);
+        Truncation.check_module(design.modules.get(design.top), &design, &ctx, &sink);
+        let diags = sink.take_all();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "truncation: 8-bit value assigned to 4-bit target `nibble`, losing 4 bits"
+        );
+    }
+
+    #[test]
+    fn constant_target_message_has_no_name() {
+        let mut module = mk_module();
+        module.assignments.push(Assignment {
+            target: SignalRef::Const(LogicVec::all_zero(2)),
+            value: Expr::Literal(LogicVec::from_u64(0xA5, 8)),
+            span: Span::DUMMY,
+        });
+        let diags = run_rule(module, TypeDb::new());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "truncation: 8-bit value assigned to 2-bit target, losing 6 bits"
+        );
     }
 }

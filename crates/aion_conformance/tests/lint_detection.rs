@@ -4,7 +4,8 @@
 //! and asserts that expected diagnostics are (or are not) emitted.
 
 use aion_conformance::{
-    full_pipeline_sv, full_pipeline_verilog, full_pipeline_verilog_with_lint, full_pipeline_vhdl,
+    full_pipeline_sv, full_pipeline_verilog, full_pipeline_verilog_with_config,
+    full_pipeline_verilog_with_lint, full_pipeline_vhdl, full_pipeline_vhdl_with_config,
 };
 use aion_diagnostics::Severity;
 
@@ -604,43 +605,429 @@ endmodule
 }
 
 // ============================================================================
-// C201: Naming violation (stub — verify no false positives)
+// C201: Naming violation (checked against `[lint.naming]`)
 // ============================================================================
 
+/// Builds a config with `[lint.naming]` set to snake_case modules/signals
+/// and UPPER_SNAKE_CASE parameters/constants.
+fn naming_config(top: &str) -> aion_config::ProjectConfig {
+    let toml_str = format!(
+        r#"
+[project]
+name = "conformance_test"
+version = "0.1.0"
+top = "{top}"
+
+[lint.naming]
+module = "snake_case"
+signal = "snake_case"
+parameter = "upper_snake_case"
+constant = "upper_snake_case"
+"#
+    );
+    toml::from_str(&toml_str).unwrap()
+}
+
 #[test]
-fn naming_stub_no_false_positives_c201() {
+fn naming_without_config_reports_nothing_c201() {
     let src = r#"
-module my_module (input a_in, output y_out);
-    wire internal_wire;
+module MyModule (input aIn, output yOut);
+    assign yOut = aIn;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "MyModule");
+    let has_c201 = result.diagnostics.iter().any(|d| d.code.number == 201);
+    assert!(!has_c201, "C201 must stay silent without [lint.naming]");
+}
+
+#[test]
+fn conforming_names_no_c201() {
+    let src = r#"
+module my_module #(parameter WIDTH = 4) (input [WIDTH-1:0] a_in, output [WIDTH-1:0] y_out);
+    wire [WIDTH-1:0] internal_wire;
     assign internal_wire = a_in;
     assign y_out = internal_wire;
 endmodule
 "#;
-    let result = full_pipeline_verilog(src, "my_module");
-    let has_c201 = result.diagnostics.iter().any(|d| d.code.number == 201);
+    let result = full_pipeline_verilog_with_config(src, &naming_config("my_module"));
+    let c201: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 201)
+        .collect();
+    assert!(c201.is_empty(), "{c201:#?}");
+}
+
+#[test]
+fn naming_violations_are_reported_with_names_c201() {
+    let src = r#"
+module MyModule #(parameter width = 4) (input [width-1:0] dataIn, output [width-1:0] y);
+    assign y = dataIn;
+endmodule
+"#;
+    let result = full_pipeline_verilog_with_config(src, &naming_config("MyModule"));
+    let msgs: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 201)
+        .map(|d| d.message.as_str())
+        .collect();
     assert!(
-        !has_c201,
-        "C201 is currently a stub — should not emit false positives"
+        msgs.contains(&"module name `MyModule` does not follow the snake_case convention"),
+        "{msgs:#?}"
+    );
+    assert!(
+        msgs.contains(&"parameter name `width` does not follow the UPPER_SNAKE_CASE convention"),
+        "{msgs:#?}"
+    );
+    assert!(
+        msgs.contains(&"signal name `dataIn` does not follow the snake_case convention"),
+        "{msgs:#?}"
+    );
+    assert_eq!(msgs.len(), 3, "{msgs:#?}");
+    // The note quotes the exact aion.toml spelling, not the display label.
+    let param = result
+        .diagnostics
+        .iter()
+        .find(|d| d.code.number == 201 && d.message.contains("`width`"))
+        .expect("parameter violation");
+    assert!(
+        param
+            .notes
+            .iter()
+            .any(|n| n.contains("`parameter = \"upper_snake_case\"`")),
+        "{:#?}",
+        param.notes
+    );
+}
+
+#[test]
+fn vhdl_names_checked_as_written_c201() {
+    // The VHDL parser folds identifiers to lowercase; C201 must still see
+    // `DATA_WIDTH` (conforming) and `DataOut` (violating) as spelled.
+    let src = r#"
+entity blink is
+    generic (DATA_WIDTH : integer := 8);
+    port (clk : in bit; DataOut : out bit);
+end entity;
+
+architecture rtl of blink is
+begin
+    DataOut <= clk;
+end architecture;
+"#;
+    let result = full_pipeline_vhdl_with_config(src, &naming_config("blink"));
+    let msgs: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 201)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        msgs,
+        vec!["signal name `DataOut` does not follow the snake_case convention"],
+        "{:#?}",
+        result.diagnostics
     );
 }
 
 // ============================================================================
-// C202: Missing doc (stub — verify no false positives)
+// C202: Missing doc
 // ============================================================================
 
 #[test]
-fn missing_doc_stub_no_false_positives_c202() {
+fn undocumented_module_c202() {
     let src = r#"
 module top (input a, output y);
     assign y = a;
 endmodule
 "#;
     let result = full_pipeline_verilog(src, "top");
+    let c202: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 202)
+        .collect();
+    assert_eq!(c202.len(), 1, "{:#?}", result.diagnostics);
+    assert_eq!(c202[0].message, "module `top` has no documentation comment");
+    assert_eq!(c202[0].severity, Severity::Warning);
+}
+
+#[test]
+fn documented_module_no_c202() {
+    let src = r#"
+// Pass-through buffer used by the conformance suite.
+module top (input a, output y);
+    assign y = a;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
     let has_c202 = result.diagnostics.iter().any(|d| d.code.number == 202);
-    assert!(
-        !has_c202,
-        "C202 is currently a stub — should not emit false positives"
+    assert!(!has_c202, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn documented_vhdl_entity_no_c202() {
+    let src = r#"
+-- Drives the output from the clock.
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity blink is
+    port (clk : in std_logic; led : out std_logic);
+end entity;
+
+architecture rtl of blink is
+begin
+    led <= clk;
+end architecture;
+"#;
+    let result = full_pipeline_vhdl(src, "blink");
+    let has_c202 = result.diagnostics.iter().any(|d| d.code.number == 202);
+    assert!(!has_c202, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn trailing_block_comment_after_code_is_not_doc_c202() {
+    // `endmodule /* end */` ends with `*/` but is code, not a header comment
+    // for the module declared on the next line.
+    let src = "// Pass-through.\nmodule sub(input a, output y);\n    assign y = a; endmodule /* end */\nmodule top(input a, output y);\n    sub u(.a(a), .y(y));\nendmodule\n";
+    let result = full_pipeline_verilog(src, "top");
+    let c202: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 202)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(c202, vec!["module `top` has no documentation comment"]);
+}
+
+#[test]
+fn parameterized_module_c202_reported_once() {
+    let src = r#"
+// Top level.
+module top (input [7:0] a, input [3:0] b, output [7:0] y, output [3:0] z);
+    buffer #(.W(8)) u8 (.d(a), .q(y));
+    buffer #(.W(4)) u4 (.d(b), .q(z));
+endmodule
+
+module buffer #(parameter W = 1) (input [W-1:0] d, output [W-1:0] q);
+    assign q = d;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    let c202: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 202)
+        .collect();
+    assert_eq!(c202.len(), 1, "{c202:#?}");
+    assert!(c202[0].message.contains("`buffer`"));
+}
+
+// ============================================================================
+// Issue #39: W101 reads and real names in messages
+// ============================================================================
+
+#[test]
+fn gated_clock_used_only_in_edge_list_no_w101() {
+    let src = r#"
+module top (input clk, input en, input d, output reg q);
+    wire gclk;
+    assign gclk = clk & en;
+    always @(posedge gclk) q <= d;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    let w101: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 101)
+        .collect();
+    assert!(w101.is_empty(), "gclk is read by the edge list: {w101:#?}");
+}
+
+#[test]
+fn async_reset_used_only_in_edge_list_no_w101() {
+    let src = r#"
+module top (input clk, input rst_in, input d, output reg q);
+    wire arst;
+    assign arst = ~rst_in;
+    always @(posedge clk or posedge arst)
+        if (arst) q <= 1'b0; else q <= d;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    let has_w101 = result.diagnostics.iter().any(|d| d.code.number == 101);
+    assert!(!has_w101, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn underscore_prefixed_wire_no_w101() {
+    let src = r#"
+module top (input a, output y);
+    wire _unused;
+    wire spare;
+    assign y = a;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    let w101: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 101)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(w101, vec!["unused signal `spare`"]);
+}
+
+#[test]
+fn dynamic_index_of_write_is_a_read_no_w101() {
+    let src = r#"
+module top (input clk, input [2:0] sel, input d, output [7:0] q);
+    reg [7:0] r;
+    wire [2:0] addr;
+    assign addr = sel;
+    always @(posedge clk) r[addr] <= d;
+    assign q = r;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    let w101: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 101)
+        .collect();
+    assert!(w101.is_empty(), "addr is read as an index: {w101:#?}");
+}
+
+/// Returns the W101 messages in `result`.
+fn w101_messages(result: &aion_conformance::PipelineResult) -> Vec<&str> {
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 101)
+        .map(|d| d.message.as_str())
+        .collect()
+}
+
+#[test]
+fn unused_concat_target_still_w101() {
+    // Regression: the dynamic-index fallback must not treat `{...}` on the
+    // left-hand side as an index, or an unused carry-out goes unreported.
+    let src = r#"
+module top (input [3:0] a, input [3:0] b, output [3:0] y);
+    wire carry;
+    wire [3:0] s;
+    assign {carry, s} = a + b;
+    assign y = s;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    assert_eq!(w101_messages(&result), vec!["unused signal `carry`"]);
+}
+
+#[test]
+fn unused_procedural_concat_target_still_w101() {
+    let src = r#"
+module top (input clk, input [3:0] a, input [3:0] b, output reg [3:0] y);
+    reg carry;
+    reg [3:0] s;
+    always @(posedge clk) begin
+        {carry, s} <= a + b;
+        y <= s;
+    end
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    assert_eq!(w101_messages(&result), vec!["unused signal `carry`"]);
+}
+
+#[test]
+fn dynamic_index_read_is_case_sensitive_in_verilog() {
+    // `Addr` is read by the index; `addr` is a different, unused signal.
+    let src = r#"
+module top (input clk, input [2:0] sel, input d, output [7:0] q);
+    reg [7:0] mem;
+    wire [2:0] Addr;
+    wire [2:0] addr;
+    assign Addr = sel;
+    always @(posedge clk) mem[Addr] <= d;
+    assign q = mem;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    assert_eq!(w101_messages(&result), vec!["unused signal `addr`"]);
+}
+
+#[test]
+fn w101_message_names_the_signal() {
+    let src = r#"
+module top (input a, output y);
+    wire unused_w;
+    assign y = a;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    let w101 = result
+        .diagnostics
+        .iter()
+        .find(|d| d.code.number == 101)
+        .expect("W101 expected");
+    assert_eq!(w101.message, "unused signal `unused_w`");
+}
+
+#[test]
+fn e105_messages_name_ports_not_ids() {
+    let src = r#"
+module sub (input a, input b, output y);
+    assign y = a & b;
+endmodule
+
+module top (input x, output z);
+    sub u0 (.a(x), .y(z));
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    let e105: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.number == 105)
+        .collect();
+    assert_eq!(e105.len(), 1, "{e105:#?}");
+    assert_eq!(
+        e105[0].message,
+        "missing port connection: port `b` of module `sub` is not connected in instance `u0`"
     );
+    assert!(
+        e105[0].labels.iter().all(|l| !l.message.contains('\'')),
+        "labels must not quote raw IDs: {:#?}",
+        e105[0].labels
+    );
+}
+
+#[test]
+fn e104_and_w102_messages_name_the_signal() {
+    let src = r#"
+module top (input a, input b, output y);
+    wire w;
+    wire floating;
+    assign w = a;
+    assign w = b;
+    assign y = w | floating;
+endmodule
+"#;
+    let result = full_pipeline_verilog(src, "top");
+    let msgs: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(
+        msgs.contains(&"signal `w` has 2 concurrent drivers"),
+        "{msgs:#?}"
+    );
+    assert!(msgs.contains(&"undriven signal `floating`"), "{msgs:#?}");
 }
 
 // ============================================================================

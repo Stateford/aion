@@ -3,7 +3,7 @@
 use aion_diagnostics::{Category, Diagnostic, DiagnosticCode, DiagnosticSink, Label, Severity};
 use aion_ir::{Design, Expr, Module, Statement};
 
-use crate::LintRule;
+use crate::{LintContext, LintRule};
 
 /// Detects "magic numbers" — literal values wider than 1 bit and not
 /// 0 or 1 used directly in expressions.
@@ -29,7 +29,13 @@ impl LintRule for MagicNumber {
         Severity::Warning
     }
 
-    fn check_module(&self, module: &Module, _design: &Design, sink: &DiagnosticSink) {
+    fn check_module(
+        &self,
+        module: &Module,
+        _design: &Design,
+        _ctx: &LintContext<'_>,
+        sink: &DiagnosticSink,
+    ) {
         // Check process bodies for magic numbers in expressions
         for (_pid, process) in module.processes.iter() {
             check_stmt_magic_numbers(&process.body, self.code(), sink);
@@ -173,6 +179,7 @@ fn check_expr_magic_numbers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::test_util::empty_ctx;
     use aion_common::{ContentHash, Ident, LogicVec};
     use aion_ir::*;
     use aion_source::Span;
@@ -214,7 +221,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MagicNumber.check_module(design.modules.get(design.top), &design, &sink);
+        MagicNumber.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("magic number"));
@@ -235,7 +242,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MagicNumber.check_module(design.modules.get(design.top), &design, &sink);
+        MagicNumber.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -249,7 +256,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MagicNumber.check_module(design.modules.get(design.top), &design, &sink);
+        MagicNumber.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -263,7 +270,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MagicNumber.check_module(design.modules.get(design.top), &design, &sink);
+        MagicNumber.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -282,7 +289,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MagicNumber.check_module(design.modules.get(design.top), &design, &sink);
+        MagicNumber.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -302,7 +309,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MagicNumber.check_module(design.modules.get(design.top), &design, &sink);
+        MagicNumber.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         assert!(sink.take_all().is_empty());
     }
 
@@ -324,7 +331,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MagicNumber.check_module(design.modules.get(design.top), &design, &sink);
+        MagicNumber.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("0xDEAD"));
@@ -359,7 +366,7 @@ mod tests {
         });
         let design = mk_design(module);
         let sink = DiagnosticSink::new();
-        MagicNumber.check_module(design.modules.get(design.top), &design, &sink);
+        MagicNumber.check_module(design.modules.get(design.top), &design, &empty_ctx(), &sink);
         let diags = sink.take_all();
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert!(diags[0].message.contains("0x5"));
