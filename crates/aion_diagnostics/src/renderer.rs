@@ -360,4 +360,57 @@ mod tests {
         let output = TerminalRenderer::new(false, 80).render(&diag, &source_db);
         assert!(output.ends_with(" |   ^\n"), "{output}");
     }
+
+    #[test]
+    fn floor_char_boundary_clamps_smart_quotes() {
+        let s = "a\u{2018}b"; // 'a', 3-byte quote, 'b'
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 1);
+        assert_eq!(floor_char_boundary(s, 2), 1);
+        assert_eq!(floor_char_boundary(s, 3), 1);
+        assert_eq!(floor_char_boundary(s, 4), 4);
+        assert_eq!(floor_char_boundary(s, 99), s.len());
+        assert_eq!(floor_char_boundary("", 3), 0);
+    }
+
+    #[test]
+    fn get_source_line_inside_smart_quote() {
+        let content = "first\nx <= \u{2018}1\u{2019};\nlast";
+        // Offset 12 is inside the 3-byte U+2018 (bytes 11..14).
+        assert_eq!(get_source_line(content, 12), "x <= \u{2018}1\u{2019};");
+        assert_eq!(get_source_line(content, 13), "x <= \u{2018}1\u{2019};");
+        // Past the end clamps to the last line.
+        assert_eq!(get_source_line(content, 1000), "last");
+    }
+
+    #[test]
+    fn render_smart_quote_spans_do_not_panic() {
+        // VHDL source with pasted smart quotes (issue #22, VHDL-5).
+        let mut source_db = SourceDb::new();
+        let src = "x <= \u{2018}1\u{2019};\n";
+        let file_id = source_db.add_source("smart.vhd", src.to_string());
+        let code = DiagnosticCode::new(Category::Error, 100);
+        // Spans starting and ending inside multi-byte characters.
+        for (start, end) in [(6, 7), (7, 10), (5, 13), (13, 13)] {
+            let span = aion_source::Span::new(file_id, start, end);
+            let diag = Diagnostic::error(code, "unrecognized character", span);
+            let output = TerminalRenderer::new(false, 80).render(&diag, &source_db);
+            assert!(output.contains("x <= \u{2018}1\u{2019};"), "{output}");
+            assert!(output.contains('^'));
+        }
+    }
+
+    #[test]
+    fn render_carets_align_after_multibyte_prefix() {
+        let mut source_db = SourceDb::new();
+        let src = "\u{e9}\u{e9} <= \u{2018}1;\n";
+        let file_id = source_db.add_source("t.vhd", src.to_string());
+        // U+2018 is bytes 8..11; it is the 6th character (char column 6).
+        let span = aion_source::Span::new(file_id, 8, 11);
+        let diag = Diagnostic::error(DiagnosticCode::new(Category::Error, 100), "bad", span);
+        let output = TerminalRenderer::new(false, 80).render(&diag, &source_db);
+        let caret_line = output.lines().find(|l| l.contains('^')).unwrap();
+        // "  | " prefix, then 6 spaces of padding, then exactly one caret.
+        assert!(caret_line.ends_with("|       ^"), "{caret_line:?}");
+    }
 }
