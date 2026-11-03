@@ -15,8 +15,8 @@ use aion_source::SourceDb;
 use crate::const_eval;
 use crate::errors;
 use crate::expr::{
-    self, lower_sv_expr, lower_sv_to_signal_ref, lower_to_signal_ref, lower_verilog_expr,
-    lower_vhdl_expr, lower_vhdl_to_signal_ref, SignalEnv,
+    self, lower_sv_assign_value, lower_sv_expr, lower_sv_to_signal_ref, lower_to_signal_ref,
+    lower_verilog_expr, lower_vhdl_expr, lower_vhdl_to_signal_ref, SignalEnv, WidthLookup,
 };
 
 /// Default timescale: 1 time unit = 1 ns = 1,000,000 fs.
@@ -222,10 +222,13 @@ pub fn lower_verilog_looping_always(
 
 /// SystemVerilog counterpart of [`lower_verilog_looping_always`] for a plain
 /// `always` block without a top-level event control.
+///
+/// `widths` sizes context-dependent literals, as in [`lower_sv_stmt_sized`].
 pub fn lower_sv_looping_always(
     body: &aion_sv_parser::ast::Statement,
     always_span: aion_source::Span,
     sig_env: &SignalEnv,
+    widths: &WidthLookup<'_>,
     source_db: &SourceDb,
     interner: &Interner,
     sink: &DiagnosticSink,
@@ -234,7 +237,9 @@ pub fn lower_sv_looping_always(
         sink.emit(errors::warn_always_without_timing(always_span));
     }
     IrStmt::Forever {
-        body: Box::new(lower_sv_stmt(body, sig_env, source_db, interner, sink)),
+        body: Box::new(lower_sv_stmt_sized(
+            body, sig_env, widths, source_db, interner, sink,
+        )),
         span: always_span,
     }
 }
@@ -346,9 +351,30 @@ fn sv_may_yield(stmt: &aion_sv_parser::ast::Statement, interner: &Interner) -> b
 }
 
 /// Lowers a SystemVerilog AST statement to an IR statement.
+///
+/// Equivalent to [`lower_sv_stmt_sized`] with no signal width information, so
+/// context-sized literals such as `'1` are reported as unsupported.
 pub fn lower_sv_stmt(
     stmt: &aion_sv_parser::ast::Statement,
     sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrStmt {
+    lower_sv_stmt_sized(stmt, sig_env, &|_| None, source_db, interner, sink)
+}
+
+/// Lowers a SystemVerilog AST statement to an IR statement, using `widths` to
+/// size context-dependent assignment values (`'1`, `'x`, `'z`, `'{default: v}`).
+///
+/// `++`/`--` on the right-hand side of a blocking or non-blocking assignment
+/// are hoisted into separate increment statements: prefix forms run before
+/// the assignment and postfix forms after it, so `a = b++` assigns the old
+/// value of `b` and `a = ++b` the new one.
+pub fn lower_sv_stmt_sized(
+    stmt: &aion_sv_parser::ast::Statement,
+    sig_env: &SignalEnv,
+    widths: &WidthLookup<'_>,
     source_db: &SourceDb,
     interner: &Interner,
     sink: &DiagnosticSink,
@@ -359,30 +385,32 @@ pub fn lower_sv_stmt(
             target,
             value,
             span,
-        } => {
-            let tgt = lower_sv_to_signal_ref(target, sig_env, source_db, interner, sink);
-            let val = lower_sv_expr(value, sig_env, source_db, interner, sink);
-            IrStmt::Assign {
-                target: tgt,
-                value: val,
-                kind: AssignKind::Blocking,
-                span: *span,
-            }
-        }
+        } => lower_sv_assign(
+            target,
+            value,
+            AssignKind::Blocking,
+            *span,
+            sig_env,
+            widths,
+            source_db,
+            interner,
+            sink,
+        ),
         Statement::NonBlocking {
             target,
             value,
             span,
-        } => {
-            let tgt = lower_sv_to_signal_ref(target, sig_env, source_db, interner, sink);
-            let val = lower_sv_expr(value, sig_env, source_db, interner, sink);
-            IrStmt::Assign {
-                target: tgt,
-                value: val,
-                kind: AssignKind::NonBlocking,
-                span: *span,
-            }
-        }
+        } => lower_sv_assign(
+            target,
+            value,
+            AssignKind::NonBlocking,
+            *span,
+            sig_env,
+            widths,
+            source_db,
+            interner,
+            sink,
+        ),
         Statement::CompoundAssign {
             target,
             op,
@@ -413,34 +441,13 @@ pub fn lower_sv_stmt(
             increment,
             span,
             ..
-        } => {
-            // Expand `i++` / `i--` into `i = i + 1` / `i = i - 1`
-            let tgt = lower_sv_to_signal_ref(operand, sig_env, source_db, interner, sink);
-            let tgt_expr = lower_sv_expr(operand, sig_env, source_db, interner, sink);
-            let one = IrExpr::Literal(crate::expr::logic_vec_from_u64(32, 1));
-            let op = if *increment {
-                BinaryOp::Add
-            } else {
-                BinaryOp::Sub
-            };
-            let combined = IrExpr::Binary {
-                op,
-                lhs: Box::new(tgt_expr),
-                rhs: Box::new(one),
-                ty: TypeId::from_raw(0),
-                span: *span,
-            };
-            IrStmt::Assign {
-                target: tgt,
-                value: combined,
-                kind: AssignKind::Blocking,
-                span: *span,
-            }
-        }
+        } => lower_sv_incr_decr(
+            operand, *increment, *span, sig_env, source_db, interner, sink,
+        ),
         Statement::Block { stmts, span, .. } => {
             let ir_stmts: Vec<_> = stmts
                 .iter()
-                .map(|s| lower_sv_stmt(s, sig_env, source_db, interner, sink))
+                .map(|s| lower_sv_stmt_sized(s, sig_env, widths, source_db, interner, sink))
                 .collect();
             IrStmt::Block {
                 stmts: ir_stmts,
@@ -455,10 +462,13 @@ pub fn lower_sv_stmt(
             ..
         } => {
             let cond = lower_sv_expr(condition, sig_env, source_db, interner, sink);
-            let then_body = lower_sv_stmt(then_stmt, sig_env, source_db, interner, sink);
-            let else_body = else_stmt
-                .as_ref()
-                .map(|s| Box::new(lower_sv_stmt(s, sig_env, source_db, interner, sink)));
+            let then_body =
+                lower_sv_stmt_sized(then_stmt, sig_env, widths, source_db, interner, sink);
+            let else_body = else_stmt.as_ref().map(|s| {
+                Box::new(lower_sv_stmt_sized(
+                    s, sig_env, widths, source_db, interner, sink,
+                ))
+            });
             IrStmt::If {
                 condition: cond,
                 then_body: Box::new(then_body),
@@ -474,8 +484,8 @@ pub fn lower_sv_stmt(
             let mut default = None;
             for arm in arms {
                 if arm.is_default {
-                    default = Some(Box::new(lower_sv_stmt(
-                        &arm.body, sig_env, source_db, interner, sink,
+                    default = Some(Box::new(lower_sv_stmt_sized(
+                        &arm.body, sig_env, widths, source_db, interner, sink,
                     )));
                 } else {
                     let patterns: Vec<_> = arm
@@ -483,7 +493,8 @@ pub fn lower_sv_stmt(
                         .iter()
                         .map(|p| lower_sv_expr(p, sig_env, source_db, interner, sink))
                         .collect();
-                    let body = lower_sv_stmt(&arm.body, sig_env, source_db, interner, sink);
+                    let body =
+                        lower_sv_stmt_sized(&arm.body, sig_env, widths, source_db, interner, sink);
                     ir_arms.push(IrCaseArm {
                         patterns,
                         body,
@@ -498,32 +509,42 @@ pub fn lower_sv_stmt(
                 span: *span,
             }
         }
-        Statement::For { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
-        Statement::While { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
-        Statement::DoWhile { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
+        Statement::For { body, .. } => {
+            lower_sv_stmt_sized(body, sig_env, widths, source_db, interner, sink)
+        }
+        Statement::While { body, .. } => {
+            lower_sv_stmt_sized(body, sig_env, widths, source_db, interner, sink)
+        }
+        Statement::DoWhile { body, .. } => {
+            lower_sv_stmt_sized(body, sig_env, widths, source_db, interner, sink)
+        }
         Statement::Forever { body, span } => {
             if !sv_may_yield(body, interner) {
                 sink.emit(errors::warn_forever_without_timing(*span));
             }
-            let ir_body = lower_sv_stmt(body, sig_env, source_db, interner, sink);
+            let ir_body = lower_sv_stmt_sized(body, sig_env, widths, source_db, interner, sink);
             IrStmt::Forever {
                 body: Box::new(ir_body),
                 span: *span,
             }
         }
-        Statement::Repeat { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
-        Statement::Foreach { body, .. } => lower_sv_stmt(body, sig_env, source_db, interner, sink),
+        Statement::Repeat { body, .. } => {
+            lower_sv_stmt_sized(body, sig_env, widths, source_db, interner, sink)
+        }
+        Statement::Foreach { body, .. } => {
+            lower_sv_stmt_sized(body, sig_env, widths, source_db, interner, sink)
+        }
         Statement::Wait { span, .. } => IrStmt::Wait {
             duration: None,
             span: *span,
         },
         Statement::EventControl { body, .. } => {
-            lower_sv_stmt(body, sig_env, source_db, interner, sink)
+            lower_sv_stmt_sized(body, sig_env, widths, source_db, interner, sink)
         }
         Statement::Delay {
             delay, body, span, ..
         } => {
-            let ir_body = lower_sv_stmt(body, sig_env, source_db, interner, sink);
+            let ir_body = lower_sv_stmt_sized(body, sig_env, widths, source_db, interner, sink);
             let duration_fs = eval_delay_expr_sv(delay, source_db, interner, sink);
             IrStmt::Delay {
                 duration_fs,
@@ -566,6 +587,322 @@ pub fn lower_sv_stmt(
         Statement::LocalVarDecl(_) => IrStmt::Nop,
         Statement::Null { .. } => IrStmt::Nop,
         Statement::Error(_) => IrStmt::Nop,
+    }
+}
+
+/// Lowers an SV blocking/non-blocking assignment `target = value`.
+///
+/// The value is sized from the target (see [`lower_sv_assign_value`]).
+/// Unconditionally evaluated `++`/`--` sub-expressions are hoisted out (see
+/// [`lower_sv_stmt_sized`]); ones under `?:`, `&&` or `||` stay in place and
+/// are reported as unsupported, since hoisting them would make a conditional
+/// side effect unconditional.
+#[allow(clippy::too_many_arguments)]
+fn lower_sv_assign(
+    target: &aion_sv_parser::ast::Expr,
+    value: &aion_sv_parser::ast::Expr,
+    kind: AssignKind,
+    span: aion_source::Span,
+    sig_env: &SignalEnv,
+    widths: &WidthLookup<'_>,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrStmt {
+    let tgt = lower_sv_to_signal_ref(target, sig_env, source_db, interner, sink);
+    if !sv_has_hoistable_incr_decr(value) {
+        let val = lower_sv_assign_value(value, &tgt, widths, sig_env, source_db, interner, sink);
+        return IrStmt::Assign {
+            target: tgt,
+            value: val,
+            kind,
+            span,
+        };
+    }
+
+    let mut rewritten = value.clone();
+    let mut effects = Vec::new();
+    hoist_sv_incr_decr(&mut rewritten, &mut effects);
+    let val = lower_sv_assign_value(&rewritten, &tgt, widths, sig_env, source_db, interner, sink);
+    let lower_effect = |e: &IncrDecrEffect| {
+        lower_sv_incr_decr(
+            &e.operand,
+            e.increment,
+            e.span,
+            sig_env,
+            source_db,
+            interner,
+            sink,
+        )
+    };
+    let mut stmts: Vec<IrStmt> = effects
+        .iter()
+        .filter(|e| e.prefix)
+        .map(lower_effect)
+        .collect();
+    stmts.push(IrStmt::Assign {
+        target: tgt,
+        value: val,
+        kind,
+        span,
+    });
+    stmts.extend(effects.iter().filter(|e| !e.prefix).map(lower_effect));
+    IrStmt::Block { stmts, span }
+}
+
+/// Lowers `operand++`/`operand--` (either form) to `operand = operand ± 1`.
+fn lower_sv_incr_decr(
+    operand: &aion_sv_parser::ast::Expr,
+    increment: bool,
+    span: aion_source::Span,
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> IrStmt {
+    let tgt = lower_sv_to_signal_ref(operand, sig_env, source_db, interner, sink);
+    let tgt_expr = lower_sv_expr(operand, sig_env, source_db, interner, sink);
+    let one = IrExpr::Literal(crate::expr::logic_vec_from_u64(32, 1));
+    let op = if increment {
+        BinaryOp::Add
+    } else {
+        BinaryOp::Sub
+    };
+    let combined = IrExpr::Binary {
+        op,
+        lhs: Box::new(tgt_expr),
+        rhs: Box::new(one),
+        ty: TypeId::from_raw(0),
+        span,
+    };
+    IrStmt::Assign {
+        target: tgt,
+        value: combined,
+        kind: AssignKind::Blocking,
+        span,
+    }
+}
+
+/// An increment/decrement removed from an expression by [`hoist_sv_incr_decr`].
+struct IncrDecrEffect {
+    /// The variable being incremented or decremented.
+    operand: aion_sv_parser::ast::Expr,
+    /// `true` for `++`, `false` for `--`.
+    increment: bool,
+    /// `true` for `++x`/`--x` (runs before the read), `false` for `x++`/`x--`.
+    prefix: bool,
+    /// Span of the whole `++`/`--` expression.
+    span: aion_source::Span,
+}
+
+/// Decodes an increment/decrement operator into `(increment, prefix)`.
+fn incr_decr_kind(op: aion_sv_parser::ast::UnaryOp) -> Option<(bool, bool)> {
+    use aion_sv_parser::ast::UnaryOp;
+    match op {
+        UnaryOp::PreIncr => Some((true, true)),
+        UnaryOp::PreDecr => Some((false, true)),
+        UnaryOp::PostIncr => Some((true, false)),
+        UnaryOp::PostDecr => Some((false, false)),
+        _ => None,
+    }
+}
+
+/// Returns `true` if `expr` contains a `++`/`--` that [`hoist_sv_incr_decr`]
+/// would hoist (one evaluated unconditionally).
+fn sv_has_hoistable_incr_decr(expr: &aion_sv_parser::ast::Expr) -> bool {
+    use aion_sv_parser::ast::Expr;
+    if let Expr::Unary { op, .. } = expr {
+        if op.is_incr_decr() {
+            return true;
+        }
+    }
+    let mut found = false;
+    for_each_unconditional_child(expr, &mut |child| {
+        found = found || sv_has_hoistable_incr_decr(child);
+    });
+    found
+}
+
+/// Replaces each unconditionally evaluated `++`/`--` in `expr` by its operand
+/// and records the side effect in `effects`.
+///
+/// The operand itself is not searched, so nested forms such as `a[i++]++`
+/// keep the inner `i++`, which expression lowering then reports.
+fn hoist_sv_incr_decr(expr: &mut aion_sv_parser::ast::Expr, effects: &mut Vec<IncrDecrEffect>) {
+    use aion_sv_parser::ast::Expr;
+    if let Expr::Unary { op, operand, span } = expr {
+        if let Some((increment, prefix)) = incr_decr_kind(*op) {
+            let operand = std::mem::replace(operand.as_mut(), Expr::Error(*span));
+            effects.push(IncrDecrEffect {
+                operand: operand.clone(),
+                increment,
+                prefix,
+                span: *span,
+            });
+            *expr = operand;
+            return;
+        }
+    }
+    for_each_unconditional_child_mut(expr, &mut |child| hoist_sv_incr_decr(child, effects));
+}
+
+/// Visits the direct sub-expressions of `expr` that are always evaluated
+/// when `expr` is: everything except the branches of `?:` and the right-hand
+/// operand of `&&`/`||`.
+fn for_each_unconditional_child(
+    expr: &aion_sv_parser::ast::Expr,
+    f: &mut dyn FnMut(&aion_sv_parser::ast::Expr),
+) {
+    use aion_sv_parser::ast::{BinaryOp, Expr, PatternItem};
+    match expr {
+        Expr::Identifier { .. }
+        | Expr::HierarchicalName { .. }
+        | Expr::ScopedIdent { .. }
+        | Expr::Literal { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::UnbasedUnsized { .. }
+        | Expr::Error(_) => {}
+        Expr::Index { base, index, .. } => {
+            f(base);
+            f(index);
+        }
+        Expr::RangeSelect { base, msb, lsb, .. } => {
+            f(base);
+            f(msb);
+            f(lsb);
+        }
+        Expr::PartSelect {
+            base, index, width, ..
+        } => {
+            f(base);
+            f(index);
+            f(width);
+        }
+        Expr::Concat { elements, .. } => elements.iter().for_each(f),
+        Expr::Repeat {
+            count, elements, ..
+        } => {
+            f(count);
+            elements.iter().for_each(f);
+        }
+        Expr::Unary { operand, .. } => f(operand),
+        Expr::Binary {
+            left, op, right, ..
+        } => {
+            f(left);
+            if !matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
+                f(right);
+            }
+        }
+        Expr::Ternary { condition, .. } => f(condition),
+        Expr::Inside { expr, ranges, .. } => {
+            f(expr);
+            ranges.iter().for_each(f);
+        }
+        Expr::Cast {
+            cast_type, expr, ..
+        } => {
+            f(cast_type);
+            f(expr);
+        }
+        Expr::FuncCall { name, args, .. } => {
+            f(name);
+            args.iter().for_each(f);
+        }
+        Expr::SystemCall { args, .. } => args.iter().for_each(f),
+        Expr::Paren { inner, .. } => f(inner),
+        Expr::Member { base, .. } => f(base),
+        Expr::AssignmentPattern { items, .. } => {
+            for item in items {
+                match item {
+                    PatternItem::Positional(e) | PatternItem::Default { value: e, .. } => f(e),
+                    PatternItem::Keyed { key, value, .. } => {
+                        f(key);
+                        f(value);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mutable counterpart of [`for_each_unconditional_child`].
+fn for_each_unconditional_child_mut(
+    expr: &mut aion_sv_parser::ast::Expr,
+    f: &mut dyn FnMut(&mut aion_sv_parser::ast::Expr),
+) {
+    use aion_sv_parser::ast::{BinaryOp, Expr, PatternItem};
+    match expr {
+        Expr::Identifier { .. }
+        | Expr::HierarchicalName { .. }
+        | Expr::ScopedIdent { .. }
+        | Expr::Literal { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::UnbasedUnsized { .. }
+        | Expr::Error(_) => {}
+        Expr::Index { base, index, .. } => {
+            f(base);
+            f(index);
+        }
+        Expr::RangeSelect { base, msb, lsb, .. } => {
+            f(base);
+            f(msb);
+            f(lsb);
+        }
+        Expr::PartSelect {
+            base, index, width, ..
+        } => {
+            f(base);
+            f(index);
+            f(width);
+        }
+        Expr::Concat { elements, .. } => elements.iter_mut().for_each(f),
+        Expr::Repeat {
+            count, elements, ..
+        } => {
+            f(count);
+            elements.iter_mut().for_each(f);
+        }
+        Expr::Unary { operand, .. } => f(operand),
+        Expr::Binary {
+            left, op, right, ..
+        } => {
+            f(left);
+            if !matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
+                f(right);
+            }
+        }
+        Expr::Ternary { condition, .. } => f(condition),
+        Expr::Inside { expr, ranges, .. } => {
+            f(expr);
+            ranges.iter_mut().for_each(f);
+        }
+        Expr::Cast {
+            cast_type, expr, ..
+        } => {
+            f(cast_type);
+            f(expr);
+        }
+        Expr::FuncCall { name, args, .. } => {
+            f(name);
+            args.iter_mut().for_each(f);
+        }
+        Expr::SystemCall { args, .. } => args.iter_mut().for_each(f),
+        Expr::Paren { inner, .. } => f(inner),
+        Expr::Member { base, .. } => f(base),
+        Expr::AssignmentPattern { items, .. } => {
+            for item in items {
+                match item {
+                    PatternItem::Positional(e) | PatternItem::Default { value: e, .. } => f(e),
+                    PatternItem::Keyed { key, value, .. } => {
+                        f(key);
+                        f(value);
+                    }
+                }
+            }
+        }
     }
 }
 

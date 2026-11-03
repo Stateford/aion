@@ -247,6 +247,16 @@ impl Lexer<'_> {
             if matches!(next, b'b' | b'o' | b'd' | b'h' | b's') {
                 return self.lex_unsized_based_literal(start);
             }
+            // Unbased unsized literal: '0, '1, 'x, 'X, 'z, 'Z. A following
+            // identifier character (e.g. `'10`, `'xy`) leaves a bare tick so
+            // the parser can report the malformed literal.
+            if matches!(next, b'0' | b'1' | b'x' | b'z') && !is_ident_char(self.peek_at(2)) {
+                self.pos += 2;
+                return Token {
+                    kind: SvToken::UnbasedUnsizedLiteral,
+                    span: self.span_from(start),
+                };
+            }
         }
 
         // String literal
@@ -1018,6 +1028,65 @@ mod tests {
         assert_eq!(k[0], SvToken::Int);
         assert_eq!(k[1], SvToken::Tick);
         assert_eq!(k[2], SvToken::LeftParen);
+    }
+
+    #[test]
+    fn unbased_unsized_literals() {
+        let tokens = lex_tokens("'0 '1 'x 'X 'z 'Z");
+        assert_eq!(
+            kinds(&tokens),
+            vec![
+                SvToken::UnbasedUnsizedLiteral,
+                SvToken::UnbasedUnsizedLiteral,
+                SvToken::UnbasedUnsizedLiteral,
+                SvToken::UnbasedUnsizedLiteral,
+                SvToken::UnbasedUnsizedLiteral,
+                SvToken::UnbasedUnsizedLiteral,
+                SvToken::Eof
+            ]
+        );
+        assert_eq!(tokens[0].span.start, 0);
+        assert_eq!(tokens[0].span.end, 2);
+    }
+
+    #[test]
+    fn unbased_unsized_before_punctuation() {
+        let tokens = lex_tokens("q<='1;");
+        assert_eq!(
+            kinds(&tokens),
+            vec![
+                SvToken::Identifier,
+                SvToken::LessEquals,
+                SvToken::UnbasedUnsizedLiteral,
+                SvToken::Semicolon,
+                SvToken::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_unbased_unsized_is_bare_tick() {
+        // `'10` and `'q` are not unbased unsized literals: the tick stays bare
+        // so the parser can diagnose it.
+        let k = kinds(&lex_tokens("'10"));
+        assert_eq!(k, vec![SvToken::Tick, SvToken::IntLiteral, SvToken::Eof]);
+        let k = kinds(&lex_tokens("'q"));
+        assert_eq!(k, vec![SvToken::Tick, SvToken::Identifier, SvToken::Eof]);
+    }
+
+    #[test]
+    fn assignment_pattern_tick_brace() {
+        let k = kinds(&lex_tokens("'{0}"));
+        assert_eq!(
+            k,
+            vec![
+                SvToken::Tick,
+                SvToken::LeftBrace,
+                SvToken::IntLiteral,
+                SvToken::RightBrace,
+                SvToken::Eof
+            ]
+        );
     }
 
     #[test]
