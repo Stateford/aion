@@ -14,7 +14,9 @@ use aion_ir::{BinaryOp, CellKind, Expr, SignalKind, SignalRef, Type, UnaryOp};
 /// and wiring them together with temporary signals.
 pub(crate) fn lower_expr(expr: &Expr, netlist: &mut Netlist) -> SignalRef {
     match expr {
-        Expr::Literal(lv) | Expr::NamedConst { value: lv, .. } => {
+        Expr::Literal(lv)
+        | Expr::SignedLiteral { value: lv, .. }
+        | Expr::NamedConst { value: lv, .. } => {
             let width = lv.width();
             let ty = if width == 1 {
                 netlist.types.intern(Type::Bit)
@@ -411,7 +413,9 @@ pub(crate) fn lower_expr(expr: &Expr, netlist: &mut Netlist) -> SignalRef {
 /// Tries to evaluate an expression as a constant integer.
 fn const_eval_expr(expr: &Expr) -> Option<i64> {
     match expr {
-        Expr::Literal(lv) | Expr::NamedConst { value: lv, .. } => lv.to_u64().map(|v| v as i64),
+        Expr::Literal(lv)
+        | Expr::SignedLiteral { value: lv, .. }
+        | Expr::NamedConst { value: lv, .. } => lv.to_u64().map(|v| v as i64),
         _ => None,
     }
 }
@@ -419,7 +423,9 @@ fn const_eval_expr(expr: &Expr) -> Option<i64> {
 /// Estimates the bit width of an expression from the netlist context.
 fn expr_width(expr: &Expr, netlist: &Netlist) -> Option<u32> {
     match expr {
-        Expr::Literal(lv) | Expr::NamedConst { value: lv, .. } => Some(lv.width()),
+        Expr::Literal(lv)
+        | Expr::SignedLiteral { value: lv, .. }
+        | Expr::NamedConst { value: lv, .. } => Some(lv.width()),
         Expr::Signal(SignalRef::Signal(id)) => Some(netlist.signal_width(*id)),
         Expr::Signal(SignalRef::Slice { high, low, .. }) => Some(high - low + 1),
         Expr::Signal(SignalRef::Const(lv)) => Some(lv.width()),
@@ -555,6 +561,42 @@ mod tests {
         assert_eq!(consts, vec![value]);
         assert_eq!(expr_width(&expr, &netlist), Some(32));
         assert_eq!(const_eval_expr(&expr), Some(5));
+    }
+
+    #[test]
+    fn lower_signed_literal_like_literal() {
+        // Synthesis ignores literal signedness: `8'sd2` and an unsized `5`
+        // lower to the same constant cells as their unsigned bits.
+        let interner = Interner::new();
+        for (value, sized) in [
+            (LogicVec::from_u64(2, 8), true),
+            (LogicVec::from_u64(5, 3), false),
+        ] {
+            let mut netlist = make_netlist(&interner);
+            let expr = Expr::SignedLiteral {
+                value: value.clone(),
+                sized,
+            };
+            let out = lower_expr(&expr, &mut netlist);
+            assert!(matches!(out, SignalRef::Signal(_)));
+            let consts: Vec<_> = netlist
+                .cells
+                .iter()
+                .filter_map(|(_, c)| match &c.kind {
+                    CellKind::Const { value } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(consts, vec![value.clone()]);
+            assert_eq!(expr_width(&expr, &netlist), Some(value.width()));
+            assert_eq!(const_eval_expr(&expr), value.to_u64().map(|v| v as i64));
+        }
+        // An X bit is not a compile-time integer.
+        let x = Expr::SignedLiteral {
+            value: LogicVec::from_binary_str("1x").unwrap(),
+            sized: true,
+        };
+        assert_eq!(const_eval_expr(&x), None);
     }
 
     #[test]

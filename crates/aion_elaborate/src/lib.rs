@@ -1704,7 +1704,9 @@ mod tests {
     /// on anything else.
     fn lit(e: &aion_ir::Expr) -> (u32, u64) {
         match e {
-            aion_ir::Expr::Literal(lv) | aion_ir::Expr::NamedConst { value: lv, .. } => {
+            aion_ir::Expr::Literal(lv)
+            | aion_ir::Expr::SignedLiteral { value: lv, .. }
+            | aion_ir::Expr::NamedConst { value: lv, .. } => {
                 (lv.width(), lv.to_u64().expect("2-state literal"))
             }
             other => panic!("expected literal, got {other:?}"),

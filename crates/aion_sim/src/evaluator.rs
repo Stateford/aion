@@ -186,6 +186,7 @@ fn expr_type(
 ) -> Result<ExprType, SimError> {
     Ok(match expr {
         Expr::Literal(lv) | Expr::NamedConst { value: lv, .. } => ExprType::unsigned(lv.width()),
+        Expr::SignedLiteral { value, sized } => signed_literal_type(value, *sized),
         Expr::Signal(signal_ref) => signal_ref_type(ctx, signal_ref)?,
         Expr::Unary { op, operand, .. } => match op {
             UnaryOp::Not | UnaryOp::Neg => expr_type(ctx, ov, operand)?,
@@ -239,6 +240,31 @@ fn expr_type(
         }
         Expr::FuncCall { .. } => ExprType::unsigned(0),
     })
+}
+
+/// The width of an unsized integer literal or `integer` value (IEEE
+/// 1364-2005 3.5.1, 4.8).
+const INTEGER_WIDTH: u32 = 32;
+
+/// Computes the self-determined type of a signed literal: signed, at its
+/// declared width when sized, else a 32-bit integer.
+///
+/// An unsized literal whose magnitude needs more than 32 bits is widened by
+/// one bit past the magnitude, so its sign bit stays 0 (an implementation
+/// may widen unsized literals, IEEE 1364-2005 3.5.1). A magnitude of exactly
+/// 32 bits is kept at 32 and reads as negative, as an `integer` would.
+fn signed_literal_type(value: &LogicVec, sized: bool) -> ExprType {
+    let width = if sized {
+        value.width()
+    } else if value.width() > INTEGER_WIDTH {
+        value.width().saturating_add(1)
+    } else {
+        INTEGER_WIDTH
+    };
+    ExprType {
+        width,
+        signed: true,
+    }
 }
 
 /// Computes the self-determined type of a signal reference read in an
@@ -335,6 +361,14 @@ fn eval_ctx(
 ) -> Result<LogicVec, SimError> {
     match expr {
         Expr::Literal(lv) | Expr::NamedConst { value: lv, .. } => Ok(extend(lv, ty)),
+
+        // Zero-extend the bits to the literal's own width first (a no-op
+        // for a sized literal), so an unsized `1` is +1 before any sign
+        // extension to the context width.
+        Expr::SignedLiteral { value, sized } => {
+            let own = signed_literal_type(value, *sized);
+            Ok(extend(&extend(value, ExprType::unsigned(own.width)), ty))
+        }
 
         Expr::Signal(signal_ref) => Ok(extend(&eval_signal_ref_ov(ctx, ov, signal_ref)?, ty)),
 
@@ -1118,11 +1152,26 @@ fn signal_ref_width(ctx: &EvalContext<'_>, signal_ref: &SignalRef) -> Result<u32
 /// Formats a `$display` string with evaluated arguments, each paired with
 /// whether it is signed.
 ///
-/// `%d` and `%h` work at any width. A value with X/Z bits prints per IEEE
+/// Each format specification is `%[-][width]<conv>` (IEEE 1364-2005
+/// 17.1.1.2 and 17.1.1.3):
+///
+/// - `%d` (decimal), `%h`/`%x` (hex), `%o` (octal), `%b` (binary), `%t`
+///   (time, printed as a decimal number) and `%c` (the low 8 bits as a
+///   character) consume one argument; `%s` prints the argument's bytes as
+///   text (MSB first, NUL bytes skipped).
+/// - `%%` prints `%`, and `%m` prints `%m` (the evaluator does not know the
+///   hierarchical scope); neither consumes an argument.
+/// - Without a width, `%d`/`%h`/`%o`/`%t` print the value without leading
+///   zeros or padding and `%b` prints every bit. A width of 0 (`%0d`,
+///   `%0b`) prints the minimum number of digits. A non-zero width is a
+///   minimum: decimal, time and text are padded with spaces and the other
+///   radices with leading zeros, and `-` left-justifies with spaces instead.
+///
+/// All radices work at any width. A value with X/Z bits prints per IEEE
 /// 1364-2005 17.1.1.3: for `%d`, `x`/`z` when every bit is X/Z and `X`/`Z`
-/// when only some are; for `%h`, the same rule per hex digit. Leading zero
-/// digits are dropped. A signed `%d` value prints with a minus sign when
-/// negative.
+/// when only some are; for `%h`/`%o`/`%b`, the same rule per digit. A signed
+/// `%d` value prints with a minus sign when negative. An unknown conversion,
+/// or one with no argument left, is printed as written.
 fn format_display(format: &str, args: &[(LogicVec, bool)]) -> String {
     let mut result = String::new();
     let mut arg_idx = 0;
@@ -1132,31 +1181,96 @@ fn format_display(format: &str, args: &[(LogicVec, bool)]) -> String {
             result.push(c);
             continue;
         }
-        let Some(spec) = chars.next() else {
-            result.push('%');
+        // The specification as written, echoed back when it is not valid.
+        let mut raw = String::from('%');
+        let left = chars.next_if_eq(&'-').is_some();
+        if left {
+            raw.push('-');
+        }
+        let mut digits = String::new();
+        while let Some(d) = chars.next_if(char::is_ascii_digit) {
+            digits.push(d);
+        }
+        raw.push_str(&digits);
+        // An absurd width saturates; padding is then capped by `pad`.
+        let width = (!digits.is_empty()).then(|| digits.parse::<usize>().unwrap_or(usize::MAX));
+        let Some(conv) = chars.next() else {
+            result.push_str(&raw);
             continue;
         };
-        if spec == '%' {
-            result.push('%');
-            continue; // Doesn't consume an argument.
+        raw.push(conv);
+        let spec = FormatSpec { left, width };
+        match conv {
+            '%' => {
+                result.push('%');
+                continue;
+            }
+            'm' | 'M' => {
+                result.push_str(&raw);
+                continue;
+            }
+            _ => {}
         }
         let Some((value, signed)) = args.get(arg_idx) else {
-            result.push('%');
-            result.push(spec);
+            result.push_str(&raw);
             continue;
         };
-        match spec {
-            'd' | 'D' => result.push_str(&format_decimal(value, *signed)),
-            'b' | 'B' => result.push_str(&format!("{value}")),
-            'h' | 'H' | 'x' | 'X' => result.push_str(&format_hex(value)),
-            _ => {
-                result.push('%');
-                result.push(spec);
+        let (text, zero_pad) = match conv {
+            'd' | 'D' => (format_decimal(value, *signed), false),
+            't' | 'T' => (format_decimal(value, false), false),
+            'b' | 'B' => {
+                // `%b` keeps every bit unless a width asks for the minimum.
+                let trim = spec.width.is_some();
+                (format_radix(value, 1, trim), true)
             }
-        }
+            'o' | 'O' => (format_radix(value, 3, true), true),
+            'h' | 'H' | 'x' | 'X' => (format_radix(value, 4, true), true),
+            's' | 'S' => (format_string(value), false),
+            'c' | 'C' => (format_char(value), false),
+            _ => (raw, false),
+        };
+        result.push_str(&spec.pad(&text, zero_pad));
         arg_idx += 1;
     }
     result
+}
+
+/// The flags and field width of one `$display` format specification.
+#[derive(Debug, Clone, Copy)]
+struct FormatSpec {
+    /// Whether `-` asked for left justification.
+    left: bool,
+    /// The explicit field width, if any (`Some(0)` for `%0d`).
+    width: Option<usize>,
+}
+
+impl FormatSpec {
+    /// The widest field [`FormatSpec::pad`] pads to, so a corrupt width
+    /// such as `%99999999999d` cannot exhaust memory.
+    const MAX_PAD: usize = 1 << 16;
+
+    /// Pads `text` to the field width: on the right with spaces when
+    /// left-justified, else on the left with zeros (`zero_pad`, for the
+    /// binary, octal and hex radices) or spaces. A negative number keeps its
+    /// sign in front of the zeros. Text already as wide is unchanged.
+    fn pad(self, text: &str, zero_pad: bool) -> String {
+        let width = self.width.unwrap_or(0).min(Self::MAX_PAD);
+        let len = text.chars().count();
+        if len >= width {
+            return text.to_string();
+        }
+        let fill = width - len;
+        if self.left {
+            format!("{text}{}", " ".repeat(fill))
+        } else if zero_pad {
+            match text.strip_prefix('-') {
+                Some(rest) => format!("-{}{rest}", "0".repeat(fill)),
+                None => format!("{}{text}", "0".repeat(fill)),
+            }
+        } else {
+            format!("{}{text}", " ".repeat(fill))
+        }
+    }
 }
 
 /// Returns the character for a group of bits that contains X or Z: `x`/`z`
@@ -1185,25 +1299,32 @@ fn format_decimal(value: &LogicVec, signed: bool) -> String {
     }
 }
 
-/// Formats a value for `%h` at any width, one digit per 4 bits (the top
-/// digit may cover fewer), without leading zero digits.
-fn format_hex(value: &LogicVec) -> String {
-    let digits = value.width().div_ceil(4);
+/// Formats a value in a power-of-two radix at any width, one digit per
+/// `bits_per_digit` bits (1 for `%b`, 3 for `%o`, 4 for `%h`; the top digit
+/// may cover fewer). A digit with X/Z bits prints per [`unknown_digit`].
+/// With `trim`, leading zero digits are dropped (keeping at least one).
+fn format_radix(value: &LogicVec, bits_per_digit: u32, trim: bool) -> String {
+    let w = value.width();
+    let digits = w.div_ceil(bits_per_digit);
     let mut s = String::with_capacity(digits as usize);
     for d in (0..digits).rev() {
-        let bits: Vec<Logic> = (d * 4..(d * 4 + 4).min(value.width()))
+        let lo = d * bits_per_digit;
+        let bits: Vec<Logic> = (lo..(lo + bits_per_digit).min(w))
             .map(|i| value.get(i))
             .collect();
         if bits.iter().any(|b| matches!(b, Logic::X | Logic::Z)) {
             s.push(unknown_digit(&bits));
         } else {
-            let nibble = bits
+            let digit = bits
                 .iter()
                 .enumerate()
                 .filter(|(_, &b)| b == Logic::One)
                 .fold(0u32, |acc, (i, _)| acc | (1 << i));
-            s.push(char::from_digit(nibble, 16).unwrap_or('?'));
+            s.push(char::from_digit(digit, 16).unwrap_or('?'));
         }
+    }
+    if !trim {
+        return s;
     }
     let trimmed = s.trim_start_matches('0');
     if trimmed.is_empty() {
@@ -1211,6 +1332,44 @@ fn format_hex(value: &LogicVec) -> String {
     } else {
         trimmed.into()
     }
+}
+
+/// Returns the byte held by `bits[lo..lo + 8]` (bits past the end are 0),
+/// or `None` if any of them is X/Z.
+fn byte_at(value: &LogicVec, lo: u32) -> Option<u8> {
+    let mut byte = 0u8;
+    for i in 0..8 {
+        if lo + i >= value.width() {
+            break;
+        }
+        match value.get(lo + i) {
+            Logic::One => byte |= 1 << i,
+            Logic::Zero => {}
+            Logic::X | Logic::Z => return None,
+        }
+    }
+    Some(byte)
+}
+
+/// Formats a value for `%s`: one character per 8 bits, MSB first, skipping
+/// NUL bytes (the zero padding of a string stored in a wider vector). A
+/// byte with X/Z bits prints as `?`.
+fn format_string(value: &LogicVec) -> String {
+    let bytes = value.width().div_ceil(8);
+    (0..bytes)
+        .rev()
+        .filter_map(|b| match byte_at(value, b * 8) {
+            Some(0) => None,
+            Some(byte) => Some(char::from(byte)),
+            None => Some('?'),
+        })
+        .collect()
+}
+
+/// Formats a value for `%c`: its low 8 bits as a character, or `?` if any
+/// of them is X/Z.
+fn format_char(value: &LogicVec) -> String {
+    byte_at(value, 0).map_or('?', char::from).to_string()
 }
 
 /// Creates an all-X LogicVec of the given width.
@@ -3061,6 +3220,165 @@ mod tests {
             // `%%` never consumes an argument, even when none are left.
             assert_eq!(format_display("100%%", &[]), "100%");
             assert_eq!(format_display("%d %d", &[(lv("1"), false)]), "1 %d");
+        }
+
+        // ---- $display format specifications ----
+
+        #[test]
+        fn display_zero_width_is_one_specification() {
+            // Review repro: `%0d` used to print `%0d` and swallow `u`.
+            let u = (LogicVec::from_u64(5, 8), false);
+            assert_eq!(
+                format_display("v=%0d h=%h", &[u.clone(), u.clone()]),
+                "v=5 h=5"
+            );
+            assert_eq!(
+                format_display("%0h|%0o|%0b", &[u.clone(), u.clone(), u]),
+                "5|5|101"
+            );
+            let zero = (LogicVec::from_u64(0, 8), false);
+            assert_eq!(format_display("%0b %0h", &[zero.clone(), zero]), "0 0");
+        }
+
+        #[test]
+        fn display_default_width_is_unchanged() {
+            // Without a width: no padding for %d/%h/%o, every bit for %b.
+            let u = (LogicVec::from_u64(10, 8), false);
+            assert_eq!(
+                format_display("%d %h %o %b", &[u.clone(), u.clone(), u.clone(), u]),
+                "10 a 12 00001010"
+            );
+        }
+
+        #[test]
+        fn display_explicit_width_pads() {
+            let lv = |s: &str| LogicVec::from_binary_str(s).unwrap();
+            let u = (LogicVec::from_u64(5, 8), false);
+            assert_eq!(format_display("[%4d]", std::slice::from_ref(&u)), "[   5]");
+            assert_eq!(format_display("[%-4d]", std::slice::from_ref(&u)), "[5   ]");
+            assert_eq!(format_display("[%4h]", std::slice::from_ref(&u)), "[0005]");
+            assert_eq!(format_display("[%-4h]", std::slice::from_ref(&u)), "[5   ]");
+            assert_eq!(format_display("[%4o]", std::slice::from_ref(&u)), "[0005]");
+            assert_eq!(format_display("[%5b]", std::slice::from_ref(&u)), "[00101]");
+            // A width smaller than the value never truncates it.
+            assert_eq!(format_display("[%1d]", &[(lv("11111111"), false)]), "[255]");
+            // Negative signed values keep the sign in front.
+            assert_eq!(format_display("[%4d]", &[(lv("11111101"), true)]), "[  -3]");
+            // X/Z values pad like known ones.
+            assert_eq!(format_display("[%3d]", &[(lv("xxxx"), false)]), "[  x]");
+            assert_eq!(format_display("[%6b]", &[(lv("xx1z"), false)]), "[00xx1z]");
+            assert_eq!(format_display("[%-3h]", &[(lv("zzzz"), false)]), "[z  ]");
+            assert_eq!(format_display("[%0h]", &[(lv("0000x1x1"), false)]), "[X]");
+            // A huge width is capped instead of exhausting memory.
+            let out = format_display("%99999999999999999999d", &[u]);
+            assert_eq!(out.len(), FormatSpec::MAX_PAD);
+        }
+
+        #[test]
+        fn display_other_conversions() {
+            let lv = |s: &str| LogicVec::from_binary_str(s).unwrap();
+            // "Hi" stored right-aligned in 24 bits: the NUL byte is skipped.
+            let hi = (LogicVec::from_u64(0x4869, 24), false);
+            assert_eq!(
+                format_display("%s|%4s|%-4s|", &[hi.clone(), hi.clone(), hi]),
+                "Hi|  Hi|Hi  |"
+            );
+            assert_eq!(
+                format_display("%c", &[(LogicVec::from_u64(0x141, 9), false)]),
+                "A"
+            );
+            assert_eq!(
+                format_display("%c%s", &[(lv("x1000001"), false), (lv("0100000x"), false)]),
+                "??"
+            );
+            assert_eq!(
+                format_display("t=%t", &[(LogicVec::from_u64(100, 64), true)]),
+                "t=100"
+            );
+            assert_eq!(format_display("%o", &[(lv("1x0111"), false)]), "X7");
+            // %m and %% take no argument; unknown or argument-less
+            // specifications are echoed as written.
+            let one = (LogicVec::from_u64(1, 1), false);
+            assert_eq!(
+                format_display("%m %d %5%", std::slice::from_ref(&one)),
+                "%m 1 %"
+            );
+            // An unknown conversion still consumes its argument, as before.
+            assert_eq!(format_display("%-3q %d", &[one.clone(), one]), "%-3q 1");
+            assert_eq!(format_display("end%-", &[]), "end%-");
+            assert_eq!(format_display("%4d", &[]), "%4d");
+        }
+
+        // ---- Signed literals (review follow-up) ----
+
+        /// A sized signed literal `w'sd v`.
+        fn slit(v: u64, w: u32) -> Expr {
+            Expr::SignedLiteral {
+                value: LogicVec::from_u64(v, w),
+                sized: true,
+            }
+        }
+
+        /// An unsized decimal literal, at its minimal width as the
+        /// elaborator lowers it.
+        fn int(v: u64) -> Expr {
+            let w = (64 - v.leading_zeros()).max(1);
+            Expr::SignedLiteral {
+                value: LogicVec::from_u64(v, w),
+                sized: false,
+            }
+        }
+
+        #[test]
+        fn unsized_literal_is_a_32_bit_signed_integer() {
+            // `1` is +1 (its minimal 1-bit form is not read as -1), 32 bits.
+            let r = ev(&int(1));
+            assert_eq!((r.width(), r.to_u64()), (32, Some(1)));
+            let r = ev(&un(UnaryOp::Neg, int(1)));
+            assert_eq!((r.width(), r.to_u64()), (32, Some(0xFFFF_FFFF)));
+            // A magnitude wider than 32 bits keeps a zero sign bit.
+            let r = ev(&int(1 << 40));
+            assert_eq!((r.width(), r.to_u64()), (42, Some(1 << 40)));
+            // A sized signed literal keeps its width.
+            let r = ev(&slit(0xFE, 8));
+            assert_eq!((r.width(), r.to_u64()), (8, Some(0xFE)));
+        }
+
+        #[test]
+        fn signed_literal_keeps_signed_operations_signed() {
+            // Review repro: integer i = -1; reg signed [7:0] s = -2.
+            let (mut signals, map, types) = setup(&[
+                (LogicVec::from_u64(0xFFFF_FFFF, 32), true),
+                (LogicVec::from_u64(0xFE, 8), true),
+            ]);
+            let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+            let lt = |l, r| eval_expr(&ctx, &bin(BinaryOp::Lt, l, r)).unwrap().to_u64();
+            assert_eq!(lt(rd(0), int(0)), Some(1), "i < 0");
+            assert_eq!(lt(rd(1), int(0)), Some(1), "s < 0");
+            assert_eq!(lt(rd(1), un(UnaryOp::Neg, slit(1, 8))), Some(1), "-2 < -1");
+            // `w16 = s + 1` sign-extends s: the RHS is a signed 32-bit sum.
+            let sum = eval_expr(&ctx, &bin(BinaryOp::Add, rd(1), int(1))).unwrap();
+            assert_eq!((sum.width(), sum.to_u64()), (32, Some(0xFFFF_FFFF)));
+            // The literal is signed too, so it sign-extends in a signed
+            // context: 8'sb1111_1110 + 16'sd0 is -2 at 16 bits.
+            let (mut signals, map, types) = setup(&[(LogicVec::from_u64(0, 16), true)]);
+            let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+            let r = eval_expr(&ctx, &bin(BinaryOp::Add, slit(0xFE, 8), rd(0))).unwrap();
+            assert_eq!((r.width(), r.to_u64()), (16, Some(0xFFFE)));
+        }
+
+        #[test]
+        fn unsigned_literal_still_makes_the_operation_unsigned() {
+            // s = -2 compared with 8'd0 / 'h0: unsigned, so 254 < 0 is false.
+            let (mut signals, map, types) = setup(&[(LogicVec::from_u64(0xFE, 8), true)]);
+            let ctx = make_ctx_with_signals(&mut signals, &map, &types);
+            let r = eval_expr(&ctx, &bin(BinaryOp::Lt, rd(0), lit(0, 8))).unwrap();
+            assert_eq!(r.to_u64(), Some(0));
+            let r = eval_expr(&ctx, &bin(BinaryOp::Add, rd(0), lit(1, 8))).unwrap();
+            assert_eq!((r.width(), r.to_u64()), (8, Some(0xFF)));
+            // An unsigned operand makes a signed literal zero-extend too.
+            let r = ev(&bin(BinaryOp::Add, slit(0xFE, 8), lit(0, 16)));
+            assert_eq!((r.width(), r.to_u64()), (16, Some(0x00FE)));
         }
 
         // ---- SIM-12 / SIM-5: context width and resize to target ----

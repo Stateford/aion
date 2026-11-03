@@ -337,3 +337,87 @@ endmodule
     // Part-selects are unsigned: 253 < 1 is false.
     assert_eq!(value(&kernel, "ult"), Some(0));
 }
+
+#[test]
+fn signed_literals_keep_signed_semantics() {
+    // An unsized decimal is a signed 32-bit integer and `'s` makes a sized
+    // literal signed (IEEE 1364-2005 3.5.1, 5.5), so mixing them with a
+    // signed operand keeps the operation signed.
+    let src = r#"
+module top;
+  integer i;
+  reg signed [7:0] s;
+  reg lt0, slt, sgt, big;
+  reg [15:0] w16;
+  reg [7:0] c;
+  initial begin
+    i = -1;
+    s = -8'sd2;
+    c = 8'hFF;
+    lt0 = (i < 0);
+    slt = (s < 0);
+    sgt = (s > -8'sd3);
+    w16 = s + 1;
+    // An unsized literal is 32 bits wide, so `c + 1` does not wrap at 8.
+    big = (c + 1) > c;
+  end
+endmodule
+"#;
+    let (kernel, _) = simulate("top.v", src, "top");
+    assert_eq!(value(&kernel, "lt0"), Some(1), "integer -1 < 0");
+    assert_eq!(value(&kernel, "slt"), Some(1), "signed -2 < 0");
+    assert_eq!(value(&kernel, "sgt"), Some(1), "-2 > -3 signed");
+    assert_eq!(value(&kernel, "w16"), Some(0xFFFF), "s + 1 sign-extends");
+    assert_eq!(value(&kernel, "big"), Some(1), "c + 1 is 32 bits wide");
+}
+
+#[test]
+fn sized_unsigned_literal_keeps_operation_unsigned() {
+    // Without `s` a sized (or based) literal is unsigned, so the signed
+    // operand is treated as unsigned too: -2 (0xFE) < 8'd0 is false.
+    let src = r#"
+module top;
+  reg signed [7:0] s;
+  reg lt, gt, hlt;
+  reg [15:0] w16;
+  initial begin
+    s = -8'sd2;
+    lt = (s < 8'd0);
+    gt = (s > 8'd1);
+    hlt = (s < 'h0);
+    w16 = s + 8'd1;
+  end
+endmodule
+"#;
+    let (kernel, _) = simulate("top.v", src, "top");
+    assert_eq!(value(&kernel, "lt"), Some(0));
+    assert_eq!(value(&kernel, "gt"), Some(1));
+    assert_eq!(value(&kernel, "hlt"), Some(0));
+    assert_eq!(value(&kernel, "w16"), Some(0x00FF));
+}
+
+#[test]
+fn display_width_specifiers() {
+    // `%0d` is one specification (it used to print `%0d` and swallow the
+    // argument). An explicit width pads decimal with spaces and the other
+    // radices with zeros; `-` left-justifies.
+    let src = r#"
+module top;
+  reg [7:0] u;
+  reg [3:0] x;
+  initial begin
+    u = 8'd5;
+    // `x` is never assigned, so it stays X (the elaborator cannot lower
+    // X/Z literals yet).
+    $display("v=%0d h=%h", u, u);
+    $display("[%4d] [%-4d] [%0h] [%3d] [%6b] [%0b] [%b]", u, u, u, x, x, u, u);
+  end
+endmodule
+"#;
+    let (_, result) = simulate("top.v", src, "top");
+    assert_eq!(result.display_output[0], "v=5 h=5");
+    assert_eq!(
+        result.display_output[1],
+        "[   5] [5   ] [5] [  x] [00xxxx] [101] [00000101]"
+    );
+}
