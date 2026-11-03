@@ -1443,7 +1443,11 @@ mod tests {
             module child2 #(parameter P = 1) (); parameter Q = 2; endmodule
             module top; child #(.W(8)) u1(); child2 #(.P(3), .Q(5)) u2(); endmodule";
         let (design, interner, diags) = elaborate_src("top.v", src, "top");
-        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        // `.Q(5)` targets a local parameter: reported (E214), value kept.
+        let e214 = spans_with(&diags, errors::E214);
+        assert_eq!(e214.len(), 1, "{diags:?}");
+        assert!(e214[0].contains('Q'), "{e214:?}");
+        assert_eq!(errors_of(&diags).len(), 1, "{diags:?}");
         let child = module_named(&design, &interner, "child");
         assert_eq!(
             params_of(child, &interner),
@@ -1461,6 +1465,57 @@ mod tests {
                 ("Q".to_string(), ConstValue::Int(2)),
             ]
         );
+    }
+
+    #[test]
+    fn overriding_local_parameters_reports_e214() {
+        // Header `localparam` and body `localparam` (Verilog and SV), and an
+        // SV body `parameter` in a module with a `#(...)` list, are all local.
+        for (file, src) in [
+            (
+                "top.v",
+                "module c #(parameter P = 1, localparam L = 2) (); localparam M = 3; endmodule
+                 module top; c #(.P(4), .L(9), .M(9)) u(); endmodule",
+            ),
+            (
+                "top.sv",
+                "module c #(parameter int P = 1, localparam int L = 2) (); localparam int M = 3; endmodule
+                 module top; c #(.P(4), .L(9), .M(9)) u(); endmodule",
+            ),
+        ] {
+            let (design, interner, diags) = elaborate_src(file, src, "top");
+            assert_eq!(spans_with(&diags, errors::E214).len(), 2, "{file}: {diags:?}");
+            let c = module_named(&design, &interner, "c");
+            assert_eq!(
+                params_of(c, &interner),
+                vec![
+                    ("P".to_string(), ConstValue::Int(4)),
+                    ("L".to_string(), ConstValue::Int(2)),
+                    ("M".to_string(), ConstValue::Int(3)),
+                ],
+                "{file}"
+            );
+        }
+        let (_, _, diags) = elaborate_src(
+            "top.sv",
+            "module c #(parameter int P = 1) (); parameter int Q = 2; endmodule
+             module top; c #(.Q(5)) u(); endmodule",
+            "top",
+        );
+        assert_eq!(spans_with(&diags, errors::E214).len(), 1, "{diags:?}");
+    }
+
+    #[test]
+    fn legal_overrides_do_not_report_e214() {
+        let (_, _, diags) = elaborate_src(
+            "top.v",
+            "module c #(parameter P = 1) (); endmodule
+             module d; parameter W = 2; endmodule
+             module top; c #(.P(4)) u1(); d #(.W(8)) u2(); endmodule",
+            "top",
+        );
+        assert!(spans_with(&diags, errors::E214).is_empty(), "{diags:?}");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
     }
 
     #[test]

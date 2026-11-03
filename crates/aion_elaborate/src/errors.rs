@@ -1,6 +1,6 @@
 //! Diagnostic codes and helper functions for elaboration errors and warnings.
 //!
-//! Error codes `E200`--`E213` cover elaboration failures (unknown modules,
+//! Error codes `E200`--`E214` cover elaboration failures (unknown modules,
 //! duplicate signals, type mismatches, unresolvable VHDL range attributes,
 //! invalid VHDL bit-string literals, etc.). Warning codes `W200`--`W207`
 //! cover non-fatal issues (width mismatches, unconnected ports, `forever`
@@ -93,6 +93,14 @@ pub const E212: DiagnosticCode = DiagnosticCode {
 pub const E213: DiagnosticCode = DiagnosticCode {
     category: Category::Error,
     number: 213,
+};
+
+/// Instance parameter override that targets a parameter which cannot be
+/// overridden: a `localparam`, or a body `parameter` of a module that has a
+/// `#(...)` parameter port list (IEEE 1364-2005 12.2, IEEE 1800-2017 6.20.1).
+pub const E214: DiagnosticCode = DiagnosticCode {
+    category: Category::Error,
+    number: 214,
 };
 
 /// Width mismatch in assignment or connection.
@@ -271,6 +279,22 @@ pub fn error_param_not_const(msg: &str, span: Span) -> Diagnostic {
     Diagnostic::error(E209, format!("cannot evaluate parameter: {msg}"), span)
 }
 
+/// Creates a diagnostic when an instance overrides parameter `name`, which is
+/// local and cannot be overridden. `span` is the parameter's declaration; the
+/// declared value is kept.
+pub fn error_param_not_overridable(name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        E214,
+        format!("parameter `{name}` cannot be overridden"),
+        span,
+    )
+    .with_note(
+        "`localparam`s, and body `parameter`s of a module with a `#(...)` \
+             parameter list, are local (IEEE 1364-2005 12.2, IEEE 1800-2017 6.20.1)",
+    )
+    .with_help("remove the override, or declare the parameter in the module's `#(...)` list")
+}
+
 /// Creates a diagnostic for an unsupported construct.
 pub fn error_unsupported(what: &str, span: Span) -> Diagnostic {
     Diagnostic::error(E210, format!("unsupported construct: {what}"), span)
@@ -433,6 +457,16 @@ mod tests {
     fn param_not_const_diagnostic() {
         let d = error_param_not_const("non-constant expression", Span::DUMMY);
         assert_eq!(d.code, E209);
+    }
+
+    #[test]
+    fn param_not_overridable_diagnostic() {
+        let d = error_param_not_overridable("Q", Span::DUMMY);
+        assert_eq!(d.code, E214);
+        assert_eq!(format!("{E214}"), "E214");
+        assert!(d.message.contains("`Q`"), "{}", d.message);
+        assert!(!d.notes.is_empty());
+        assert!(!d.help.is_empty());
     }
 
     #[test]

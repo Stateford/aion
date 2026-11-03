@@ -114,8 +114,10 @@ fn apply_sv_params(
     // declarations in source order, so a later one can use an earlier one
     // (`localparam A = 1, B = A + 1;`). A body `parameter` can be overridden
     // only when the module has no parameter port list; otherwise it acts as a
-    // `localparam` (IEEE 1364-2005 12.2, IEEE 1800-2017 6.20.1).
-    let header = decl.params.iter().map(|p| (p, true));
+    // `localparam` (IEEE 1364-2005 12.2, IEEE 1800-2017 6.20.1). Overriding a
+    // non-overridable parameter is reported as E214.
+    // A `localparam` in the `#(...)` list is local too.
+    let header = decl.params.iter().map(|p| (p, !p.local));
     let body = decl.items.iter().filter_map(|item| match item {
         sv_ast::ModuleItem::ParameterDecl(p) | sv_ast::ModuleItem::LocalparamDecl(p) => {
             Some((p, !p.local && decl.params.is_empty()))
@@ -125,6 +127,14 @@ fn apply_sv_params(
 
     for (param, overridable) in header.chain(body) {
         let name = param.name;
+        // Overriding a local parameter is illegal: report it instead of
+        // silently keeping the declared value.
+        if !overridable && override_map.contains_key(&name) {
+            ctx.sink.emit(errors::error_param_not_overridable(
+                ctx.interner.resolve(name),
+                param.span,
+            ));
+        }
         let value = if let Some(ov) = override_map.get(&name).filter(|_| overridable) {
             ov.clone()
         } else if let Some(ref value) = param.value {
