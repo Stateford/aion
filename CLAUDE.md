@@ -35,6 +35,7 @@ crates/
 ├── aion_vhdl_parser/    # Hand-rolled recursive descent VHDL-2008 parser
 ├── aion_verilog_parser/ # Hand-rolled recursive descent Verilog-2005 parser
 ├── aion_sv_parser/      # Hand-rolled recursive descent SystemVerilog-2017 parser
+├── aion_vpp/            # Shared Verilog/SV preprocessor: `define, `ifdef, `include, directives
 ├── aion_elaborate/      # AST → AionIR elaboration engine
 ├── aion_synth/          # Synthesis: behavioral lowering, optimization, tech mapping
 ├── aion_pnr/            # Place & route: simulated annealing + PathFinder router
@@ -125,7 +126,8 @@ crates/
 
 ## Crate Dependency Rules
 
-- Parsers depend on: `aion_source`, `aion_diagnostics`
+- Parsers depend on: `aion_source`, `aion_diagnostics`; the Verilog and SV parsers also depend on `aion_vpp`
+- `aion_vpp` (shared Verilog/SV preprocessor) depends only on: `aion_source`, `aion_diagnostics`
 - `aion_elaborate` depends on: `aion_ir`, all parsers
 - `aion_synth` depends on: `aion_ir`, `aion_arch`
 - `aion_pnr` depends on: `aion_ir`, `aion_arch`, `aion_timing`
