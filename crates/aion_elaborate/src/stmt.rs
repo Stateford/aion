@@ -1652,4 +1652,40 @@ mod tests {
         assert!(w204[0].message.contains("`t`"), "{}", w204[0].message);
         assert_eq!(find(&objects, "p.t").2, None);
     }
+
+    #[test]
+    fn vhdl_sized_bit_string_defaults() {
+        // Issue #22: sized/signed/decimal bit-string literals as defaults.
+        let (objects, diags) = vhdl_objects(
+            "constant U8 : std_logic_vector(7 downto 0) := 8UX\"F\";\n\
+             constant S8 : std_logic_vector(7 downto 0) := 8SX\"F\";\n\
+             constant D16 : std_logic_vector(15 downto 0) := 16D\"255\";\n\
+             constant S12 : std_logic_vector(11 downto 0) := 12SB\"101\";\n\
+             constant UX4 : std_logic_vector(3 downto 0) := UX\"A\";\n\
+             begin\n y <= a;",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(find(&objects, "u8").2, Some(0x0F));
+        assert_eq!(find(&objects, "s8").2, Some(0xFF));
+        assert_eq!(find(&objects, "d16").2, Some(255));
+        assert_eq!(find(&objects, "s12").2, Some(0xFFD));
+        assert_eq!(find(&objects, "ux4").2, Some(0xA));
+    }
+
+    #[test]
+    fn vhdl_truncating_bit_string_is_a_parse_error() {
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source(
+            "t.vhd",
+            "architecture rtl of t is constant K : std_logic_vector(2 downto 0) := 3UX\"F\"; \
+             begin end;"
+                .to_string(),
+        );
+        let _ = aion_vhdl_parser::parse_file(file_id, &source_db, &interner, &sink);
+        let diags = sink.diagnostics();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("cannot be truncated"));
+    }
 }
