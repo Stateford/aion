@@ -209,6 +209,9 @@ pub enum SvToken {
     UnbasedUnsizedLiteral,
     /// Real literal (e.g., `3.5`, `1.0e-3`)
     RealLiteral,
+    /// Time literal: a number with a time unit (e.g., `10ns`, `1.5ps`,
+    /// `100fs`, `1s`) or `1step`
+    TimeLiteral,
     /// String literal (e.g., `"hello"`)
     StringLiteral,
 

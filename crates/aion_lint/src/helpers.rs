@@ -340,6 +340,9 @@ pub fn signal_ref_width(sref: &SignalRef, module: &Module, design: &Design) -> O
 /// - whole-signal and concatenated-signal references (no module context);
 /// - 1-bit all-zero / all-one literals, which represent context-dependent
 ///   VHDL `(others => '0')` / `(others => '1')` aggregates;
+/// - named constants (parameters, generics): an untyped parameter is 32
+///   bits by the LRM, so `state <= IDLE` would otherwise always look like a
+///   mismatch, although the value fits;
 /// - unary, binary, ternary, and function-call expressions stamped with the
 ///   `TypeId::from_raw(0)` placeholder, which the elaborator uses for
 ///   unresolved result types and which may alias an unrelated real type;
@@ -359,6 +362,7 @@ pub fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
             }
             Some(lv.width())
         }
+        Expr::NamedConst { .. } => None,
         Expr::Unary { ty, .. }
         | Expr::Binary { ty, .. }
         | Expr::Ternary { ty, .. }
@@ -374,7 +378,10 @@ pub fn expr_width(expr: &Expr, design: &Design) -> Option<u32> {
         Expr::Repeat { expr, count, .. } => expr_width(expr, design)?.checked_mul(*count),
         Expr::Index { .. } => Some(1),
         Expr::Slice { high, low, .. } => match (high.as_ref(), low.as_ref()) {
-            (Expr::Literal(h), Expr::Literal(l)) => range_width(h.to_u64()?, l.to_u64()?),
+            (
+                Expr::Literal(h) | Expr::NamedConst { value: h, .. },
+                Expr::Literal(l) | Expr::NamedConst { value: l, .. },
+            ) => range_width(h.to_u64()?, l.to_u64()?),
             _ => None,
         },
     }
@@ -404,7 +411,7 @@ fn collect_expr_signals_into(expr: &Expr, result: &mut HashSet<SignalId>) {
         Expr::Signal(sref) => {
             collect_signal_ref_signals_into(sref, result);
         }
-        Expr::Literal(_) => {}
+        Expr::Literal(_) | Expr::NamedConst { .. } => {}
         Expr::Unary { operand, .. } => {
             collect_expr_signals_into(operand, result);
         }
@@ -1140,6 +1147,27 @@ mod tests {
             span: dummy_span(),
         };
         assert_eq!(expr_width(&e, &design), None);
+    }
+
+    #[test]
+    fn expr_width_named_constant() {
+        let design = mk_design_with(mk_module(), TypeDb::new());
+        let named = |v| Expr::NamedConst {
+            name: Ident::from_raw(1),
+            value: LogicVec::from_u64(v, 32),
+        };
+        // A parameter's width is context-dependent: never a mismatch alone.
+        assert_eq!(expr_width(&named(1), &design), None);
+        // But a parameter is a known constant slice bound (`a[MSB:0]`).
+        let e = Expr::Slice {
+            expr: Box::new(mk_signal_expr(SignalId::from_raw(0))),
+            high: Box::new(named(7)),
+            low: Box::new(lit(0, 32)),
+            span: dummy_span(),
+        };
+        assert_eq!(expr_width(&e, &design), Some(8));
+        // ...and a parameter reads no signals.
+        assert!(collect_expr_signals(&named(3)).is_empty());
     }
 
     #[test]

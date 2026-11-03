@@ -266,4 +266,36 @@ mod tests {
         DeadLogic.check_module(design.modules.get(design.top), &design, &sink);
         assert!(sink.take_all().is_empty());
     }
+
+    #[test]
+    fn parameter_condition_no_warning() {
+        // `if (DEBUG)` with `localparam DEBUG = 0` is configuration, not dead
+        // logic: a named constant condition is not reported.
+        let mut module = mk_module();
+        module.processes.alloc(Process {
+            id: ProcessId::from_raw(0),
+            name: None,
+            kind: ProcessKind::Combinational,
+            body: Statement::If {
+                condition: Expr::NamedConst {
+                    name: Ident::from_raw(1),
+                    value: LogicVec::from_u64(0, 32),
+                },
+                then_body: Box::new(Statement::Assign {
+                    target: SignalRef::Signal(SignalId::from_raw(0)),
+                    value: Expr::Literal(LogicVec::from_bool(true)),
+                    kind: aion_ir::AssignKind::Blocking,
+                    span: Span::DUMMY,
+                }),
+                else_body: None,
+                span: Span::DUMMY,
+            },
+            sensitivity: Sensitivity::All,
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module);
+        let sink = DiagnosticSink::new();
+        DeadLogic.check_module(design.modules.get(design.top), &design, &sink);
+        assert!(sink.take_all().is_empty());
+    }
 }

@@ -1,0 +1,25 @@
+## 2026-11-02 — Elaborator: Parameter Names in Expressions (Part of #42 LINT-20)
+
+- **Bug:** a header or body `parameter`/`localparam` (Verilog, SV) or a VHDL generic used in an expression failed with E204, so `if (state == IDLE)` and `case (state) IDLE:` did not elaborate. VHDL constants already worked, because they are `Const` signals.
+- **Design:** `SignalEnv` is now a struct, not a `HashMap` alias. It holds the module's constants next to its signals. `apply_*_params`/`apply_vhdl_generics` bind each one, so no lowering call site had to change. A signal of the same name takes precedence. A name that is neither a signal nor a constant is still E204.
+- **New IR variant `Expr::NamedConst { name, value }`:** sim and synth evaluate it exactly like `Literal`. It keeps the name so lint can tell a parameter from a literal. With a plain literal, every `state <= RUN` got W103/W107 (32-bit into 2-bit), every parameter got C203 "magic number", and `if (DEBUG)` got W108. `expr_width` treats it as context-dependent, except as a slice bound. C203 and W108 skip it.
+- **Width (LRM 1364 §12.2 / 1800 §6.20.2):** a declared range or type sets the width (`[1:0]` is 2 bits, `int` 32, `logic [5:0]` 6). An untyped parameter takes its value's width: a sized literal keeps its size, the widest operand of `+ - * / % & | ^` is used, and an integer is 32 bits. Overrides are 32 bits. VHDL generics use their type's width; `integer` is 32 bits.
+- **Same root cause, also fixed:** these used an empty const env and failed with E209, or silently wrote the whole signal:
+  - replication counts (`{W{1'b0}}`);
+  - delays (`#HALF`, `#(D*2)`);
+  - instance overrides that name a parent parameter (`#(.W(P))`, `generic map (N => P)`);
+  - constant target indices (`state[RUN] <= 1`, `q[W-1:0] <= ...`), which used to write the whole signal.
+- **Tests:**
+  - elaborator +22 (12 end-to-end, 10 `SignalEnv`/width unit tests);
+  - IR +2 (bincode/JSON round-trip);
+  - lint +3 (C203, W108, `expr_width`);
+  - sim +1 and synth +2;
+  - `aion_conformance/tests/param_fsm.rs`: a simulated localparam FSM, plus lint checks with no parameter false positives.
+- **Known gaps:**
+  - SV package parameters (`pkg::X`), SV `enum` members and VHDL enumeration literals (`type st_t is (IDLE, RUN)`, E210 + E204) are still unresolved.
+  - VHDL `when … else` concurrent assignments do not parse.
+  - VHDL generics with string or bit-string defaults give E209 (const eval handles integers only).
+  - Parameter signedness is not modelled.
+  - Out of scope: LINT-4 part-select, LINT-20 net initializers.
+- **Merged with #20/#21/#31/#34 (2026-11-03):** #21 (PR #60) added a `&RangeEnv` argument to `types::resolve_vhdl_type`; the generic-width lookup in `apply_vhdl_generics` now passes an empty `RangeEnv`, since no object is in scope yet when a generic's own type is resolved. New test `vhdl_generic_type_range_attribute_reports_e212` checks that a range attribute in a generic's type is reported (`E212`). Both sides' new `expr.rs` tests are kept.
+- **Merged with #30 (2026-11-03):** SV `#delay` statements keep this branch's parameter-aware delay evaluation (`eval_delay_expr_sv` takes the `SignalEnv`) and use #30's target-sized `lower_sv_stmt_sized` for the body. SV continuous assigns now go through #30's `lower_sv_assign_value`, which receives the same constant-carrying `SignalEnv`, so parameter names still resolve there (covered by the existing localparam FSM tests).

@@ -21,7 +21,7 @@ use aion_sv_parser::ast::{self as sv_ast, Direction};
 use crate::const_eval::{self, ConstEnv};
 use crate::context::ElaborationContext;
 use crate::errors;
-use crate::expr::{lower_sv_assign_value, lower_sv_to_signal_ref, SignalEnv};
+use crate::expr::{self, lower_sv_assign_value, lower_sv_to_signal_ref, SignalEnv};
 use crate::registry::ModuleEntry;
 use crate::stmt::{lower_sv_looping_always, lower_sv_stmt_sized};
 use crate::types;
@@ -34,10 +34,17 @@ pub fn elaborate_sv_module(
 ) -> ModuleId {
     let mut const_env = ConstEnv::new();
     let mut ir_params = Vec::new();
-    apply_sv_params(decl, param_overrides, &mut const_env, &mut ir_params, ctx);
+    let mut sig_env = SignalEnv::new();
+    apply_sv_params(
+        decl,
+        param_overrides,
+        &mut const_env,
+        &mut ir_params,
+        &mut sig_env,
+        ctx,
+    );
 
     let mut signals: Arena<SignalId, Signal> = Arena::new();
-    let mut sig_env = SignalEnv::new();
     let mut ports = Vec::new();
 
     elaborate_sv_ports(
@@ -101,25 +108,59 @@ pub fn elaborate_sv_module(
 }
 
 /// Applies parameter declarations and overrides.
+///
+/// Each parameter is also bound as a constant in `sig_env`, with the width
+/// of its declared type or range (`int` is 32 bits, `logic [7:0]` 8) or,
+/// when untyped, the width of its final value, so that expressions can use
+/// its name.
 fn apply_sv_params(
     decl: &sv_ast::SvModuleDecl,
     overrides: &[(Ident, ConstValue)],
     const_env: &mut ConstEnv,
     ir_params: &mut Vec<Parameter>,
+    sig_env: &mut SignalEnv,
     ctx: &mut ElaborationContext<'_>,
 ) {
     let override_map: HashMap<_, _> = overrides.iter().cloned().collect();
 
-    for param in &decl.params {
+    // Header (`#(...)`) parameters first, then body `parameter`/`localparam`
+    // declarations in source order, so a later one can use an earlier one
+    // (`localparam A = 1, B = A + 1;`). A body `parameter` can be overridden
+    // only when the module has no parameter port list; otherwise it acts as a
+    // `localparam` (IEEE 1364-2005 12.2, IEEE 1800-2017 6.20.1). Overriding a
+    // non-overridable parameter is reported as E214.
+    // A `localparam` in the `#(...)` list is local too.
+    let header = decl.params.iter().map(|p| (p, !p.local));
+    let body = decl.items.iter().filter_map(|item| match item {
+        sv_ast::ModuleItem::ParameterDecl(p) | sv_ast::ModuleItem::LocalparamDecl(p) => {
+            Some((p, !p.local && decl.params.is_empty()))
+        }
+        _ => None,
+    });
+
+    for (param, overridable) in header.chain(body) {
         let name = param.name;
-        let value = if let Some(ov) = override_map.get(&name) {
+        // Overriding a local parameter is illegal: report it instead of
+        // silently keeping the declared value.
+        if !overridable && override_map.contains_key(&name) {
+            ctx.sink.emit(errors::error_param_not_overridable(
+                ctx.interner.resolve(name),
+                param.span,
+            ));
+        }
+        let mut value_width = None;
+        let value = if let Some(ov) = override_map.get(&name).filter(|_| overridable) {
             ov.clone()
         } else if let Some(ref value) = param.value {
+            value_width = Some(expr::sv_value_width(value, sig_env, ctx.source_db));
             const_eval::eval_sv_expr(value, ctx.source_db, ctx.interner, const_env, ctx.sink)
                 .unwrap_or(ConstValue::Int(0))
         } else {
             ConstValue::Int(0)
         };
+        let declared = sv_param_declared_width(param, const_env, ctx);
+        let width = expr::param_value_width(declared, &value, value_width);
+        sig_env.insert_const(name, value.clone(), width);
         const_env.insert(name, value.clone());
         ir_params.push(Parameter {
             name,
@@ -127,6 +168,40 @@ fn apply_sv_params(
             value,
             span: param.span,
         });
+    }
+}
+
+/// Returns the width of a parameter's explicit type or range, if it has one.
+///
+/// A simple type (`int`, `byte`, `logic [7:0]`, `bit`) gives its bit width,
+/// with `integer` 32 bits; a bare range (`parameter [3:0] P`) gives the
+/// range width. Untyped parameters, and other types (named typedefs,
+/// enums), return `None`, so the value's width is used.
+fn sv_param_declared_width(
+    param: &sv_ast::ParameterDecl,
+    const_env: &ConstEnv,
+    ctx: &mut ElaborationContext<'_>,
+) -> Option<u32> {
+    let range = param.range.as_ref();
+    match &param.type_spec {
+        Some(sv_ast::TypeSpec::Simple(sv_ast::VarType::Integer)) => Some(32),
+        Some(sv_ast::TypeSpec::Simple(vt)) => {
+            let ty = types::resolve_sv_var_type(
+                vt,
+                range,
+                param.signed,
+                &mut ctx.design.types,
+                const_env,
+                ctx.source_db,
+                ctx.interner,
+                ctx.sink,
+            );
+            ctx.design.types.bit_width(ty)
+        }
+        _ => range.and_then(|r| {
+            const_eval::eval_sv_range(r, ctx.source_db, ctx.interner, const_env, ctx.sink)
+                .map(|(msb, lsb)| (msb - lsb).unsigned_abs() as u32 + 1)
+        }),
     }
 }
 
@@ -245,6 +320,9 @@ fn elaborate_sv_item(
 ) {
     match item {
         sv_ast::ModuleItem::NetDecl(net) => {
+            if let Some(delay) = &net.delay {
+                crate::verilog::warn_net_delay(ctx, "net declaration", delay.span);
+            }
             let ty = types::resolve_sv_range(
                 net.range.as_ref(),
                 net.signed,
@@ -347,6 +425,9 @@ fn elaborate_sv_item(
         sv_ast::ModuleItem::ParameterDecl(_) | sv_ast::ModuleItem::LocalparamDecl(_) => {}
         sv_ast::ModuleItem::PortDecl(_) => {}
         sv_ast::ModuleItem::ContinuousAssign(ca) => {
+            if let Some(delay) = &ca.delay {
+                crate::verilog::warn_net_delay(ctx, "continuous assignment", delay.span);
+            }
             let target =
                 lower_sv_to_signal_ref(&ca.target, sig_env, ctx.source_db, ctx.interner, ctx.sink);
             let widths = packed_width_lookup(signals, &ctx.design.types, unpacked);
@@ -606,7 +687,7 @@ fn elaborate_sv_instantiation(
                 actual,
                 ctx.source_db,
                 ctx.interner,
-                &Default::default(),
+                sig_env.consts(),
                 ctx.sink,
             )?;
             Some((formal, val))

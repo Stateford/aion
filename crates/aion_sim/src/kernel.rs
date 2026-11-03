@@ -1356,7 +1356,7 @@ fn collect_expr_reads_inner(
 ) {
     match expr {
         Expr::Signal(sr) => collect_signal_ref_reads(sr, signal_map, result),
-        Expr::Literal(_) => {}
+        Expr::Literal(_) | Expr::NamedConst { .. } => {}
         Expr::Unary { operand, .. } => collect_expr_reads_inner(operand, signal_map, result),
         Expr::Binary { lhs, rhs, .. } => {
             collect_expr_reads_inner(lhs, signal_map, result);

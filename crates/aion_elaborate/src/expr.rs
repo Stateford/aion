@@ -1,8 +1,9 @@
 //! AST expression lowering to IR expressions.
 //!
 //! Converts language-specific AST expression trees (Verilog, SystemVerilog, VHDL)
-//! into the unified [`Expr`](aion_ir::expr::Expr) representation. Signal references
-//! are resolved through a [`SignalEnv`] mapping of interned names to signal IDs.
+//! into the unified [`Expr`](aion_ir::expr::Expr) representation. Names are
+//! resolved through a [`SignalEnv`], which maps interned names to signal IDs and,
+//! for parameters and generics, to constant values.
 
 use std::collections::HashMap;
 
@@ -11,13 +12,198 @@ use aion_diagnostics::DiagnosticSink;
 use aion_ir::expr::{BinaryOp, Expr as IrExpr, UnaryOp};
 use aion_ir::ids::{SignalId, TypeId};
 use aion_ir::signal::SignalRef;
+use aion_ir::ConstValue;
 use aion_source::{SourceDb, Span};
 
-use crate::const_eval;
+use crate::const_eval::{self, ConstEnv};
 use crate::errors;
 
-/// Maps interned signal names to their signal IDs within a module.
-pub type SignalEnv = HashMap<Ident, SignalId>;
+/// Name-resolution scope for expression lowering within one module.
+///
+/// Maps interned names to the module's signals and, separately, to its
+/// compile-time constants (Verilog/SV `parameter`/`localparam`, VHDL
+/// generics). An identifier is resolved as a signal first; only a name that
+/// is not a signal falls back to a constant, which lowers to an
+/// [`IrExpr::NamedConst`] carrying the constant's value at its width. A name
+/// that is neither is an `E204` error.
+///
+/// Carrying the constants here means every lowering function that already
+/// receives the scope can resolve parameter names, without a separate
+/// constant environment threaded through each call.
+#[derive(Debug, Clone, Default)]
+pub struct SignalEnv {
+    /// Signal names visible in this scope.
+    signals: HashMap<Ident, SignalId>,
+    /// Constant values, usable by the constant evaluator.
+    consts: ConstEnv,
+    /// Bit width of each constant when lowered to a literal.
+    const_widths: HashMap<Ident, u32>,
+}
+
+impl SignalEnv {
+    /// Creates an empty scope with no signals and no constants.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the signal bound to `name`, ignoring constants.
+    pub fn get(&self, name: &Ident) -> Option<&SignalId> {
+        self.signals.get(name)
+    }
+
+    /// Binds `name` to signal `sid`, returning the previous binding if any.
+    ///
+    /// A signal binding takes precedence over a constant of the same name.
+    pub fn insert(&mut self, name: Ident, sid: SignalId) -> Option<SignalId> {
+        self.signals.insert(name, sid)
+    }
+
+    /// Binds `name` to a constant `value` that lowers to a `width`-bit literal.
+    ///
+    /// `width` is the parameter's declared width, or its value's width for an
+    /// untyped parameter (see `param_value_width`). A width of 0 is
+    /// treated as 1.
+    pub fn insert_const(&mut self, name: Ident, value: ConstValue, width: u32) {
+        self.consts.insert(name, value);
+        self.const_widths.insert(name, width.max(1));
+    }
+
+    /// Returns every constant in scope, for use with the constant evaluator
+    /// (replication counts, delays, instance parameter overrides, indices).
+    pub fn consts(&self) -> &ConstEnv {
+        &self.consts
+    }
+
+    /// Lowers the constant `name` to a literal of its value and width, or
+    /// returns `None` if `name` is not a constant in this scope.
+    ///
+    /// Integers are encoded in two's complement (sign-extended past 64
+    /// bits); a real is truncated toward zero; a logic vector is
+    /// zero-extended or truncated to the width; a boolean is 0 or 1; a
+    /// string lowers to the same zero placeholder as a string literal.
+    pub fn const_literal(&self, name: Ident) -> Option<LogicVec> {
+        let value = self.consts.get(&name)?;
+        let width = self.const_widths.get(&name).copied().unwrap_or(32);
+        Some(const_value_to_logic(value, width))
+    }
+}
+
+/// Encodes a constant value as a `width`-bit logic vector.
+fn const_value_to_logic(value: &ConstValue, width: u32) -> LogicVec {
+    use aion_common::Logic;
+    let int = match value {
+        ConstValue::Int(v) => *v,
+        ConstValue::Real(f) => *f as i64,
+        ConstValue::Bool(b) => i64::from(*b),
+        ConstValue::Logic(lv) => {
+            let mut out = LogicVec::all_zero(width);
+            for i in 0..width.min(lv.width()) {
+                out.set(i, lv.get(i));
+            }
+            return out;
+        }
+        ConstValue::String(_) => return LogicVec::all_zero(1),
+    };
+    let mut lv = logic_vec_from_u64(width, int as u64);
+    if int < 0 {
+        for i in 64..width {
+            lv.set(i, Logic::One);
+        }
+    }
+    lv
+}
+
+/// Returns the width a parameter lowers to when used in an expression.
+///
+/// `declared` is the width of an explicit range or type, which always wins
+/// (IEEE 1364-2005 12.2, IEEE 1800-2017 6.20.2). Without one, the parameter
+/// takes the width of its final value: `value_width` (the self-determined
+/// width of the value expression) when the value is the declared default,
+/// a logic vector's own width, and 32 bits for any integer (an unsized
+/// integer value, or an instance override, which carries no width).
+pub(crate) fn param_value_width(
+    declared: Option<u32>,
+    value: &ConstValue,
+    value_width: Option<u32>,
+) -> u32 {
+    if let Some(w) = declared {
+        return w.max(1);
+    }
+    match value {
+        ConstValue::Logic(lv) => lv.width().max(1),
+        ConstValue::Bool(_) => 1,
+        ConstValue::Real(_) => 64,
+        ConstValue::Int(_) | ConstValue::String(_) => value_width.unwrap_or(32).max(1),
+    }
+}
+
+/// Returns the self-determined width of an untyped Verilog parameter value.
+///
+/// A sized literal (`2'b01`) has its explicit width and an unsized one is
+/// 32 bits. A name of an earlier constant has that constant's width.
+/// Parentheses, unary `-`/`+`/`~`, and binary arithmetic or bitwise
+/// operators take the widest operand; anything else is treated as a 32-bit
+/// integer.
+pub(crate) fn verilog_value_width(
+    expr: &aion_verilog_parser::ast::Expr,
+    env: &SignalEnv,
+    source_db: &SourceDb,
+) -> u32 {
+    use aion_verilog_parser::ast::{BinaryOp as B, Expr, UnaryOp as U};
+    match expr {
+        Expr::Literal { span } => literal_width(source_db.snippet(*span)),
+        Expr::Identifier { name, .. } => env.const_widths.get(name).copied().unwrap_or(32),
+        Expr::Paren { inner, .. } => verilog_value_width(inner, env, source_db),
+        Expr::Unary {
+            op: U::Minus | U::Plus | U::BitNot,
+            operand,
+            ..
+        } => verilog_value_width(operand, env, source_db),
+        Expr::Binary {
+            left,
+            op: B::Add | B::Sub | B::Mul | B::Div | B::Mod | B::BitAnd | B::BitOr | B::BitXor,
+            right,
+            ..
+        } => verilog_value_width(left, env, source_db)
+            .max(verilog_value_width(right, env, source_db)),
+        _ => 32,
+    }
+}
+
+/// Returns the self-determined width of an untyped SV parameter value.
+///
+/// Same rules as [`verilog_value_width`].
+pub(crate) fn sv_value_width(
+    expr: &aion_sv_parser::ast::Expr,
+    env: &SignalEnv,
+    source_db: &SourceDb,
+) -> u32 {
+    use aion_sv_parser::ast::{BinaryOp as B, Expr, UnaryOp as U};
+    match expr {
+        Expr::Literal { span } => literal_width(source_db.snippet(*span)),
+        Expr::Identifier { name, .. } => env.const_widths.get(name).copied().unwrap_or(32),
+        Expr::Paren { inner, .. } => sv_value_width(inner, env, source_db),
+        Expr::Unary {
+            op: U::Minus | U::Plus | U::BitNot,
+            operand,
+            ..
+        } => sv_value_width(operand, env, source_db),
+        Expr::Binary {
+            left,
+            op: B::Add | B::Sub | B::Mul | B::Div | B::Mod | B::BitAnd | B::BitOr | B::BitXor,
+            right,
+            ..
+        } => sv_value_width(left, env, source_db).max(sv_value_width(right, env, source_db)),
+        _ => 32,
+    }
+}
+
+/// Returns a Verilog/SV literal's width: its explicit size, else 32 bits.
+fn literal_width(text: &str) -> u32 {
+    const_eval::parse_verilog_literal_with_width(text)
+        .and_then(|(w, _)| w)
+        .unwrap_or(32)
+}
 
 /// Looks up the bit width of a signal that is a plain packed vector.
 ///
@@ -128,15 +314,10 @@ pub fn lower_verilog_expr(
             span,
         } => {
             // Evaluate count as constant
-            let count_val = const_eval::eval_verilog_expr(
-                count,
-                source_db,
-                interner,
-                &Default::default(),
-                sink,
-            )
-            .and_then(|v| const_eval::const_to_i64(&v))
-            .unwrap_or(1) as u32;
+            let count_val =
+                const_eval::eval_verilog_expr(count, source_db, interner, sig_env.consts(), sink)
+                    .and_then(|v| const_eval::const_to_i64(&v))
+                    .unwrap_or(1) as u32;
             let inner = if elements.len() == 1 {
                 lower_verilog_expr(&elements[0], sig_env, source_db, interner, sink)
             } else {
@@ -252,6 +433,7 @@ pub fn lower_sv_expr(
         }
         Expr::Literal { span } => lower_verilog_literal(*span, source_db),
         Expr::RealLiteral { span } => lower_verilog_literal(*span, source_db),
+        Expr::TimeLiteral { span } => lower_sv_time_literal_value(*span, source_db, sink),
         Expr::StringLiteral { .. } => IrExpr::Literal(LogicVec::all_zero(1)),
         Expr::Unary { op, operand, span } => {
             if op.is_incr_decr() {
@@ -325,7 +507,7 @@ pub fn lower_sv_expr(
             span,
         } => {
             let count_val =
-                const_eval::eval_sv_expr(count, source_db, interner, &Default::default(), sink)
+                const_eval::eval_sv_expr(count, source_db, interner, sig_env.consts(), sink)
                     .and_then(|v| const_eval::const_to_i64(&v))
                     .unwrap_or(1) as u32;
             let inner = if elements.len() == 1 {
@@ -807,7 +989,7 @@ pub fn lower_to_signal_ref(
         }
         Expr::Index { base, index, .. } => {
             if let Some(sid) = extract_base_signal_verilog(base, sig_env) {
-                if let Some(idx) = try_const_index_verilog(index, source_db) {
+                if let Some(idx) = try_const_index_verilog(index, sig_env, source_db, interner) {
                     SignalRef::Slice {
                         signal: sid,
                         high: idx,
@@ -823,8 +1005,8 @@ pub fn lower_to_signal_ref(
         Expr::RangeSelect { base, msb, lsb, .. } => {
             if let Some(sid) = extract_base_signal_verilog(base, sig_env) {
                 if let (Some(hi), Some(lo)) = (
-                    try_const_index_verilog(msb, source_db),
-                    try_const_index_verilog(lsb, source_db),
+                    try_const_index_verilog(msb, sig_env, source_db, interner),
+                    try_const_index_verilog(lsb, sig_env, source_db, interner),
                 ) {
                     SignalRef::Slice {
                         signal: sid,
@@ -874,7 +1056,7 @@ pub fn lower_sv_to_signal_ref(
         }
         Expr::Index { base, index, .. } => {
             if let Some(sid) = extract_base_signal_sv(base, sig_env) {
-                if let Some(idx) = try_const_index_sv(index, source_db) {
+                if let Some(idx) = try_const_index_sv(index, sig_env, source_db, interner) {
                     SignalRef::Slice {
                         signal: sid,
                         high: idx,
@@ -890,8 +1072,8 @@ pub fn lower_sv_to_signal_ref(
         Expr::RangeSelect { base, msb, lsb, .. } => {
             if let Some(sid) = extract_base_signal_sv(base, sig_env) {
                 if let (Some(hi), Some(lo)) = (
-                    try_const_index_sv(msb, source_db),
-                    try_const_index_sv(lsb, source_db),
+                    try_const_index_sv(msb, sig_env, source_db, interner),
+                    try_const_index_sv(lsb, sig_env, source_db, interner),
                 ) {
                     SignalRef::Slice {
                         signal: sid,
@@ -958,26 +1140,45 @@ fn extract_base_signal_sv(
 }
 
 /// Tries to const-evaluate a Verilog expression to a `u32` index value.
+///
+/// Literals and constant expressions over the parameters in `sig_env`
+/// (`q[IDLE]`, `q[W-1:0]`) evaluate; anything else (a signal index) returns
+/// `None` without diagnostics, since a non-constant index is legal there.
 fn try_const_index_verilog(
     expr: &aion_verilog_parser::ast::Expr,
+    sig_env: &SignalEnv,
     source_db: &SourceDb,
+    interner: &Interner,
 ) -> Option<u32> {
-    if let aion_verilog_parser::ast::Expr::Literal { span } = expr {
-        let text = source_db.snippet(*span);
-        crate::const_eval::parse_verilog_literal(text).and_then(|v| u32::try_from(v).ok())
-    } else {
-        None
+    if let aion_verilog_parser::ast::Expr::Identifier { name, .. } = expr {
+        if sig_env.get(name).is_some() {
+            return None; // a signal shadows a parameter of the same name
+        }
     }
+    let scratch = DiagnosticSink::new();
+    const_eval::eval_verilog_expr(expr, source_db, interner, sig_env.consts(), &scratch)
+        .and_then(|v| const_eval::const_to_i64(&v))
+        .and_then(|v| u32::try_from(v).ok())
 }
 
 /// Tries to const-evaluate an SV expression to a `u32` index value.
-fn try_const_index_sv(expr: &aion_sv_parser::ast::Expr, source_db: &SourceDb) -> Option<u32> {
-    if let aion_sv_parser::ast::Expr::Literal { span } = expr {
-        let text = source_db.snippet(*span);
-        crate::const_eval::parse_verilog_literal(text).and_then(|v| u32::try_from(v).ok())
-    } else {
-        None
+///
+/// Same rules as [`try_const_index_verilog`].
+fn try_const_index_sv(
+    expr: &aion_sv_parser::ast::Expr,
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+) -> Option<u32> {
+    if let aion_sv_parser::ast::Expr::Identifier { name, .. } = expr {
+        if sig_env.get(name).is_some() {
+            return None; // a signal shadows a parameter of the same name
+        }
     }
+    let scratch = DiagnosticSink::new();
+    const_eval::eval_sv_expr(expr, source_db, interner, sig_env.consts(), &scratch)
+        .and_then(|v| const_eval::const_to_i64(&v))
+        .and_then(|v| u32::try_from(v).ok())
 }
 
 /// Converts a VHDL AST expression into a [`SignalRef`] for assignment targets.
@@ -1026,7 +1227,10 @@ pub fn lower_vhdl_to_signal_ref(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Resolves an identifier to an IR signal reference, or emits an E204 diagnostic.
+/// Resolves an identifier to an IR signal reference or, for a name that is
+/// not a signal but a constant in scope, to an [`IrExpr::NamedConst`] of the
+/// constant's value and width. Emits an E204 diagnostic for a name that is
+/// neither.
 fn resolve_signal(
     name: Ident,
     span: Span,
@@ -1036,10 +1240,56 @@ fn resolve_signal(
 ) -> IrExpr {
     if let Some(&sid) = sig_env.get(&name) {
         IrExpr::Signal(SignalRef::Signal(sid))
+    } else if let Some(value) = sig_env.const_literal(name) {
+        IrExpr::NamedConst { name, value }
     } else {
         sink.emit(errors::error_unknown_signal(interner.resolve(name), span));
         poison(span)
     }
+}
+
+/// Lowers a SystemVerilog time literal used as a value (`x = 5ns;`,
+/// `$time > 10ns`) to a 64-bit count of time units.
+///
+/// The elaborator assumes a 1 ns time unit (see
+/// [`DEFAULT_TIMESCALE_FS`](crate::stmt::DEFAULT_TIMESCALE_FS)), so `10ns`
+/// lowers to `10`. A literal that is not a whole number of nanoseconds
+/// (`100ps`, `1step`) is rounded half-up with a W207 warning; an
+/// out-of-range literal is an E209 error and lowers to 0.
+fn lower_sv_time_literal_value(span: Span, source_db: &SourceDb, sink: &DiagnosticSink) -> IrExpr {
+    let text = source_db.snippet(span);
+    let unit = crate::stmt::DEFAULT_TIMESCALE_FS;
+    let count = match const_eval::parse_time_literal(text) {
+        Some(const_eval::TimeLiteralValue::Fs { fs, exact }) => {
+            let count = fs / unit + u64::from(fs % unit >= unit / 2);
+            if !exact || fs % unit != 0 {
+                sink.emit(errors::warn_time_literal_assumed(
+                    text,
+                    &format!(
+                        "not a whole number of the assumed 1 ns time unit; rounded to {count}"
+                    ),
+                    span,
+                ));
+            }
+            count
+        }
+        Some(const_eval::TimeLiteralValue::Step) => {
+            sink.emit(errors::warn_time_literal_assumed(
+                text,
+                "`1step` depends on the unknown time precision; it rounds to 0 time units",
+                span,
+            ));
+            0
+        }
+        None => {
+            sink.emit(errors::error_param_not_const(
+                &format!("time literal `{text}` is out of range"),
+                span,
+            ));
+            0
+        }
+    };
+    IrExpr::Literal(logic_vec_from_u64(64, count))
 }
 
 /// Produces a poison zero-width literal for error recovery.
@@ -2273,6 +2523,265 @@ mod tests {
         assert!(is_vhdl_builtin("Rising_Edge"));
         assert!(is_vhdl_builtin("to_unsigned"));
         assert!(!is_vhdl_builtin("my_signal"));
+    }
+
+    // ---- SignalEnv constants ----
+
+    /// Returns `(width, value)` of an IR literal or named constant, panicking
+    /// on anything else.
+    fn lit(e: &IrExpr) -> (u32, u64) {
+        match e {
+            IrExpr::Literal(lv) | IrExpr::NamedConst { value: lv, .. } => {
+                (lv.width(), lv.to_u64().expect("2-state literal"))
+            }
+            other => panic!("expected literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_env_new_is_empty() {
+        let (_, interner, _, env) = setup();
+        let a = interner.get_or_intern("a");
+        assert!(env.get(&a).is_none());
+        assert!(env.const_literal(a).is_none());
+        assert!(env.consts().is_empty());
+    }
+
+    #[test]
+    fn signal_env_insert_returns_previous_binding() {
+        let (_, interner, _, mut env) = setup();
+        let a = interner.get_or_intern("a");
+        assert_eq!(env.insert(a, SignalId::from_raw(1)), None);
+        assert_eq!(
+            env.insert(a, SignalId::from_raw(2)),
+            Some(SignalId::from_raw(1))
+        );
+        assert_eq!(env.get(&a), Some(&SignalId::from_raw(2)));
+    }
+
+    #[test]
+    fn signal_env_const_is_not_a_signal_but_is_in_consts() {
+        let (_, interner, _, mut env) = setup();
+        let w = interner.get_or_intern("W");
+        env.insert_const(w, ConstValue::Int(8), 32);
+        assert!(env.get(&w).is_none(), "a constant is not a signal");
+        assert_eq!(env.consts().get(&w), Some(&ConstValue::Int(8)));
+        // A clone (used for VHDL process scopes) keeps the constants.
+        assert_eq!(env.clone().const_literal(w), env.const_literal(w));
+    }
+
+    #[test]
+    fn signal_env_const_literal_encodes_each_value_kind() {
+        let (_, interner, _, mut env) = setup();
+        let names: Vec<_> = ["i", "n", "b", "r", "l", "s", "z", "wide"]
+            .iter()
+            .map(|n| interner.get_or_intern(n))
+            .collect();
+        env.insert_const(names[0], ConstValue::Int(5), 3);
+        env.insert_const(names[1], ConstValue::Int(-2), 4);
+        env.insert_const(names[2], ConstValue::Bool(true), 1);
+        env.insert_const(names[3], ConstValue::Real(2.9), 8);
+        env.insert_const(
+            names[4],
+            ConstValue::Logic(LogicVec::from_u64(0b1101, 4)),
+            2,
+        );
+        env.insert_const(names[5], ConstValue::String("hi".into()), 16);
+        env.insert_const(names[6], ConstValue::Int(1), 0);
+        env.insert_const(names[7], ConstValue::Int(-1), 70);
+        let get = |i: usize| env.const_literal(names[i]).unwrap();
+        assert_eq!(get(0).to_u64(), Some(5));
+        assert_eq!((get(1).width(), get(1).to_u64()), (4, Some(0b1110)));
+        assert_eq!(get(2).to_u64(), Some(1));
+        assert_eq!(get(3).to_u64(), Some(2), "real truncates toward zero");
+        assert_eq!((get(4).width(), get(4).to_u64()), (2, Some(0b01)));
+        assert_eq!(get(5), LogicVec::all_zero(1), "string placeholder");
+        assert_eq!(get(6).width(), 1, "width 0 is clamped to 1");
+        let wide = get(7);
+        assert_eq!(wide.width(), 70);
+        assert!(
+            (0..70).all(|i| wide.get(i) == aion_common::Logic::One),
+            "negative values sign-extend past 64 bits"
+        );
+    }
+
+    #[test]
+    fn identifier_naming_constant_lowers_to_literal() {
+        let (sdb, interner, sink, mut env) = setup();
+        let w = interner.get_or_intern("W");
+        env.insert_const(w, ConstValue::Int(8), 32);
+        let v = aion_verilog_parser::ast::Expr::Identifier {
+            name: w,
+            span: Span::DUMMY,
+        };
+        let sv = aion_sv_parser::ast::Expr::Identifier {
+            name: w,
+            span: Span::DUMMY,
+        };
+        let vhdl = aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
+            primary: w,
+            parts: vec![],
+            span: Span::DUMMY,
+        });
+        let ir = lower_verilog_expr(&v, &env, &sdb, &interner, &sink);
+        assert!(
+            matches!(ir, IrExpr::NamedConst { name, .. } if name == w),
+            "{ir:?}"
+        );
+        assert_eq!(lit(&ir), (32, 8));
+        assert_eq!(
+            lit(&lower_sv_expr(&sv, &env, &sdb, &interner, &sink)),
+            (32, 8)
+        );
+        assert_eq!(
+            lit(&lower_vhdl_expr(&vhdl, &env, &sdb, &interner, &sink)),
+            (32, 8)
+        );
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn signal_takes_precedence_over_constant() {
+        let (sdb, interner, sink, mut env) = setup();
+        let a = interner.get_or_intern("a");
+        env.insert_const(a, ConstValue::Int(3), 32);
+        env.insert(a, SignalId::from_raw(4));
+        let e = aion_verilog_parser::ast::Expr::Identifier {
+            name: a,
+            span: Span::DUMMY,
+        };
+        let ir = lower_verilog_expr(&e, &env, &sdb, &interner, &sink);
+        assert!(matches!(ir, IrExpr::Signal(SignalRef::Signal(s)) if s == SignalId::from_raw(4)));
+    }
+
+    #[test]
+    fn param_value_width_rules() {
+        // A declared width always wins.
+        assert_eq!(param_value_width(Some(4), &ConstValue::Int(1), Some(2)), 4);
+        // Untyped: the value's width, else 32 bits for an integer.
+        assert_eq!(param_value_width(None, &ConstValue::Int(1), Some(2)), 2);
+        assert_eq!(param_value_width(None, &ConstValue::Int(1), None), 32);
+        let lv = ConstValue::Logic(LogicVec::all_zero(5));
+        assert_eq!(param_value_width(None, &lv, None), 5);
+        assert_eq!(param_value_width(None, &ConstValue::Bool(true), None), 1);
+        assert_eq!(param_value_width(None, &ConstValue::Real(1.0), None), 64);
+        assert_eq!(param_value_width(Some(0), &ConstValue::Int(0), None), 1);
+    }
+
+    #[test]
+    fn verilog_value_width_of_expressions() {
+        use aion_verilog_parser::ast::{BinaryOp, Expr, UnaryOp};
+        let (mut sdb, interner, _, mut env) = setup();
+        let file = sdb.add_source("w.v", "2'b01 42 4'hF".to_string());
+        let sized = Expr::Literal {
+            span: Span::new(file, 0, 5),
+        };
+        let unsized_ = Expr::Literal {
+            span: Span::new(file, 6, 8),
+        };
+        let four = Expr::Literal {
+            span: Span::new(file, 9, 13),
+        };
+        assert_eq!(verilog_value_width(&sized, &env, &sdb), 2);
+        assert_eq!(verilog_value_width(&unsized_, &env, &sdb), 32);
+        let add = Expr::Binary {
+            left: Box::new(sized.clone()),
+            op: BinaryOp::Add,
+            right: Box::new(four.clone()),
+            span: Span::DUMMY,
+        };
+        assert_eq!(verilog_value_width(&add, &env, &sdb), 4);
+        let neg = Expr::Unary {
+            op: UnaryOp::Minus,
+            operand: Box::new(sized.clone()),
+            span: Span::DUMMY,
+        };
+        assert_eq!(verilog_value_width(&neg, &env, &sdb), 2);
+        // A comparison is not a width-preserving operator: 32-bit fallback.
+        let eq = Expr::Binary {
+            left: Box::new(sized),
+            op: BinaryOp::Eq,
+            right: Box::new(four),
+            span: Span::DUMMY,
+        };
+        assert_eq!(verilog_value_width(&eq, &env, &sdb), 32);
+        // A name of an earlier constant has that constant's width.
+        let p = interner.get_or_intern("P");
+        env.insert_const(p, ConstValue::Int(1), 6);
+        let id = Expr::Identifier {
+            name: p,
+            span: Span::DUMMY,
+        };
+        assert_eq!(verilog_value_width(&id, &env, &sdb), 6);
+        let unknown = Expr::Identifier {
+            name: interner.get_or_intern("Q"),
+            span: Span::DUMMY,
+        };
+        assert_eq!(verilog_value_width(&unknown, &env, &sdb), 32);
+    }
+
+    #[test]
+    fn sv_value_width_of_expressions() {
+        use aion_sv_parser::ast::Expr;
+        let (mut sdb, interner, _, mut env) = setup();
+        let file = sdb.add_source("w.sv", "3'd5 7".to_string());
+        let sized = Expr::Literal {
+            span: Span::new(file, 0, 4),
+        };
+        let unsized_ = Expr::Literal {
+            span: Span::new(file, 5, 6),
+        };
+        assert_eq!(sv_value_width(&sized, &env, &sdb), 3);
+        assert_eq!(sv_value_width(&unsized_, &env, &sdb), 32);
+        let paren = Expr::Paren {
+            inner: Box::new(sized),
+            span: Span::DUMMY,
+        };
+        assert_eq!(sv_value_width(&paren, &env, &sdb), 3);
+        let p = interner.get_or_intern("P");
+        env.insert_const(p, ConstValue::Int(1), 9);
+        let id = Expr::Identifier {
+            name: p,
+            span: Span::DUMMY,
+        };
+        assert_eq!(sv_value_width(&id, &env, &sdb), 9);
+    }
+
+    #[test]
+    fn target_index_uses_constants_but_not_shadowing_signals() {
+        let (sdb, interner, sink, mut env) = setup();
+        let q = interner.get_or_intern("q");
+        let k = interner.get_or_intern("K");
+        let i = interner.get_or_intern("i");
+        env.insert(q, SignalId::from_raw(0));
+        env.insert_const(k, ConstValue::Int(3), 32);
+        // `i` is both a constant and a signal: the signal wins, so the index
+        // is not constant and the whole signal is the target.
+        env.insert_const(i, ConstValue::Int(1), 32);
+        env.insert(i, SignalId::from_raw(1));
+        let index = |name| aion_verilog_parser::ast::Expr::Index {
+            base: Box::new(aion_verilog_parser::ast::Expr::Identifier {
+                name: q,
+                span: Span::DUMMY,
+            }),
+            index: Box::new(aion_verilog_parser::ast::Expr::Identifier {
+                name,
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+        let by_const = lower_to_signal_ref(&index(k), &env, &sdb, &interner, &sink);
+        assert!(matches!(
+            by_const,
+            SignalRef::Slice {
+                high: 3,
+                low: 3,
+                ..
+            }
+        ));
+        let by_signal = lower_to_signal_ref(&index(i), &env, &sdb, &interner, &sink);
+        assert!(matches!(by_signal, SignalRef::Signal(_)));
+        assert!(!sink.has_errors(), "a non-constant index is not an error");
     }
 
     /// Parses `src` (language chosen by the extension of `file_name`),

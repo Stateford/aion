@@ -100,6 +100,8 @@ fn check_expr_magic_numbers(
     sink: &DiagnosticSink,
 ) {
     match expr {
+        // A parameter reference is the named constant this rule asks for.
+        Expr::NamedConst { .. } => {}
         Expr::Literal(lv) => {
             // Skip 1-bit literals and values 0/1
             if lv.width() <= 1 {
@@ -328,5 +330,38 @@ mod tests {
         assert!(diags[0].message.contains("0xDEAD"));
         assert!(diags[0].message.contains("16-bit"));
         assert!(!diags[0].help.is_empty());
+    }
+
+    #[test]
+    fn named_constant_no_warning() {
+        // `assign y = W;` and `y = W + 5`: the parameter is the named constant
+        // this rule asks for, while the bare `5` next to it still fires.
+        let named = || Expr::NamedConst {
+            name: Ident::from_raw(1),
+            value: LogicVec::from_u64(42, 32),
+        };
+        let mut module = mk_module();
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(SignalId::from_raw(0)),
+            value: named(),
+            span: Span::DUMMY,
+        });
+        module.assignments.push(Assignment {
+            target: SignalRef::Signal(SignalId::from_raw(0)),
+            value: Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(named()),
+                rhs: Box::new(Expr::Literal(LogicVec::from_u64(5, 3))),
+                ty: TypeId::from_raw(0),
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        });
+        let design = mk_design(module);
+        let sink = DiagnosticSink::new();
+        MagicNumber.check_module(design.modules.get(design.top), &design, &sink);
+        let diags = sink.take_all();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("0x5"));
     }
 }

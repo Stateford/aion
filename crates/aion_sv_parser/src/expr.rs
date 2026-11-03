@@ -260,6 +260,12 @@ impl SvParser<'_> {
                 self.advance();
                 Expr::RealLiteral { span }
             }
+            // Time literal (`10ns`, `1step`)
+            SvToken::TimeLiteral => {
+                let span = self.current_span();
+                self.advance();
+                Expr::TimeLiteral { span }
+            }
             // String literal
             SvToken::StringLiteral => {
                 let span = self.current_span();
@@ -1440,6 +1446,7 @@ mod precedence_matrix {
                 interner,
             ),
             Expr::Paren { inner, .. } => list("paren", &[inner], src, interner),
+            Expr::TimeLiteral { span } => text(*span),
             Expr::Member { base, member, .. } => {
                 format!(
                     "(. {} {})",
@@ -1637,6 +1644,17 @@ mod precedence_matrix {
             ("a[1] ** 2", "(** (idx a 1) 2)"),
             ("m[i][j]", "(idx (idx m i) j)"),
             ("m[i][j +: 2]", "(+: (idx m i) j 2)"),
+        ]);
+    }
+
+    /// SV time literals (#35) are primary operands and compose with the
+    /// LRM operator table (#31) like any other literal.
+    #[test]
+    fn time_literals_as_operands() {
+        check_table(&[
+            ("t + 10ns", "(+ t 10ns)"),
+            ("2.5ps * n", "(* 2.5ps n)"),
+            ("d[i] > 1step", "(> (idx d i) 1step)"),
         ]);
     }
 

@@ -194,6 +194,9 @@ pub struct NetDecl {
     pub signed: bool,
     /// Optional bit range.
     pub range: Option<Range>,
+    /// Optional net delay (`wire #1 w;`), applied to every driver of the
+    /// declared nets. Parsed for fidelity; synthesis ignores it.
+    pub delay: Option<Delay>,
     /// Declared net names, each with optional array dimensions.
     pub names: Vec<DeclName>,
     /// Source span.
@@ -271,6 +274,9 @@ pub struct DefparamDecl {
 /// A continuous assignment (e.g., `assign y = a & b;`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinuousAssign {
+    /// Optional assignment delay (`assign #2 y = a;`). Parsed for fidelity;
+    /// synthesis ignores it.
+    pub delay: Option<Delay>,
     /// The target net.
     pub target: Expr,
     /// The value expression.
@@ -349,6 +355,9 @@ pub struct GateInst {
     pub gate_type: Ident,
     /// The instance name (optional for gates, but we store it).
     pub name: Option<Ident>,
+    /// Optional gate delay (`and #1 g1(y, a, b);`). In a multi-instance
+    /// statement (`and #1 g1(...), g2(...);`) every instance carries a copy.
+    pub delay: Option<Delay>,
     /// Port connections (positional).
     pub ports: Vec<Expr>,
     /// Source span.
@@ -439,19 +448,27 @@ pub struct TaskDecl {
 /// A statement in a procedural block (always, initial, function, task).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Statement {
-    /// A blocking assignment (e.g., `a = b;`).
+    /// A blocking assignment (e.g., `a = b;`, `a = #5 b;`).
     Blocking {
         /// Target expression.
         target: Expr,
+        /// Optional intra-assignment timing control between `=` and the
+        /// value (`a = #5 b;`, `a = @(posedge clk) b;`): the value is
+        /// sampled first, then the assignment waits for the control.
+        timing: Option<TimingControl>,
         /// Value expression.
         value: Expr,
         /// Source span.
         span: Span,
     },
-    /// A non-blocking assignment (e.g., `q <= d;`).
+    /// A non-blocking assignment (e.g., `q <= d;`, `q <= #1 d;`).
     NonBlocking {
         /// Target expression.
         target: Expr,
+        /// Optional intra-assignment timing control between `<=` and the
+        /// value (`q <= #1 d;`): the value is sampled now and the update is
+        /// scheduled after the control. This is not the same as `#1 q <= d;`.
+        timing: Option<TimingControl>,
         /// Value expression.
         value: Expr,
         /// Source span.
@@ -611,6 +628,47 @@ pub struct CaseArm {
     pub body: Statement,
     /// Source span.
     pub span: Span,
+}
+
+// ============================================================================
+// Delays and timing controls
+// ============================================================================
+
+/// A `#` delay attached to a declaration, continuous assignment, gate, or
+/// intra-assignment timing control.
+///
+/// `#5` and `#(5)` have one value. Nets, continuous assignments, and gates may
+/// give up to three values, `#(rise, fall, turn_off)`, stored in that order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Delay {
+    /// The delay values in source order (one to three entries).
+    pub values: Vec<Expr>,
+    /// Source span, from `#` to the end of the last value.
+    pub span: Span,
+}
+
+/// An intra-assignment timing control (`a = #5 b;`, `q <= @(posedge clk) d;`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TimingControl {
+    /// A delay control `#value` or `#(value)`.
+    Delay(Delay),
+    /// An event control `@(...)`, `@*`, or `@(*)`.
+    Event {
+        /// The events waited for.
+        sensitivity: SensitivityList,
+        /// Source span, from `@` to the end of the event expression.
+        span: Span,
+    },
+}
+
+impl TimingControl {
+    /// Returns the source span of the whole timing control.
+    pub fn span(&self) -> Span {
+        match self {
+            TimingControl::Delay(d) => d.span,
+            TimingControl::Event { span, .. } => *span,
+        }
+    }
 }
 
 // ============================================================================
@@ -1043,5 +1101,57 @@ mod tests {
         let json = serde_json::to_string(&range).unwrap();
         let back: Range = serde_json::from_str(&json).unwrap();
         assert_eq!(back.span, dummy_span());
+    }
+
+    #[test]
+    fn serde_roundtrip_timing_controls() {
+        let delay = Delay {
+            values: vec![
+                Expr::Literal { span: dummy_span() },
+                Expr::Literal { span: dummy_span() },
+            ],
+            span: dummy_span(),
+        };
+        let stmt = Statement::NonBlocking {
+            target: Expr::Literal { span: dummy_span() },
+            timing: Some(TimingControl::Delay(delay.clone())),
+            value: Expr::Literal { span: dummy_span() },
+            span: dummy_span(),
+        };
+        let json = serde_json::to_string(&stmt).unwrap();
+        let back: Statement = serde_json::from_str(&json).unwrap();
+        match back {
+            Statement::NonBlocking {
+                timing: Some(TimingControl::Delay(d)),
+                ..
+            } => assert_eq!(d.values.len(), 2),
+            other => panic!("{other:?}"),
+        }
+
+        let event = TimingControl::Event {
+            sensitivity: SensitivityList::Star,
+            span: dummy_span(),
+        };
+        assert_eq!(event.span(), dummy_span());
+        let json = serde_json::to_string(&event).unwrap();
+        let back: TimingControl = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            TimingControl::Event {
+                sensitivity: SensitivityList::Star,
+                ..
+            }
+        ));
+
+        let gate = GateInst {
+            gate_type: Ident::from_raw(0),
+            name: None,
+            delay: Some(delay),
+            ports: Vec::new(),
+            span: dummy_span(),
+        };
+        let json = serde_json::to_string(&gate).unwrap();
+        let back: GateInst = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.delay.unwrap().values.len(), 2);
     }
 }
