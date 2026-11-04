@@ -519,6 +519,61 @@ mod tests {
         assert!(!top.cells.is_empty(), "Should have synthesized cells");
     }
 
+    /// Synthesizes a module holding one `time` object of `kind` and returns
+    /// the number of errors reported.
+    fn synthesize_time_object(kind: SignalKind) -> usize {
+        let interner = Interner::new();
+        let mut types = TypeDb::new();
+        let time_ty = types.intern(Type::Time);
+        let mut signals = Arena::new();
+        signals.alloc(Signal {
+            id: SignalId::from_raw(0),
+            name: interner.get_or_intern("t"),
+            ty: time_ty,
+            kind,
+            init: Some(aion_ir::ConstValue::Int(20_000_000)),
+            clock_domain: None,
+            span: Span::DUMMY,
+        });
+        let mut modules = Arena::new();
+        modules.alloc(Module {
+            id: ModuleId::from_raw(0),
+            name: interner.get_or_intern("top"),
+            span: Span::DUMMY,
+            params: vec![],
+            ports: vec![],
+            signals,
+            cells: Arena::new(),
+            processes: Arena::new(),
+            assignments: vec![],
+            clock_domains: vec![],
+            content_hash: ContentHash::from_bytes(b"time"),
+        });
+        let design = Design {
+            modules,
+            top: ModuleId::from_raw(0),
+            types,
+            source_map: SourceMap::new(),
+        };
+        let sink = DiagnosticSink::new();
+        synthesize(&design, &interner, &TestArch, &OptLevel::Balanced, &sink);
+        sink.diagnostics()
+            .iter()
+            .filter(|d| d.severity == aion_diagnostics::Severity::Error)
+            .count()
+    }
+
+    #[test]
+    fn time_signals_and_variables_are_rejected() {
+        assert_eq!(synthesize_time_object(SignalKind::Wire), 1);
+        assert_eq!(synthesize_time_object(SignalKind::Variable), 1);
+    }
+
+    #[test]
+    fn time_constants_are_not_rejected() {
+        assert_eq!(synthesize_time_object(SignalKind::Const), 0);
+    }
+
     #[test]
     fn synthesize_empty_module() {
         let interner = Interner::new();

@@ -51,15 +51,6 @@ impl SignalEnv {
         self.signals.get(name)
     }
 
-    /// Iterates over every signal binding in scope as `(name, signal)` pairs,
-    /// in no particular order. Constants added with [`insert_const`] are not
-    /// included.
-    ///
-    /// [`insert_const`]: SignalEnv::insert_const
-    pub fn signals(&self) -> impl Iterator<Item = (Ident, SignalId)> + '_ {
-        self.signals.iter().map(|(&name, &sid)| (name, sid))
-    }
-
     /// Binds `name` to signal `sid`, returning the previous binding if any.
     ///
     /// A signal binding takes precedence over a constant of the same name.
@@ -75,6 +66,14 @@ impl SignalEnv {
     pub fn insert_const(&mut self, name: Ident, value: ConstValue, width: u32) {
         self.consts.insert(name, value);
         self.const_widths.insert(name, width.max(1));
+    }
+
+    /// Removes the constant `name` from this scope, if present, so a
+    /// declaration of the same name in an inner scope hides it from the
+    /// constant evaluator.
+    pub fn remove_const(&mut self, name: Ident) {
+        self.consts.remove(&name);
+        self.const_widths.remove(&name);
     }
 
     /// Returns every constant in scope, for use with the constant evaluator
@@ -1294,11 +1293,8 @@ fn lower_vhdl_time_literal(
     {
         const_eval::VhdlTimeLiteral::Fs(fs) => fs,
         const_eval::VhdlTimeLiteral::Unrepresentable => {
-            sink.emit(errors::error_param_not_const(
-                &format!(
-                    "time literal `{}` cannot be represented as a 64-bit count of femtoseconds",
-                    source_db.snippet(expr.span())
-                ),
+            sink.emit(errors::error_time_literal_unrepresentable(
+                source_db.snippet(expr.span()),
                 expr.span(),
             ));
             0
@@ -2697,6 +2693,20 @@ mod tests {
             Some(SignalId::from_raw(1))
         );
         assert_eq!(env.get(&a), Some(&SignalId::from_raw(2)));
+    }
+
+    #[test]
+    fn signal_env_remove_const_hides_a_constant() {
+        let interner = Interner::new();
+        let w = interner.get_or_intern("W");
+        let mut env = SignalEnv::new();
+        env.insert_const(w, ConstValue::Int(8), 32);
+        env.remove_const(w);
+        assert!(env.consts().is_empty());
+        assert!(env.const_literal(w).is_none());
+        // Removing a name that is not a constant is a no-op.
+        env.remove_const(interner.get_or_intern("missing"));
+        assert!(env.consts().is_empty());
     }
 
     #[test]

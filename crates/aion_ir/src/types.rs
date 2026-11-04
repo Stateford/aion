@@ -51,12 +51,15 @@ pub enum Type {
         /// Named fields with their types.
         fields: Vec<(Ident, TypeId)>,
     },
+    /// A placeholder for types that failed resolution.
+    Error,
     /// The VHDL predefined physical type `time` (and its subtype
     /// `delay_length`), held as a signed 64-bit count of femtoseconds, the
     /// finest time step Aion represents. `20 ns` is the value `20_000_000`.
+    ///
+    /// Declared after [`Type::Error`] so existing variants keep their
+    /// serialized indices.
     Time,
-    /// A placeholder for types that failed resolution.
-    Error,
 }
 
 /// Central type database — interned types for cheap comparison.
@@ -199,6 +202,21 @@ mod tests {
         assert_eq!(db.bit_width(time), Some(64));
         assert_ne!(time, vec64, "time must not alias a 64-bit vector");
         assert_eq!(db.intern(Type::Time), time);
+    }
+
+    #[test]
+    fn existing_variant_indices_are_unchanged_by_time() {
+        // `Error` is variant 9 (its index before `Time` existed); `Time`
+        // was appended after it.
+        let config = bincode::config::standard();
+        assert_eq!(
+            bincode::serde::encode_to_vec(Type::Error, config).unwrap(),
+            vec![9]
+        );
+        assert_eq!(
+            bincode::serde::encode_to_vec(Type::Time, config).unwrap(),
+            vec![10]
+        );
     }
 
     #[test]

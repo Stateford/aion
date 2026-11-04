@@ -188,6 +188,30 @@ fn apply_binop_i64(op: &str, lhs: i64, rhs: i64) -> Option<i64> {
     }
 }
 
+/// Applies a binary arithmetic operation like [`apply_binop_i64`], but
+/// returns `None` when the result overflows an `i64` instead of wrapping.
+///
+/// Used for VHDL, where an out-of-range result is an error (IEEE 1076-2008
+/// §9.2) and where `time` values are large femtosecond counts, so `1 hr * 3`
+/// overflowing must not silently become a negative time.
+fn checked_binop_i64(op: &str, lhs: i64, rhs: i64) -> Option<i64> {
+    match op {
+        "+" => lhs.checked_add(rhs),
+        "-" => lhs.checked_sub(rhs),
+        "*" => lhs.checked_mul(rhs),
+        "/" => lhs.checked_div(rhs),
+        "%" => lhs.checked_rem(rhs),
+        "**" => {
+            if rhs < 0 {
+                Some(0)
+            } else {
+                lhs.checked_pow(u32::try_from(rhs).ok()?)
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Maps a Verilog `BinaryOp` to the operator string used by [`apply_binop_i64`].
 fn verilog_binop_str(op: &v_ast::BinaryOp) -> Option<&'static str> {
     match op {
@@ -214,7 +238,7 @@ fn sv_binop_str(op: &sv_ast::BinaryOp) -> Option<&'static str> {
     }
 }
 
-/// Maps a VHDL `BinaryOp` to the operator string used by [`apply_binop_i64`].
+/// Maps a VHDL `BinaryOp` to the operator string used by [`checked_binop_i64`].
 fn vhdl_binop_str(op: &vhdl_ast::BinaryOp) -> Option<&'static str> {
     match op {
         vhdl_ast::BinaryOp::Add => Some("+"),
@@ -462,11 +486,8 @@ pub fn eval_vhdl_expr(
     match eval_vhdl_time_literal(expr, source_db, interner, env) {
         Some(VhdlTimeLiteral::Fs(fs)) => return Some(ConstValue::Int(fs)),
         Some(VhdlTimeLiteral::Unrepresentable) => {
-            sink.emit(errors::error_param_not_const(
-                &format!(
-                    "time literal `{}` cannot be represented as a 64-bit count of femtoseconds",
-                    source_db.snippet(expr.span())
-                ),
+            sink.emit(errors::error_time_literal_unrepresentable(
+                source_db.snippet(expr.span()),
                 expr.span(),
             ));
             return None;
@@ -509,7 +530,7 @@ pub fn eval_vhdl_expr(
             let l = const_to_i64(&lhs)?;
             let r = const_to_i64(&rhs)?;
             let op_str = vhdl_binop_str(op);
-            match op_str.and_then(|s| apply_binop_i64(s, l, r)) {
+            match op_str.and_then(|s| checked_binop_i64(s, l, r)) {
                 Some(result) => Some(ConstValue::Int(result)),
                 None => {
                     sink.emit(errors::error_param_not_const(
@@ -527,7 +548,16 @@ pub fn eval_vhdl_expr(
         } => {
             let val = eval_vhdl_expr(operand, source_db, interner, env, sink)?;
             let n = const_to_i64(&val)?;
-            Some(ConstValue::Int(-n))
+            match n.checked_neg() {
+                Some(neg) => Some(ConstValue::Int(neg)),
+                None => {
+                    sink.emit(errors::error_param_not_const(
+                        "arithmetic overflow",
+                        expr.span(),
+                    ));
+                    None
+                }
+            }
         }
         vhdl_ast::Expr::Unary {
             op: vhdl_ast::UnaryOp::Pos,
@@ -625,36 +655,11 @@ pub fn parse_time_literal(text: &str) -> Option<TimeLiteralValue> {
         "fs" => 1,
         _ => return None,
     };
-    let (int_part, frac_part) = match number.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (number, ""),
-    };
-    if int_part.is_empty()
-        || !int_part.bytes().all(|b| b.is_ascii_digit())
-        || !frac_part.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    // Digits beyond 10^-15 s are below 1 fs for every unit: keep enough to
-    // round correctly and note whether anything non-zero was cut off.
-    let kept = frac_part.len().min(18);
-    let cut_nonzero = frac_part[kept..].bytes().any(|b| b != b'0');
-    let int_val: u128 = int_part.parse().ok()?;
-    let frac_val: u128 = if kept == 0 {
-        0
-    } else {
-        frac_part[..kept].parse().ok()?
-    };
-    let scale = 10u128.pow(kept as u32);
-    let whole = int_val.checked_mul(fs_per_unit)?;
-    let frac_scaled = frac_val * fs_per_unit;
-    let frac_fs = frac_scaled / scale;
-    let rem = frac_scaled % scale;
-    let round_up = u128::from(rem * 2 >= scale && rem != 0);
-    let fs = u64::try_from(whole.checked_add(frac_fs + round_up)?).ok()?;
+    let (int_part, frac_part) = number.split_once('.').unwrap_or((number, ""));
+    let (fs, exact) = scale_decimal(int_part, frac_part, fs_per_unit)?;
     Some(TimeLiteralValue::Fs {
-        fs,
-        exact: rem == 0 && !cut_nonzero,
+        fs: u64::try_from(fs).ok()?,
+        exact,
     })
 }
 
@@ -666,18 +671,20 @@ pub fn parse_time_literal(text: &str) -> Option<TimeLiteralValue> {
 /// resolution limit Aion uses, so every unit is a whole number of
 /// femtoseconds and the largest (`hr`, 3.6e18 fs) still fits in an `i64`.
 pub fn vhdl_time_unit_fs(unit: &str) -> Option<i64> {
-    let fs = match unit.to_ascii_lowercase().as_str() {
-        "fs" => 1,
-        "ps" => 1_000,
-        "ns" => 1_000_000,
-        "us" => 1_000_000_000,
-        "ms" => 1_000_000_000_000,
-        "sec" => 1_000_000_000_000_000,
-        "min" => 60_000_000_000_000_000,
-        "hr" => 3_600_000_000_000_000_000,
-        _ => return None,
-    };
-    Some(fs)
+    const UNITS: [(&str, i64); 8] = [
+        ("fs", 1),
+        ("ps", 1_000),
+        ("ns", 1_000_000),
+        ("us", 1_000_000_000),
+        ("ms", 1_000_000_000_000),
+        ("sec", 1_000_000_000_000_000),
+        ("min", 60_000_000_000_000_000),
+        ("hr", 3_600_000_000_000_000_000),
+    ];
+    UNITS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(unit))
+        .map(|&(_, fs)| fs)
 }
 
 /// A VHDL physical literal of type `time`, recognized in an expression tree.
@@ -743,52 +750,92 @@ pub fn eval_vhdl_time_literal(
     }
 }
 
-/// Multiplies a VHDL decimal abstract literal (`20`, `1.5`, `2.5e-3`,
-/// `1_000`) by a positive integer `factor`, rounding the exact product
-/// half-up to an integer.
+/// Multiplies the non-negative decimal number `int_part.frac_part` (digits
+/// only, `frac_part` possibly empty) by `factor`, rounding half-up to an
+/// integer. Returns the result and whether it is exact.
 ///
-/// The arithmetic is exact (no floating point), so `0.1` times `10` is
-/// exactly `1`. Returns `None` for malformed text, a based literal
-/// (`16#FF#`), or a result that does not fit in an `i64`.
-fn abstract_literal_times(text: &str, factor: i64) -> Option<i64> {
-    let clean = text.replace('_', "").to_ascii_lowercase();
-    let (mantissa, exponent) = match clean.split_once('e') {
-        Some((m, e)) => (m, e.strip_prefix('+').unwrap_or(e).parse::<i32>().ok()?),
-        None => (clean.as_str(), 0),
-    };
-    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+/// The arithmetic is exact integer arithmetic, so `0.1` times `10` is exactly
+/// `1`. Fractional digits beyond what can be scaled within a `u128` are
+/// dropped (each is worth less than `factor / 10^19`); dropping a non-zero
+/// digit makes the result inexact. Returns `None` for malformed digits or a
+/// result that does not fit in a `u128`. Shared by the SystemVerilog time
+/// literal parser and VHDL physical literals.
+fn scale_decimal(int_part: &str, frac_part: &str, factor: u128) -> Option<(u128, bool)> {
     if int_part.is_empty()
         || !int_part.bytes().all(|b| b.is_ascii_digit())
         || !frac_part.bytes().all(|b| b.is_ascii_digit())
     {
         return None;
     }
-    // The literal is `digits * 10^scale`.
-    let digits_text = format!("{int_part}{frac_part}");
-    let digits_text = digits_text.trim_start_matches('0');
-    let scale = exponent.checked_sub(i32::try_from(frac_part.len()).ok()?)?;
-    if digits_text.is_empty() {
-        return Some(0);
-    }
-    // More than 38 significant digits cannot fit in a u128.
-    if digits_text.len() > 38 {
+    // The most fractional digits whose scaled value cannot overflow.
+    let max_kept = (0..=38u32)
+        .rev()
+        .find(|&k| 10u128.pow(k).checked_mul(factor).is_some())
+        .unwrap_or(0) as usize;
+    let kept = frac_part.len().min(max_kept);
+    let cut_nonzero = frac_part[kept..].bytes().any(|b| b != b'0');
+    let int_val: u128 = int_part.parse().ok()?;
+    let frac_val: u128 = if kept == 0 {
+        0
+    } else {
+        frac_part[..kept].parse().ok()?
+    };
+    let scale = 10u128.pow(kept as u32);
+    let whole = int_val.checked_mul(factor)?;
+    let frac_scaled = frac_val * factor;
+    let rem = frac_scaled % scale;
+    let round_up = u128::from(rem != 0 && rem >= scale - rem);
+    let value = whole.checked_add(frac_scaled / scale + round_up)?;
+    Some((value, rem == 0 && !cut_nonzero))
+}
+
+/// Multiplies a VHDL decimal abstract literal (`20`, `1.5`, `2.5e-3`,
+/// `1_000`) by a positive integer `factor`, rounding the exact product
+/// half-up to an integer.
+///
+/// The exponent is applied by moving the decimal point, then
+/// [`scale_decimal`] does the exact scaling. Returns `None` for malformed
+/// text, a based literal (`16#FF#`), or a result that does not fit in an
+/// `i64`.
+fn abstract_literal_times(text: &str, factor: i64) -> Option<i64> {
+    let clean = text.replace('_', "").to_ascii_lowercase();
+    let (mantissa, exponent) = match clean.split_once('e') {
+        Some((m, e)) => (m, e.strip_prefix('+').unwrap_or(e).parse::<i64>().ok()?),
+        None => (clean.as_str(), 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{int_part}{frac_part}");
+    if int_part.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let digits: u128 = digits_text.parse().ok()?;
-    let product = digits.checked_mul(u128::try_from(factor).ok()?)?;
-    let value = if scale >= 0 {
-        product.checked_mul(10u128.checked_pow(scale.unsigned_abs())?)?
+    let factor = u128::try_from(factor).ok()?;
+    if digits.bytes().all(|b| b == b'0') {
+        return Some(0);
+    }
+    // Bound the shift: a non-zero value times 10^61 overflows, and one below
+    // 10^-60 times any `i64` factor rounds to zero.
+    let point = i64::try_from(int_part.len()).ok()? + exponent;
+    if exponent > 60 {
+        return None;
+    }
+    if point < -60 {
+        return Some(0);
+    }
+    let (int_digits, frac_digits) = if point <= 0 {
+        (
+            "0".to_string(),
+            format!("{}{digits}", "0".repeat(point.unsigned_abs() as usize)),
+        )
+    } else if point as usize >= digits.len() {
+        (
+            format!("{digits}{}", "0".repeat(point as usize - digits.len())),
+            String::new(),
+        )
     } else {
-        match 10u128.checked_pow(scale.unsigned_abs()) {
-            Some(divisor) => {
-                let rem = product % divisor;
-                product / divisor + u128::from(rem >= divisor - rem)
-            }
-            // 10^39 or more: twice any u128 product is still smaller, so
-            // the value is below one half and rounds to zero.
-            None => 0,
-        }
+        let (i, f) = digits.split_at(point as usize);
+        (i.to_string(), f.to_string())
     };
+    let (value, _) = scale_decimal(&int_digits, &frac_digits, factor)?;
     i64::try_from(value).ok()
 }
 

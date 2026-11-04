@@ -355,6 +355,17 @@ fn elaborate_vhdl_decl(
             span,
         });
         sig_env.insert(name, sid);
+        // An integer constant (including a `time` constant, a femtosecond
+        // count) becomes usable by later constant expressions, as in
+        // `constant HALF : time := PERIOD / 2;`. Any other object hides an
+        // outer constant of the same name.
+        match (kind, &init) {
+            (SignalKind::Const, Some(ConstValue::Int(v))) => {
+                let const_width = ctx.design.types.bit_width(ty).unwrap_or(32);
+                sig_env.insert_const(name, ConstValue::Int(*v), const_width);
+            }
+            _ => sig_env.remove_const(name),
+        }
     }
 }
 
@@ -500,13 +511,18 @@ fn eval_vhdl_default(
         }
         _ => {
             // Integer constant expressions (literals, generics, previously
-            // declared integer and `time` constants, arithmetic). Evaluate
+            // declared integer and `time` constants, which
+            // `elaborate_vhdl_decl` enters into `sig_env`, arithmetic). Evaluate
             // against a scratch sink: failure is reported by the caller as
             // W204, not as a constant-expression error.
             let scratch = aion_diagnostics::DiagnosticSink::new();
-            let env = with_declared_int_constants(const_env, signals, sig_env);
-            let value =
-                const_eval::eval_vhdl_expr(expr, ctx.source_db, ctx.interner, &env, &scratch)?;
+            let value = const_eval::eval_vhdl_expr(
+                expr,
+                ctx.source_db,
+                ctx.interner,
+                sig_env.consts(),
+                &scratch,
+            )?;
             match (value, width) {
                 (ConstValue::Int(v), Some(w)) => {
                     Some(ConstValue::Logic(LogicVec::from_u64(v as u64, w)))
@@ -515,29 +531,6 @@ fn eval_vhdl_default(
             }
         }
     }
-}
-
-/// Extends `const_env` (the generics) with every constant object declared so
-/// far whose value is an integer, which includes `time` constants (held as
-/// femtosecond counts). This lets a later default refer to them, as in
-/// `constant HALF : time := PERIOD / 2;`.
-///
-/// A declared constant hides a generic of the same name, as an inner
-/// declaration does in VHDL. Constants with a bit-pattern value are left
-/// out: the integer evaluator has no meaning for them.
-fn with_declared_int_constants(
-    const_env: &ConstEnv,
-    signals: &Arena<SignalId, Signal>,
-    sig_env: &SignalEnv,
-) -> ConstEnv {
-    let mut env = const_env.clone();
-    for (name, sid) in sig_env.signals() {
-        let signal = signals.get(sid);
-        if let (SignalKind::Const, Some(ConstValue::Int(v))) = (signal.kind, &signal.init) {
-            env.insert(name, ConstValue::Int(*v));
-        }
-    }
-    env
 }
 
 /// Maps a VHDL `std_logic` character literal to a 4-state [`Logic`] value.

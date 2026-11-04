@@ -279,6 +279,17 @@ pub fn error_param_not_const(msg: &str, span: Span) -> Diagnostic {
     Diagnostic::error(E209, format!("cannot evaluate parameter: {msg}"), span)
 }
 
+/// Creates an E209 error for a VHDL time literal (`text`, e.g. `3000 hr`) that
+/// does not fit in the 64-bit femtosecond count Aion stores `time` values in,
+/// or whose abstract literal is in a form Aion does not evaluate (a based
+/// literal such as `16#A# ns`).
+pub fn error_time_literal_unrepresentable(text: &str, span: Span) -> Diagnostic {
+    error_param_not_const(
+        &format!("time literal `{text}` cannot be represented as a 64-bit count of femtoseconds"),
+        span,
+    )
+}
+
 /// Creates a diagnostic when an instance overrides parameter `name`, which is
 /// local and cannot be overridden. `span` is the parameter's declaration; the
 /// declared value is kept.
@@ -549,6 +560,16 @@ mod tests {
         assert_eq!(format!("{W207}"), "W207");
         assert!(d.message.contains("`1step`"));
         assert!(!d.notes.is_empty());
+    }
+
+    #[test]
+    fn time_literal_unrepresentable_is_e209() {
+        let d = error_time_literal_unrepresentable("3000 hr", Span::DUMMY);
+        assert_eq!(d.code, E209);
+        assert!(d.message.contains("`3000 hr`"), "{}", d.message);
+        assert!(d.message.contains("femtoseconds"));
+        let d = error_time_literal_unrepresentable("", Span::DUMMY);
+        assert!(d.message.contains("``"), "empty text is still quoted");
     }
 
     #[test]

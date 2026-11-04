@@ -431,6 +431,32 @@ mod tests {
     }
 
     #[test]
+    fn vhdl_time_arithmetic_overflow_is_w204_not_a_wrapped_value() {
+        let (objects, diags) = vhdl_time_objects(
+            "constant H : time := 1 hr;\nconstant T : time := H * 3;",
+            "",
+        );
+        assert_eq!(codes_of(&diags, errors::W204), vec!["H * 3".to_string()]);
+        let t = objects.iter().find(|(n, _, _)| n == "t").unwrap();
+        assert_eq!(t.2, None);
+    }
+
+    #[test]
+    fn vhdl_process_variable_hides_architecture_constant() {
+        // Inside `p`, `n` is the variable, so `m`'s default is not constant.
+        let (objects, diags) = vhdl_time_objects(
+            "constant N : integer := 8;",
+            "p : process\n\
+               variable n : integer;\n\
+               constant M : integer := n + 1;\n\
+             begin wait; end process;",
+        );
+        assert_eq!(codes_of(&diags, errors::W204), vec!["n + 1".to_string()]);
+        let m = objects.iter().find(|(n, _, _)| n == "p.m").unwrap();
+        assert_eq!(m.2, None);
+    }
+
+    #[test]
     fn vhdl_unrepresentable_time_default_is_w204() {
         let (objects, diags) = vhdl_time_objects("constant T : time := 3000 hr;", "");
         assert_eq!(codes_of(&diags, errors::W204), vec!["3000 hr".to_string()]);

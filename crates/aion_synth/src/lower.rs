@@ -22,6 +22,8 @@ use aion_ir::{
 ///
 /// After this pass, the netlist contains only cells (no behavioral code).
 pub(crate) fn lower_module(module: &Module, netlist: &mut Netlist, sink: &DiagnosticSink) {
+    reject_time_objects(module, netlist, sink);
+
     // Lower concurrent assignments first
     let assignments = std::mem::take(&mut netlist.assignments);
     for assign in &assignments {
@@ -32,6 +34,22 @@ pub(crate) fn lower_module(module: &Module, netlist: &mut Netlist, sink: &Diagno
     // Lower each process
     for (_id, process) in module.processes.iter() {
         lower_process(process, netlist, sink);
+    }
+}
+
+/// Reports every signal or variable of the VHDL physical type `time`: it is
+/// a simulation-only type with no hardware meaning, so it is rejected rather
+/// than synthesized as a 64-bit vector. `time` constants are allowed, since a
+/// constant drives no logic unless it is used, and its uses are reported.
+fn reject_time_objects(module: &Module, netlist: &Netlist, sink: &DiagnosticSink) {
+    for (_, signal) in module.signals.iter() {
+        if signal.kind != SignalKind::Const && *netlist.types.get(signal.ty) == Type::Time {
+            sink.emit(aion_diagnostics::Diagnostic::error(
+                DiagnosticCode::new(Category::Vendor, 3),
+                "objects of type `time` are simulation-only and cannot be synthesized",
+                signal.span,
+            ));
+        }
     }
 }
 
