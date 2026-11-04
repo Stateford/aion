@@ -2017,6 +2017,75 @@ mod tests {
         );
     }
 
+    /// Returns the init value of the signal or constant `name` in `m`.
+    fn init_of(m: &aion_ir::Module, interner: &Interner, name: &str) -> Option<ConstValue> {
+        let (_, sig) = m
+            .signals
+            .iter()
+            .find(|(_, s)| interner.resolve(s.name) == name)
+            .unwrap_or_else(|| panic!("no signal `{name}`"));
+        sig.init.clone()
+    }
+
+    #[test]
+    fn vhdl_declared_constant_named_false_hides_literal_in_default() {
+        let src = "entity m is end entity;
+            architecture rtl of m is
+              constant false : boolean := true;
+              signal q : boolean := false;
+            begin end architecture;";
+        let (design, interner, diags) = elaborate_src("m.vhd", src, "m");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let top = design.top_module();
+        let declared = init_of(top, &interner, "false");
+        assert!(declared.is_some());
+        // `q` takes the declared constant's value (true), not the literal.
+        assert_eq!(init_of(top, &interner, "q"), declared);
+    }
+
+    #[test]
+    fn vhdl_generic_map_uses_architecture_constants() {
+        let src = "entity child is generic (EN : boolean := false; W : integer := 1);
+              end entity;
+            architecture rtl of child is begin end architecture;
+            entity m is end entity;
+            architecture rtl of m is
+              constant false : boolean := true;
+              constant C : integer := 6;
+            begin
+              u : entity work.child generic map (EN => false, W => C);
+            end architecture;";
+        let (design, interner, diags) = elaborate_src("m.vhd", src, "m");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let top = design.top_module();
+        let declared_false = init_of(top, &interner, "false").expect("constant init");
+        let child = module_named(&design, &interner, "child");
+        assert_eq!(
+            params_of(child, &interner),
+            vec![
+                ("en".to_string(), declared_false),
+                (
+                    "w".to_string(),
+                    init_of(top, &interner, "c").expect("constant init")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn vhdl_generic_map_naming_a_signal_reports_e209() {
+        let src = "entity child is generic (EN : boolean := false); end entity;
+            architecture rtl of child is begin end architecture;
+            entity m is end entity;
+            architecture rtl of m is
+              signal true : boolean;
+            begin
+              u : entity work.child generic map (EN => true);
+            end architecture;";
+        let (_, _, diags) = elaborate_src("m.vhd", src, "m");
+        assert_eq!(spans_with(&diags, errors::E209), vec!["true"], "{diags:?}");
+    }
+
     #[test]
     fn vhdl_generic_type_range_attribute_reports_e212() {
         // A generic is the first declaration of an entity, so a range
