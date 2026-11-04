@@ -157,7 +157,9 @@ pub(crate) fn resolve_sv_range(
 ///
 /// Recognizes common IEEE types: `std_logic` maps to [`Type::Bit`],
 /// `std_logic_vector(N downto M)` maps to [`Type::BitVec`],
-/// `integer` maps to [`Type::Integer`], `boolean` maps to [`Type::Bool`].
+/// `integer` maps to [`Type::Integer`], `boolean` maps to [`Type::Bool`],
+/// and the predefined physical type `time` (and its subtype `delay_length`)
+/// maps to [`Type::Time`].
 ///
 /// A vector index constraint may also be a range attribute
 /// (`std_logic_vector(a'range)`); its prefix is looked up in `ranges`, and
@@ -246,6 +248,8 @@ pub fn resolve_vhdl_type(
         "real" => types.intern(Type::Real),
         "boolean" => types.intern(Type::Bool),
         "string" => types.intern(Type::Str),
+        // `delay_length` is the predefined subtype `time range 0 fs to time'high`.
+        "time" | "delay_length" => types.intern(Type::Time),
         _ => {
             // Unknown type — emit diagnostic
             sink.emit(errors::error_unsupported(
@@ -408,6 +412,41 @@ mod tests {
             &sink,
         );
         assert_eq!(*types.get(tid), Type::Integer);
+    }
+
+    /// Resolves a bare (unconstrained) VHDL type mark through `resolve_vhdl_type`.
+    fn resolve_vhdl_mark(mark: &str) -> (Type, usize) {
+        let (sdb, interner, sink, mut types, env) = setup();
+        let ti = aion_vhdl_parser::ast::TypeIndication {
+            type_mark: aion_vhdl_parser::ast::SelectedName {
+                parts: vec![interner.get_or_intern(mark)],
+                span: aion_source::Span::DUMMY,
+            },
+            constraint: None,
+            span: aion_source::Span::DUMMY,
+        };
+        let tid = resolve_vhdl_type(
+            &ti,
+            &RangeEnv::new(),
+            &mut types,
+            &env,
+            &sdb,
+            &interner,
+            &sink,
+        );
+        (types.get(tid).clone(), sink.diagnostics().len())
+    }
+
+    #[test]
+    fn vhdl_time_and_delay_length_are_time() {
+        assert_eq!(resolve_vhdl_mark("time"), (Type::Time, 0));
+        assert_eq!(resolve_vhdl_mark("TIME"), (Type::Time, 0));
+        assert_eq!(resolve_vhdl_mark("delay_length"), (Type::Time, 0));
+    }
+
+    #[test]
+    fn vhdl_unknown_type_still_reported() {
+        assert_eq!(resolve_vhdl_mark("timex"), (Type::Error, 1));
     }
 
     #[test]

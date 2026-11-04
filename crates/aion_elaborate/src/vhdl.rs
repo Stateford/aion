@@ -318,7 +318,13 @@ fn elaborate_vhdl_decl(
         ctx.sink,
     );
     ranges.declare_object(names, ty_ast, const_env, ctx.source_db, ctx.interner);
-    let width = ctx.design.types.bit_width(ty);
+    // A `time` value stays an integer count of femtoseconds, so later
+    // constant expressions (`T / 2`) can compute with it; only vector types
+    // are fitted to a bit pattern.
+    let width = match ctx.design.types.get(ty) {
+        aion_ir::types::Type::Time => None,
+        _ => ctx.design.types.bit_width(ty),
+    };
     let init = default.as_ref().and_then(|expr| {
         let value = eval_vhdl_default(expr, width, const_env, signals, sig_env, ctx);
         if value.is_none() {
@@ -358,7 +364,8 @@ fn elaborate_vhdl_decl(
 /// characters (`"1010"`), bit-string literals (`x"5A"`), `(others => c)`
 /// and positional aggregates, references to previously declared objects
 /// that have a constant init (e.g. another constant), and integer constant
-/// expressions over generics. Logic values are fitted to `width` (the
+/// expressions over generics and previously declared integer constants,
+/// including `time` values such as `20 ns` or `PERIOD / 2` (femtoseconds). Logic values are fitted to `width` (the
 /// declared type's bit width, when known): zero-extended or truncated.
 ///
 /// Returns `None` if the expression is not one of these forms; the caller
@@ -472,7 +479,19 @@ fn eval_vhdl_default(
                 _ => {}
             }
             // A previously declared object with a constant init.
-            let sid = *sig_env.get(&name.primary)?;
+            let Some(&sid) = sig_env.get(&name.primary) else {
+                // Otherwise a bare unit name such as `ns` is a physical
+                // literal meaning one unit.
+                return match const_eval::eval_vhdl_time_literal(
+                    expr,
+                    ctx.source_db,
+                    ctx.interner,
+                    const_env,
+                )? {
+                    const_eval::VhdlTimeLiteral::Fs(fs) => Some(ConstValue::Int(fs)),
+                    const_eval::VhdlTimeLiteral::Unrepresentable => None,
+                };
+            };
             match &signals.get(sid).init {
                 Some(ConstValue::Logic(lv)) => Some(fit(lv.clone())),
                 Some(other) => Some(other.clone()),
@@ -480,12 +499,14 @@ fn eval_vhdl_default(
             }
         }
         _ => {
-            // Integer constant expressions (literals, generics, arithmetic).
-            // Evaluate against a scratch sink: failure is reported by the
-            // caller as W204, not as a constant-expression error.
+            // Integer constant expressions (literals, generics, previously
+            // declared integer and `time` constants, arithmetic). Evaluate
+            // against a scratch sink: failure is reported by the caller as
+            // W204, not as a constant-expression error.
             let scratch = aion_diagnostics::DiagnosticSink::new();
+            let env = with_declared_int_constants(const_env, signals, sig_env);
             let value =
-                const_eval::eval_vhdl_expr(expr, ctx.source_db, ctx.interner, const_env, &scratch)?;
+                const_eval::eval_vhdl_expr(expr, ctx.source_db, ctx.interner, &env, &scratch)?;
             match (value, width) {
                 (ConstValue::Int(v), Some(w)) => {
                     Some(ConstValue::Logic(LogicVec::from_u64(v as u64, w)))
@@ -494,6 +515,29 @@ fn eval_vhdl_default(
             }
         }
     }
+}
+
+/// Extends `const_env` (the generics) with every constant object declared so
+/// far whose value is an integer, which includes `time` constants (held as
+/// femtosecond counts). This lets a later default refer to them, as in
+/// `constant HALF : time := PERIOD / 2;`.
+///
+/// A declared constant hides a generic of the same name, as an inner
+/// declaration does in VHDL. Constants with a bit-pattern value are left
+/// out: the integer evaluator has no meaning for them.
+fn with_declared_int_constants(
+    const_env: &ConstEnv,
+    signals: &Arena<SignalId, Signal>,
+    sig_env: &SignalEnv,
+) -> ConstEnv {
+    let mut env = const_env.clone();
+    for (name, sid) in sig_env.signals() {
+        let signal = signals.get(sid);
+        if let (SignalKind::Const, Some(ConstValue::Int(v))) = (signal.kind, &signal.init) {
+            env.insert(name, ConstValue::Int(*v));
+        }
+    }
+    env
 }
 
 /// Maps a VHDL `std_logic` character literal to a 4-state [`Logic`] value.

@@ -51,6 +51,10 @@ pub enum Type {
         /// Named fields with their types.
         fields: Vec<(Ident, TypeId)>,
     },
+    /// The VHDL predefined physical type `time` (and its subtype
+    /// `delay_length`), held as a signed 64-bit count of femtoseconds, the
+    /// finest time step Aion represents. `20 ns` is the value `20_000_000`.
+    Time,
     /// A placeholder for types that failed resolution.
     Error,
 }
@@ -98,11 +102,13 @@ impl TypeDb {
     /// Returns the bit width of a type, if it has a fixed width.
     ///
     /// Returns `None` for types without a fixed bit width (e.g., `Integer`, `Str`).
+    /// [`Type::Time`] is 64 bits wide: a count of femtoseconds.
     pub fn bit_width(&self, id: TypeId) -> Option<u32> {
         match self.get(id) {
             Type::Bit => Some(1),
             Type::BitVec { width, .. } => Some(*width),
             Type::Bool => Some(1),
+            Type::Time => Some(64),
             Type::Array { element, size } => self.bit_width(*element).map(|w| w * size),
             _ => None,
         }
@@ -180,6 +186,29 @@ mod tests {
             size: 4,
         });
         assert_eq!(db.bit_width(arr), Some(32));
+    }
+
+    #[test]
+    fn time_is_a_distinct_64_bit_type() {
+        let mut db = TypeDb::new();
+        let time = db.intern(Type::Time);
+        let vec64 = db.intern(Type::BitVec {
+            width: 64,
+            signed: true,
+        });
+        assert_eq!(db.bit_width(time), Some(64));
+        assert_ne!(time, vec64, "time must not alias a 64-bit vector");
+        assert_eq!(db.intern(Type::Time), time);
+    }
+
+    #[test]
+    fn time_type_round_trips_through_bincode() {
+        let mut db = TypeDb::new();
+        let time = db.intern(Type::Time);
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&db, config).unwrap();
+        let (back, _): (TypeDb, usize) = bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(*back.get(time), Type::Time);
     }
 
     #[test]

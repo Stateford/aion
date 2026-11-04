@@ -230,7 +230,8 @@ mod tests {
 
     // --- Issue #30: member selects, fill literals, patterns, `++`/`--` ---
 
-    /// Parses and elaborates `src` (top `top`) and returns the top module and
+    /// Parses and elaborates `src` (top `top`; Verilog, SystemVerilog or VHDL
+    /// by the `.v`/`.sv`/`.vhd` extension) and returns the top module and
     /// every diagnostic as `(code, source text of its span)`.
     fn elaborate_top(
         file_name: &str,
@@ -250,6 +251,10 @@ mod tests {
         };
         if file_name.ends_with(".sv") {
             parsed.sv_files.push(aion_sv_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            ));
+        } else if file_name.ends_with(".vhd") {
+            parsed.vhdl_files.push(aion_vhdl_parser::parse_file(
                 file_id, &source_db, &interner, &sink,
             ));
         } else {
@@ -322,6 +327,130 @@ mod tests {
             .filter(|(c, _)| *c == code)
             .map(|(_, s)| s.clone())
             .collect()
+    }
+
+    // --- Issue #70: the predefined VHDL `time` type and physical literals ---
+
+    /// An elaborated object: its name, resolved type and initial value.
+    type TimeObject = (
+        String,
+        Option<aion_ir::types::Type>,
+        Option<aion_ir::ConstValue>,
+    );
+
+    /// Elaborates a VHDL `top` whose architecture declares `decls` and
+    /// returns each object's `(name, type, init)` plus every diagnostic.
+    fn vhdl_time_objects(
+        decls: &str,
+        body: &str,
+    ) -> (
+        Vec<TimeObject>,
+        Vec<(aion_diagnostics::DiagnosticCode, String)>,
+    ) {
+        let src = format!(
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\
+             entity top is end entity;\n\
+             architecture sim of top is\n{decls}\nbegin\n{body}\nend architecture;"
+        );
+        let interner = Interner::new();
+        let mut source_db = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let file_id = source_db.add_source("top.vhd", src);
+        let parsed = ParsedDesign {
+            verilog_files: vec![],
+            sv_files: vec![],
+            vhdl_files: vec![aion_vhdl_parser::parse_file(
+                file_id, &source_db, &interner, &sink,
+            )],
+        };
+        assert!(!sink.has_errors(), "parse errors: {:?}", sink.diagnostics());
+        let design = elaborate(&parsed, &make_config("top"), &source_db, &interner, &sink).unwrap();
+        let objects = design.modules[design.top]
+            .signals
+            .iter()
+            .map(|(_, s)| {
+                (
+                    interner.resolve(s.name).to_string(),
+                    Some(design.types.get(s.ty).clone()),
+                    s.init.clone(),
+                )
+            })
+            .collect();
+        let diags = sink
+            .diagnostics()
+            .into_iter()
+            .map(|d| (d.code, source_db.snippet(d.primary_span).to_string()))
+            .collect();
+        (objects, diags)
+    }
+
+    #[test]
+    fn vhdl_time_constants_elaborate_to_femtoseconds() {
+        use aion_ir::types::Type;
+        use aion_ir::ConstValue::Int;
+        // The declarations of examples/blinky_vhdl/tests/blinky_tb.vhd, plus
+        // constants derived from them and other literal forms.
+        let (objects, diags) = vhdl_time_objects(
+            "signal clk : std_logic := '0';\n\
+             constant CLK_PERIOD : time := 20 ns;\n\
+             constant HALF : time := CLK_PERIOD / 2;\n\
+             constant LONG : time := CLK_PERIOD * 100;\n\
+             constant COPY : time := CLK_PERIOD;\n\
+             constant FINE : TIME := 1.5 ps;\n\
+             constant ONE : delay_length := ns;\n\
+             constant SUM : time := 1 us + 250 ns;\n\
+             signal t : time := 0 fs;",
+            "clk <= not clk after CLK_PERIOD / 2;\n\
+             process begin\n\
+               wait for CLK_PERIOD * 2;\n\
+               t <= 5 ns;\n\
+               wait;\n\
+             end process;",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let get = |name: &str| {
+            objects
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .unwrap_or_else(|| panic!("no object {name} in {objects:?}"))
+                .clone()
+        };
+        let time = |fs| (Some(Type::Time), Some(Int(fs)));
+        let typed = |name: &str| {
+            let (_, ty, init) = get(name);
+            (ty, init)
+        };
+        assert_eq!(typed("clk_period"), time(20_000_000));
+        assert_eq!(typed("half"), time(10_000_000));
+        assert_eq!(typed("long"), time(2_000_000_000));
+        assert_eq!(typed("copy"), time(20_000_000));
+        assert_eq!(typed("fine"), time(1_500));
+        assert_eq!(typed("one"), time(1_000_000));
+        assert_eq!(typed("sum"), time(1_250_000_000));
+        assert_eq!(typed("t"), time(0));
+    }
+
+    #[test]
+    fn vhdl_unrepresentable_time_default_is_w204() {
+        let (objects, diags) = vhdl_time_objects("constant T : time := 3000 hr;", "");
+        assert_eq!(codes_of(&diags, errors::W204), vec!["3000 hr".to_string()]);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        let (_, ty, init) = &objects[0];
+        assert_eq!(ty, &Some(aion_ir::types::Type::Time));
+        assert_eq!(init, &None);
+    }
+
+    #[test]
+    fn vhdl_integer_constant_derived_from_earlier_constant() {
+        // The same mechanism serves integers: a later default may use an
+        // earlier constant, and a declared constant hides nothing else.
+        let (objects, diags) = vhdl_time_objects(
+            "constant N : integer := 8;\nconstant M : integer := N * 2 + 1;",
+            "",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let m = objects.iter().find(|(n, _, _)| n == "m").unwrap();
+        assert_eq!(m.2, Some(aion_ir::ConstValue::Int(17)));
     }
 
     #[test]

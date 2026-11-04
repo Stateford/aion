@@ -446,9 +446,11 @@ pub fn eval_sv_expr(
 /// Evaluates a VHDL expression to a compile-time constant.
 ///
 /// Handles integer literals, simple name lookups in the parameter environment,
-/// binary arithmetic, unary negation, and parenthesized expressions. Emits an
-/// E209 diagnostic and returns `None` for expressions that cannot be evaluated
-/// at compile time.
+/// binary arithmetic, unary negation, and parenthesized expressions. Physical
+/// literals of type `time` (`20 ns`, see [`eval_vhdl_time_literal`]) evaluate
+/// to their value in femtoseconds, so time arithmetic such as `T / 2` works
+/// on plain integers. Emits an E209 diagnostic and returns `None` for
+/// expressions that cannot be evaluated at compile time.
 pub fn eval_vhdl_expr(
     expr: &vhdl_ast::Expr,
     source_db: &SourceDb,
@@ -456,6 +458,21 @@ pub fn eval_vhdl_expr(
     env: &ConstEnv,
     sink: &DiagnosticSink,
 ) -> Option<ConstValue> {
+    // Physical literals of type `time` (`20 ns`, `ns`) are femtosecond counts.
+    match eval_vhdl_time_literal(expr, source_db, interner, env) {
+        Some(VhdlTimeLiteral::Fs(fs)) => return Some(ConstValue::Int(fs)),
+        Some(VhdlTimeLiteral::Unrepresentable) => {
+            sink.emit(errors::error_param_not_const(
+                &format!(
+                    "time literal `{}` cannot be represented as a 64-bit count of femtoseconds",
+                    source_db.snippet(expr.span())
+                ),
+                expr.span(),
+            ));
+            return None;
+        }
+        None => {}
+    }
     match expr {
         vhdl_ast::Expr::IntLiteral { span } => {
             let text = source_db.snippet(*span).replace('_', "");
@@ -639,6 +656,140 @@ pub fn parse_time_literal(text: &str) -> Option<TimeLiteralValue> {
         fs,
         exact: rem == 0 && !cut_nonzero,
     })
+}
+
+/// Returns the number of femtoseconds in one unit of the predefined VHDL
+/// physical type `time` (IEEE 1076-2008 §16.3): `fs`, `ps`, `ns`, `us`, `ms`,
+/// `sec`, `min`, or `hr`, matched case-insensitively.
+///
+/// Returns `None` for any other name. `fs` is the primary unit and the
+/// resolution limit Aion uses, so every unit is a whole number of
+/// femtoseconds and the largest (`hr`, 3.6e18 fs) still fits in an `i64`.
+pub fn vhdl_time_unit_fs(unit: &str) -> Option<i64> {
+    let fs = match unit.to_ascii_lowercase().as_str() {
+        "fs" => 1,
+        "ps" => 1_000,
+        "ns" => 1_000_000,
+        "us" => 1_000_000_000,
+        "ms" => 1_000_000_000_000,
+        "sec" => 1_000_000_000_000_000,
+        "min" => 60_000_000_000_000_000,
+        "hr" => 3_600_000_000_000_000_000,
+        _ => return None,
+    };
+    Some(fs)
+}
+
+/// A VHDL physical literal of type `time`, recognized in an expression tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VhdlTimeLiteral {
+    /// A literal that evaluated to this many femtoseconds.
+    Fs(i64),
+    /// A literal of the physical form whose value cannot be represented:
+    /// it overflows a signed 64-bit femtosecond count, or its abstract
+    /// literal is in a form Aion does not evaluate (a based literal such as
+    /// `16#A# ns`).
+    Unrepresentable,
+}
+
+/// Recognizes a VHDL physical literal of type `time` and evaluates it to
+/// femtoseconds.
+///
+/// The parser represents `20 ns` as `Binary(Mul, 20, Name(ns))`; a bare
+/// unit name such as `ns` is itself a physical literal meaning one unit.
+/// Both forms are recognized, with an integer or real abstract literal
+/// (`1.5 us`, `1e3 ps`, `1_000 fs`). A unit name that is also a constant in
+/// `env` is not treated as a time unit, so a generic shadowing it keeps its
+/// meaning. A real value is rounded half-up to a whole femtosecond, the
+/// resolution limit.
+///
+/// Returns `None` if `expr` is not a physical time literal, so the caller can
+/// evaluate it some other way. No diagnostics are emitted.
+pub fn eval_vhdl_time_literal(
+    expr: &vhdl_ast::Expr,
+    source_db: &SourceDb,
+    interner: &Interner,
+    env: &ConstEnv,
+) -> Option<VhdlTimeLiteral> {
+    let unit_fs = |name: &vhdl_ast::Name| -> Option<i64> {
+        if !name.parts.is_empty() || env.contains_key(&name.primary) {
+            return None;
+        }
+        vhdl_time_unit_fs(interner.resolve(name.primary))
+    };
+    match expr {
+        vhdl_ast::Expr::Name(name) => unit_fs(name).map(VhdlTimeLiteral::Fs),
+        vhdl_ast::Expr::Binary {
+            left,
+            op: vhdl_ast::BinaryOp::Mul,
+            right,
+            ..
+        } => {
+            let vhdl_ast::Expr::Name(unit) = right.as_ref() else {
+                return None;
+            };
+            let (vhdl_ast::Expr::IntLiteral { span } | vhdl_ast::Expr::RealLiteral { span }) =
+                left.as_ref()
+            else {
+                return None;
+            };
+            let per_unit = unit_fs(unit)?;
+            Some(
+                abstract_literal_times(source_db.snippet(*span), per_unit)
+                    .map_or(VhdlTimeLiteral::Unrepresentable, VhdlTimeLiteral::Fs),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Multiplies a VHDL decimal abstract literal (`20`, `1.5`, `2.5e-3`,
+/// `1_000`) by a positive integer `factor`, rounding the exact product
+/// half-up to an integer.
+///
+/// The arithmetic is exact (no floating point), so `0.1` times `10` is
+/// exactly `1`. Returns `None` for malformed text, a based literal
+/// (`16#FF#`), or a result that does not fit in an `i64`.
+fn abstract_literal_times(text: &str, factor: i64) -> Option<i64> {
+    let clean = text.replace('_', "").to_ascii_lowercase();
+    let (mantissa, exponent) = match clean.split_once('e') {
+        Some((m, e)) => (m, e.strip_prefix('+').unwrap_or(e).parse::<i32>().ok()?),
+        None => (clean.as_str(), 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int_part.is_empty()
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    // The literal is `digits * 10^scale`.
+    let digits_text = format!("{int_part}{frac_part}");
+    let digits_text = digits_text.trim_start_matches('0');
+    let scale = exponent.checked_sub(i32::try_from(frac_part.len()).ok()?)?;
+    if digits_text.is_empty() {
+        return Some(0);
+    }
+    // More than 38 significant digits cannot fit in a u128.
+    if digits_text.len() > 38 {
+        return None;
+    }
+    let digits: u128 = digits_text.parse().ok()?;
+    let product = digits.checked_mul(u128::try_from(factor).ok()?)?;
+    let value = if scale >= 0 {
+        product.checked_mul(10u128.checked_pow(scale.unsigned_abs())?)?
+    } else {
+        match 10u128.checked_pow(scale.unsigned_abs()) {
+            Some(divisor) => {
+                let rem = product % divisor;
+                product / divisor + u128::from(rem >= divisor - rem)
+            }
+            // 10^39 or more: twice any u128 product is still smaller, so
+            // the value is below one half and rounds to zero.
+            None => 0,
+        }
+    };
+    i64::try_from(value).ok()
 }
 
 #[cfg(test)]
@@ -1401,6 +1552,169 @@ mod tests {
             );
         }
         assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn vhdl_time_units_are_femtosecond_multiples() {
+        assert_eq!(vhdl_time_unit_fs("fs"), Some(1));
+        assert_eq!(vhdl_time_unit_fs("NS"), Some(1_000_000));
+        assert_eq!(vhdl_time_unit_fs("sec"), Some(1_000_000_000_000_000));
+        assert_eq!(vhdl_time_unit_fs("hr"), Some(3_600_000_000_000_000_000));
+        // `s` is the SystemVerilog spelling, not a VHDL unit.
+        assert_eq!(vhdl_time_unit_fs("s"), None);
+        assert_eq!(vhdl_time_unit_fs("clk"), None);
+    }
+
+    #[test]
+    fn abstract_literal_scaling_is_exact_and_rounds_half_up() {
+        assert_eq!(abstract_literal_times("20", 1_000_000), Some(20_000_000));
+        assert_eq!(abstract_literal_times("1_000", 1), Some(1_000));
+        assert_eq!(abstract_literal_times("1.5", 1_000), Some(1_500));
+        assert_eq!(abstract_literal_times("0.1", 10), Some(1));
+        assert_eq!(abstract_literal_times("2.5E-3", 1_000_000), Some(2_500));
+        assert_eq!(abstract_literal_times("1e+3", 1_000), Some(1_000_000));
+        assert_eq!(abstract_literal_times("0.0", 1_000), Some(0));
+        // Sub-femtosecond values round to the nearest femtosecond.
+        assert_eq!(abstract_literal_times("1.5", 1), Some(2));
+        assert_eq!(abstract_literal_times("1.4", 1), Some(1));
+        assert_eq!(abstract_literal_times("1e-60", 1), Some(0));
+    }
+
+    #[test]
+    fn abstract_literal_scaling_rejects_bad_or_huge_values() {
+        // 3 hours fit in i64 femtoseconds; 3000 hours do not.
+        assert!(abstract_literal_times("2", 3_600_000_000_000_000_000).is_some());
+        assert_eq!(
+            abstract_literal_times("3000", 3_600_000_000_000_000_000),
+            None
+        );
+        assert_eq!(abstract_literal_times("1e40", 1), None);
+        assert_eq!(abstract_literal_times("16#FF#", 1), None);
+        assert_eq!(abstract_literal_times(".5", 1), None);
+        assert_eq!(abstract_literal_times("1e", 1), None);
+    }
+
+    /// Builds `lit unit` as the VHDL parser does: `Binary(Mul, lit, Name(unit))`.
+    fn vhdl_physical(lit: vhdl_ast::Expr, unit: Ident) -> vhdl_ast::Expr {
+        let span = lit.span();
+        vhdl_ast::Expr::Binary {
+            left: Box::new(lit),
+            op: vhdl_ast::BinaryOp::Mul,
+            right: Box::new(vhdl_name(unit)),
+            span,
+        }
+    }
+
+    fn vhdl_name(name: Ident) -> vhdl_ast::Expr {
+        vhdl_ast::Expr::Name(vhdl_ast::Name {
+            primary: name,
+            parts: Vec::new(),
+            span: Span::DUMMY,
+        })
+    }
+
+    #[test]
+    fn eval_vhdl_physical_time_literals() {
+        let (db, spans) = make_multi_source(&["20", "1.5"]);
+        let interner = Interner::new();
+        let env = ConstEnv::new();
+        let sink = DiagnosticSink::new();
+        let ns = interner.get_or_intern("ns");
+        let us = interner.get_or_intern("us");
+        let int_ns = vhdl_physical(vhdl_ast::Expr::IntLiteral { span: spans[0] }, ns);
+        let real_us = vhdl_physical(vhdl_ast::Expr::RealLiteral { span: spans[1] }, us);
+        assert_eq!(
+            eval_vhdl_expr(&int_ns, &db, &interner, &env, &sink),
+            Some(ConstValue::Int(20_000_000))
+        );
+        assert_eq!(
+            eval_vhdl_expr(&real_us, &db, &interner, &env, &sink),
+            Some(ConstValue::Int(1_500_000_000))
+        );
+        // A bare unit name is one unit.
+        assert_eq!(
+            eval_vhdl_expr(&vhdl_name(ns), &db, &interner, &env, &sink),
+            Some(ConstValue::Int(1_000_000))
+        );
+        assert!(!sink.has_errors(), "{:?}", sink.diagnostics());
+    }
+
+    #[test]
+    fn eval_vhdl_time_arithmetic_on_constants() {
+        let (db, spans) = make_multi_source(&["20", "2"]);
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let ns = interner.get_or_intern("ns");
+        let period = interner.get_or_intern("period");
+        let mut env = ConstEnv::new();
+        env.insert(period, ConstValue::Int(20_000_000));
+        // `period / 2`
+        let half = vhdl_ast::Expr::Binary {
+            left: Box::new(vhdl_name(period)),
+            op: vhdl_ast::BinaryOp::Div,
+            right: Box::new(vhdl_ast::Expr::IntLiteral { span: spans[1] }),
+            span: Span::DUMMY,
+        };
+        assert_eq!(
+            eval_vhdl_expr(&half, &db, &interner, &env, &sink),
+            Some(ConstValue::Int(10_000_000))
+        );
+        // `20 ns * 2`
+        let double = vhdl_ast::Expr::Binary {
+            left: Box::new(vhdl_physical(
+                vhdl_ast::Expr::IntLiteral { span: spans[0] },
+                ns,
+            )),
+            op: vhdl_ast::BinaryOp::Mul,
+            right: Box::new(vhdl_ast::Expr::IntLiteral { span: spans[1] }),
+            span: Span::DUMMY,
+        };
+        assert_eq!(
+            eval_vhdl_expr(&double, &db, &interner, &env, &sink),
+            Some(ConstValue::Int(40_000_000))
+        );
+        assert!(!sink.has_errors(), "{:?}", sink.diagnostics());
+    }
+
+    #[test]
+    fn eval_vhdl_time_literal_edge_cases() {
+        let (db, spans) = make_multi_source(&["3000", "16#A#"]);
+        let interner = Interner::new();
+        let ns = interner.get_or_intern("ns");
+        let hr = interner.get_or_intern("hr");
+        // A constant named like a unit keeps its meaning.
+        let mut env = ConstEnv::new();
+        env.insert(ns, ConstValue::Int(7));
+        assert_eq!(
+            eval_vhdl_time_literal(&vhdl_name(ns), &db, &interner, &env),
+            None
+        );
+        let sink = DiagnosticSink::new();
+        assert_eq!(
+            eval_vhdl_expr(&vhdl_name(ns), &db, &interner, &env, &sink),
+            Some(ConstValue::Int(7))
+        );
+        // Not a unit: no time literal.
+        let clk = interner.get_or_intern("clk");
+        let env = ConstEnv::new();
+        let not_time = vhdl_physical(vhdl_ast::Expr::IntLiteral { span: spans[0] }, clk);
+        assert_eq!(
+            eval_vhdl_time_literal(&not_time, &db, &interner, &env),
+            None
+        );
+        // Out of range (3000 hr) and based literals are errors, not wrong values.
+        for lit in [
+            vhdl_physical(vhdl_ast::Expr::IntLiteral { span: spans[0] }, hr),
+            vhdl_physical(vhdl_ast::Expr::IntLiteral { span: spans[1] }, ns),
+        ] {
+            assert_eq!(
+                eval_vhdl_time_literal(&lit, &db, &interner, &env),
+                Some(VhdlTimeLiteral::Unrepresentable)
+            );
+            let sink = DiagnosticSink::new();
+            assert_eq!(eval_vhdl_expr(&lit, &db, &interner, &env, &sink), None);
+            assert!(sink.has_errors());
+        }
     }
 
     #[test]

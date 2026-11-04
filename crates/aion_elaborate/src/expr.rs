@@ -51,6 +51,15 @@ impl SignalEnv {
         self.signals.get(name)
     }
 
+    /// Iterates over every signal binding in scope as `(name, signal)` pairs,
+    /// in no particular order. Constants added with [`insert_const`] are not
+    /// included.
+    ///
+    /// [`insert_const`]: SignalEnv::insert_const
+    pub fn signals(&self) -> impl Iterator<Item = (Ident, SignalId)> + '_ {
+        self.signals.iter().map(|(&name, &sid)| (name, sid))
+    }
+
     /// Binds `name` to signal `sid`, returning the previous binding if any.
     ///
     /// A signal binding takes precedence over a constant of the same name.
@@ -861,6 +870,9 @@ pub fn lower_vhdl_expr(
     sink: &DiagnosticSink,
 ) -> IrExpr {
     use aion_vhdl_parser::ast::Expr;
+    if let Some(time) = lower_vhdl_time_literal(expr, sig_env, source_db, interner, sink) {
+        return time;
+    }
     match expr {
         Expr::Name(name) => lower_vhdl_name(name, sig_env, source_db, interner, sink),
         Expr::IntLiteral { span } => lower_vhdl_literal(*span, source_db),
@@ -1246,6 +1258,53 @@ fn resolve_signal(
         sink.emit(errors::error_unknown_signal(interner.resolve(name), span));
         poison(span)
     }
+}
+
+/// Lowers a VHDL physical literal of type `time` (`20 ns`, `1.5 us`, or a
+/// bare unit such as `ns`) to a 64-bit literal counting femtoseconds, the
+/// representation of [`Type::Time`](aion_ir::types::Type::Time).
+///
+/// Returns `None` if `expr` is not such a literal, including when the unit
+/// name is a signal or constant in scope, which keeps its ordinary meaning.
+/// A literal that cannot be represented is an E209 error and lowers to 0.
+fn lower_vhdl_time_literal(
+    expr: &aion_vhdl_parser::ast::Expr,
+    sig_env: &SignalEnv,
+    source_db: &SourceDb,
+    interner: &Interner,
+    sink: &DiagnosticSink,
+) -> Option<IrExpr> {
+    use aion_vhdl_parser::ast::{BinaryOp as VBinOp, Expr};
+    let unit = match expr {
+        Expr::Name(name) => name,
+        Expr::Binary {
+            op: VBinOp::Mul,
+            right,
+            ..
+        } => match right.as_ref() {
+            Expr::Name(name) => name,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if sig_env.get(&unit.primary).is_some() {
+        return None;
+    }
+    let fs = match const_eval::eval_vhdl_time_literal(expr, source_db, interner, sig_env.consts())?
+    {
+        const_eval::VhdlTimeLiteral::Fs(fs) => fs,
+        const_eval::VhdlTimeLiteral::Unrepresentable => {
+            sink.emit(errors::error_param_not_const(
+                &format!(
+                    "time literal `{}` cannot be represented as a 64-bit count of femtoseconds",
+                    source_db.snippet(expr.span())
+                ),
+                expr.span(),
+            ));
+            0
+        }
+    };
+    Some(IrExpr::Literal(logic_vec_from_u64(64, fs as u64)))
 }
 
 /// Lowers a SystemVerilog time literal used as a value (`x = 5ns;`,
@@ -1896,6 +1955,87 @@ mod tests {
         });
         let ir = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
         assert!(matches!(ir, IrExpr::Signal(SignalRef::Signal(s)) if s == sid));
+    }
+
+    /// Builds the VHDL AST of the physical literal `<text> <unit>` over a
+    /// fresh source holding `text`, as the parser does:
+    /// `Binary(Mul, literal, Name(unit))`.
+    fn vhdl_time_ast(
+        sdb: &mut SourceDb,
+        interner: &Interner,
+        text: &str,
+        unit: &str,
+    ) -> aion_vhdl_parser::ast::Expr {
+        use aion_vhdl_parser::ast::{BinaryOp as VB, Expr as VE, Name};
+        let fid = sdb.add_source("t.vhd", text.to_string());
+        let span = Span::new(fid, 0, text.len() as u32);
+        let lit = if text.contains('.') {
+            VE::RealLiteral { span }
+        } else {
+            VE::IntLiteral { span }
+        };
+        VE::Binary {
+            left: Box::new(lit),
+            op: VB::Mul,
+            right: Box::new(VE::Name(Name {
+                primary: interner.get_or_intern(unit),
+                parts: vec![],
+                span,
+            })),
+            span,
+        }
+    }
+
+    #[test]
+    fn vhdl_time_literal_lowers_to_64_bit_femtoseconds() {
+        let (mut sdb, interner, sink, env) = setup();
+        for (text, unit, fs) in [("20", "ns", 20_000_000u64), ("1.5", "ps", 1_500)] {
+            let ast_expr = vhdl_time_ast(&mut sdb, &interner, text, unit);
+            match lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink) {
+                IrExpr::Literal(lv) => {
+                    assert_eq!(lv.width(), 64);
+                    assert_eq!(lv.to_u64(), Some(fs), "{text} {unit}");
+                }
+                other => panic!("expected literal, got {other:?}"),
+            }
+        }
+        // A bare unit is one unit.
+        let ns = aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
+            primary: interner.get_or_intern("ns"),
+            parts: vec![],
+            span: Span::DUMMY,
+        });
+        let ir = lower_vhdl_expr(&ns, &env, &sdb, &interner, &sink);
+        assert!(matches!(ir, IrExpr::Literal(lv) if lv.to_u64() == Some(1_000_000)));
+        assert!(sink.diagnostics().is_empty(), "{:?}", sink.diagnostics());
+    }
+
+    #[test]
+    fn vhdl_signal_named_like_a_unit_is_not_a_time_literal() {
+        let (mut sdb, interner, sink, mut env) = setup();
+        let sid = SignalId::from_raw(3);
+        env.insert(interner.get_or_intern("ns"), sid);
+        let ast_expr = vhdl_time_ast(&mut sdb, &interner, "2", "ns");
+        let ir = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
+        // `2 * ns` with `ns` a signal: an ordinary multiplication.
+        match ir {
+            IrExpr::Binary { op, rhs, .. } => {
+                assert_eq!(op, BinaryOp::Mul);
+                assert!(matches!(*rhs, IrExpr::Signal(SignalRef::Signal(s)) if s == sid));
+            }
+            other => panic!("expected multiplication, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vhdl_unrepresentable_time_literal_is_e209() {
+        let (mut sdb, interner, sink, env) = setup();
+        let ast_expr = vhdl_time_ast(&mut sdb, &interner, "3000", "hr");
+        let ir = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
+        assert!(matches!(ir, IrExpr::Literal(lv) if lv.to_u64() == Some(0)));
+        let diags = sink.diagnostics();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, errors::E209);
     }
 
     #[test]
