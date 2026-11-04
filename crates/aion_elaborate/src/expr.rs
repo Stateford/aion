@@ -892,15 +892,26 @@ pub fn lower_vhdl_expr(
             right,
             span,
         } => {
-            let ir_op = map_vhdl_binary_op(*op);
+            let (ir_op, complement) = map_vhdl_binary_op(*op);
             let lhs = lower_vhdl_expr(left, sig_env, source_db, interner, sink);
             let rhs = lower_vhdl_expr(right, sig_env, source_db, interner, sink);
-            IrExpr::Binary {
+            let binary = IrExpr::Binary {
                 op: ir_op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 ty: TypeId::from_raw(0),
                 span: *span,
+            };
+            if complement {
+                // `a nand b` / `a nor b` / `a xnor b` = not (a and/or/xor b)
+                IrExpr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(binary),
+                    ty: TypeId::from_raw(0),
+                    span: *span,
+                }
+            } else {
+                binary
             }
         }
         Expr::Unary { op, operand, span } => {
@@ -1238,13 +1249,21 @@ fn resolve_signal(
     interner: &Interner,
     sink: &DiagnosticSink,
 ) -> IrExpr {
-    if let Some(&sid) = sig_env.get(&name) {
-        IrExpr::Signal(SignalRef::Signal(sid))
-    } else if let Some(value) = sig_env.const_literal(name) {
-        IrExpr::NamedConst { name, value }
-    } else {
+    lookup_name(name, sig_env).unwrap_or_else(|| {
         sink.emit(errors::error_unknown_signal(interner.resolve(name), span));
         poison(span)
+    })
+}
+
+/// Looks up `name` as a signal, then as a constant in scope, without
+/// reporting anything when it is neither.
+fn lookup_name(name: Ident, sig_env: &SignalEnv) -> Option<IrExpr> {
+    if let Some(&sid) = sig_env.get(&name) {
+        Some(IrExpr::Signal(SignalRef::Signal(sid)))
+    } else {
+        sig_env
+            .const_literal(name)
+            .map(|value| IrExpr::NamedConst { name, value })
     }
 }
 
@@ -1439,7 +1458,14 @@ fn lower_vhdl_name(
         return IrExpr::Literal(LogicVec::all_zero(1));
     }
 
-    let base = resolve_signal(name.primary, name.span, sig_env, interner, sink);
+    // `true`/`false` are boolean literals unless a declared name hides them.
+    let base = match lookup_name(name.primary, sig_env) {
+        Some(expr) => expr,
+        None => match const_eval::vhdl_boolean_literal(primary_text) {
+            Some(b) if name.parts.is_empty() => return IrExpr::Literal(LogicVec::from_bool(b)),
+            _ => resolve_signal(name.primary, name.span, sig_env, interner, sink),
+        },
+    };
 
     if name.parts.is_empty() {
         return base;
@@ -1600,12 +1626,20 @@ fn map_sv_binary_op(op: aion_sv_parser::ast::BinaryOp) -> BinaryOp {
 }
 
 /// Maps a VHDL binary operator to an IR binary operator.
-fn map_vhdl_binary_op(op: aion_vhdl_parser::ast::BinaryOp) -> BinaryOp {
+///
+/// Returns the IR operator plus a flag that is `true` when the result must be
+/// complemented with an outer `Not`: the IR has no NAND/NOR/XNOR operators,
+/// so `a nand b`, `a nor b` and `a xnor b` lower to `not (a and b)`,
+/// `not (a or b)` and `not (a xor b)`.
+fn map_vhdl_binary_op(op: aion_vhdl_parser::ast::BinaryOp) -> (BinaryOp, bool) {
     use aion_vhdl_parser::ast::BinaryOp as V;
-    match op {
-        V::And | V::Nand => BinaryOp::And,
-        V::Or | V::Nor => BinaryOp::Or,
-        V::Xor | V::Xnor => BinaryOp::Xor,
+    let ir_op = match op {
+        V::Nand => return (BinaryOp::And, true),
+        V::Nor => return (BinaryOp::Or, true),
+        V::Xnor => return (BinaryOp::Xor, true),
+        V::And => BinaryOp::And,
+        V::Or => BinaryOp::Or,
+        V::Xor => BinaryOp::Xor,
         V::Eq | V::MatchEq => BinaryOp::Eq,
         V::Neq | V::MatchNeq => BinaryOp::Ne,
         V::Lt | V::MatchLt => BinaryOp::Lt,
@@ -1621,7 +1655,8 @@ fn map_vhdl_binary_op(op: aion_vhdl_parser::ast::BinaryOp) -> BinaryOp {
         V::Div => BinaryOp::Div,
         V::Mod | V::Rem2 => BinaryOp::Mod,
         V::Pow => BinaryOp::Pow,
-    }
+    };
+    (ir_op, false)
 }
 
 /// Maps a VHDL unary operator to an IR unary operator.
@@ -2434,6 +2469,78 @@ mod tests {
         assert!(sink.has_errors(), "unknown name should still emit E204");
     }
 
+    /// Lowers the bare VHDL name `text` against `env` with a fresh sink.
+    fn lower_vhdl_bare_name(text: &str, env: &SignalEnv, interner: &Interner) -> (IrExpr, bool) {
+        let sdb = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let ast_expr = aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
+            primary: interner.get_or_intern(text),
+            parts: vec![],
+            span: Span::DUMMY,
+        });
+        let ir = lower_vhdl_expr(&ast_expr, env, &sdb, interner, &sink);
+        (ir, sink.has_errors())
+    }
+
+    #[test]
+    fn vhdl_boolean_literals_lower_to_single_bit_constants() {
+        let interner = Interner::new();
+        let env = SignalEnv::new();
+        for (text, value) in [
+            ("true", true),
+            ("false", false),
+            ("TRUE", true),
+            ("False", false),
+        ] {
+            let (ir, errored) = lower_vhdl_bare_name(text, &env, &interner);
+            assert!(!errored, "`{text}` must not emit E204");
+            assert!(
+                matches!(&ir, IrExpr::Literal(lv) if *lv == LogicVec::from_bool(value)),
+                "{text}: {ir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vhdl_signal_named_true_hides_boolean_literal() {
+        let interner = Interner::new();
+        let mut env = SignalEnv::new();
+        let sid = SignalId::from_raw(7);
+        env.insert(interner.get_or_intern("true"), sid);
+        let (ir, errored) = lower_vhdl_bare_name("true", &env, &interner);
+        assert!(!errored);
+        assert!(
+            matches!(ir, IrExpr::Signal(SignalRef::Signal(s)) if s == sid),
+            "{ir:?}"
+        );
+    }
+
+    #[test]
+    fn vhdl_constant_named_false_hides_boolean_literal() {
+        let interner = Interner::new();
+        let mut env = SignalEnv::new();
+        env.insert_const(interner.get_or_intern("false"), ConstValue::Int(5), 8);
+        let (ir, errored) = lower_vhdl_bare_name("false", &env, &interner);
+        assert!(!errored);
+        assert!(
+            matches!(&ir, IrExpr::NamedConst { value, .. } if value.to_u64() == Some(5)),
+            "{ir:?}"
+        );
+    }
+
+    #[test]
+    fn vhdl_boolean_literal_lookalikes_still_report_e204() {
+        let interner = Interner::new();
+        let env = SignalEnv::new();
+        for text in ["truthy", "f", "falsehood"] {
+            let (_, errored) = lower_vhdl_bare_name(text, &env, &interner);
+            assert!(
+                errored,
+                "`{text}` only resembles a literal and is still E204"
+            );
+        }
+    }
+
     /// Lowers `<op> v` for a VHDL unary operator applied to signal `v`.
     fn lower_vhdl_unary(op: aion_vhdl_parser::ast::UnaryOp) -> (IrExpr, SignalId, bool) {
         let (sdb, interner, sink, mut env) = setup();
@@ -2464,6 +2571,69 @@ mod tests {
                 *got == op && matches!(**operand, IrExpr::Signal(SignalRef::Signal(s)) if s == sid)
             }
             _ => false,
+        }
+    }
+
+    /// Lowers `a <op> b` for a VHDL binary operator applied to signals.
+    fn lower_vhdl_binary(op: aion_vhdl_parser::ast::BinaryOp) -> IrExpr {
+        let (sdb, interner, sink, mut env) = setup();
+        let name = |text: &str, sid: u32, env: &mut SignalEnv| {
+            let id = interner.get_or_intern(text);
+            env.insert(id, SignalId::from_raw(sid));
+            aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
+                primary: id,
+                parts: vec![],
+                span: Span::DUMMY,
+            })
+        };
+        let ast_expr = aion_vhdl_parser::ast::Expr::Binary {
+            left: Box::new(name("a", 1, &mut env)),
+            op,
+            right: Box::new(name("b", 2, &mut env)),
+            span: Span::DUMMY,
+        };
+        let ir = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
+        assert!(!sink.has_errors());
+        ir
+    }
+
+    #[test]
+    fn vhdl_binary_nand_nor_xnor_lower_to_complemented_ops() {
+        use aion_vhdl_parser::ast::BinaryOp as V;
+        for (op, ir_op) in [
+            (V::Nand, BinaryOp::And),
+            (V::Nor, BinaryOp::Or),
+            (V::Xnor, BinaryOp::Xor),
+        ] {
+            let ir = lower_vhdl_binary(op);
+            let IrExpr::Unary {
+                op: UnaryOp::Not,
+                operand,
+                ..
+            } = &ir
+            else {
+                panic!("{op:?} must lower to `not (...)`, got {ir:?}");
+            };
+            assert!(
+                matches!(**operand, IrExpr::Binary { op: got, .. } if got == ir_op),
+                "{op:?}: {ir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vhdl_binary_and_or_xor_are_not_complemented() {
+        use aion_vhdl_parser::ast::BinaryOp as V;
+        for (op, ir_op) in [
+            (V::And, BinaryOp::And),
+            (V::Or, BinaryOp::Or),
+            (V::Xor, BinaryOp::Xor),
+        ] {
+            let ir = lower_vhdl_binary(op);
+            assert!(
+                matches!(ir, IrExpr::Binary { op: got, .. } if got == ir_op),
+                "{op:?}: {ir:?}"
+            );
         }
     }
 

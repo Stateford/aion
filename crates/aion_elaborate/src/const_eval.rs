@@ -443,6 +443,21 @@ pub fn eval_sv_expr(
     }
 }
 
+/// Returns the value of `text` if it is `true` or `false`, the enumeration
+/// literals of the predefined VHDL type `boolean` (case-insensitive).
+///
+/// Callers resolve declared names first: a signal, constant or generic named
+/// `true`/`false` hides the predefined literal.
+pub(crate) fn vhdl_boolean_literal(text: &str) -> Option<bool> {
+    if text.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if text.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Evaluates a VHDL expression to a compile-time constant.
 ///
 /// Handles integer literals, simple name lookups in the parameter environment,
@@ -473,6 +488,9 @@ pub fn eval_vhdl_expr(
                 Some(val) => Some(val.clone()),
                 None => {
                     let name_str = interner.resolve(name.primary);
+                    if let Some(b) = vhdl_boolean_literal(name_str) {
+                        return Some(ConstValue::Bool(b));
+                    }
                     sink.emit(errors::error_param_not_const(
                         &format!("unknown identifier `{name_str}`"),
                         name.span,
@@ -1102,6 +1120,56 @@ mod tests {
         assert_eq!(
             eval_vhdl_expr(&expr, &db, &interner, &env, &sink),
             Some(ConstValue::Int(32))
+        );
+    }
+
+    #[test]
+    fn vhdl_boolean_literal_matches_true_false_any_case() {
+        assert_eq!(vhdl_boolean_literal("true"), Some(true));
+        assert_eq!(vhdl_boolean_literal("FALSE"), Some(false));
+        assert_eq!(vhdl_boolean_literal("True"), Some(true));
+        for text in ["", "t", "truth", "false_", "falsy"] {
+            assert_eq!(vhdl_boolean_literal(text), None, "{text}");
+        }
+    }
+
+    /// Evaluates the bare VHDL name `text`, with `shadow` bound to 5 in the
+    /// constant environment, returning the value and whether it errored.
+    fn eval_vhdl_bare_name(text: &str, shadow: Option<&str>) -> (Option<ConstValue>, bool) {
+        let db = SourceDb::new();
+        let interner = Interner::new();
+        let sink = DiagnosticSink::new();
+        let mut env = ConstEnv::new();
+        if let Some(name) = shadow {
+            env.insert(interner.get_or_intern(name), ConstValue::Int(5));
+        }
+        let expr = vhdl_ast::Expr::Name(vhdl_ast::Name {
+            primary: interner.get_or_intern(text),
+            parts: Vec::new(),
+            span: Span::DUMMY,
+        });
+        let value = eval_vhdl_expr(&expr, &db, &interner, &env, &sink);
+        (value, sink.has_errors())
+    }
+
+    #[test]
+    fn eval_vhdl_boolean_literals_without_error() {
+        assert_eq!(
+            eval_vhdl_bare_name("true", None),
+            (Some(ConstValue::Bool(true)), false)
+        );
+        assert_eq!(
+            eval_vhdl_bare_name("False", None),
+            (Some(ConstValue::Bool(false)), false)
+        );
+        assert_eq!(eval_vhdl_bare_name("truthy", None), (None, true));
+    }
+
+    #[test]
+    fn eval_vhdl_declared_name_hides_boolean_literal() {
+        assert_eq!(
+            eval_vhdl_bare_name("false", Some("false")),
+            (Some(ConstValue::Int(5)), false)
         );
     }
 

@@ -460,24 +460,18 @@ fn eval_vhdl_default(
         vhdl_ast::Expr::Name(name)
             if name.parts.is_empty() && !const_env.contains_key(&name.primary) =>
         {
-            // Boolean literals.
-            match ctx
-                .interner
-                .resolve(name.primary)
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "true" => return Some(fit(LogicVec::from_bool(true))),
-                "false" => return Some(fit(LogicVec::from_bool(false))),
-                _ => {}
+            // A previously declared object with a constant init. It hides a
+            // boolean literal of the same name, so it is looked up first.
+            if let Some(&sid) = sig_env.get(&name.primary) {
+                return match &signals.get(sid).init {
+                    Some(ConstValue::Logic(lv)) => Some(fit(lv.clone())),
+                    Some(other) => Some(other.clone()),
+                    None => None,
+                };
             }
-            // A previously declared object with a constant init.
-            let sid = *sig_env.get(&name.primary)?;
-            match &signals.get(sid).init {
-                Some(ConstValue::Logic(lv)) => Some(fit(lv.clone())),
-                Some(other) => Some(other.clone()),
-                None => None,
-            }
+            // Otherwise, a boolean literal.
+            let b = const_eval::vhdl_boolean_literal(ctx.interner.resolve(name.primary))?;
+            Some(fit(LogicVec::from_bool(b)))
         }
         _ => {
             // Integer constant expressions (literals, generics, arithmetic).
@@ -610,7 +604,7 @@ fn elaborate_vhdl_concurrent(
             });
         }
         vhdl_ast::ConcurrentStatement::ComponentInstantiation(ci) => {
-            elaborate_vhdl_component(ci, sig_env, cells, ctx);
+            elaborate_vhdl_component(ci, signals, sig_env, cells, ctx);
         }
         vhdl_ast::ConcurrentStatement::ForGenerate(fg) => {
             // The generate body is not expanded in Phase 0, but its range is
@@ -1009,9 +1003,53 @@ fn collect_edge_calls_expr(
     }
 }
 
+/// Evaluates the actual of one `generic map` association.
+///
+/// Architecture-level constants are stored as signals with a constant init,
+/// not in the constant environment, so a bare name that is a declared object
+/// is resolved here first: a constant yields its init value, and any other
+/// object (a signal, or a constant whose value is unknown) is reported as
+/// E209, since a generic needs a value at elaboration time. This keeps a
+/// declared object from being mistaken for the boolean literal `true`/`false`.
+/// Every other actual goes through [`const_eval::eval_vhdl_expr`].
+fn eval_vhdl_generic_actual(
+    actual: &vhdl_ast::Expr,
+    signals: &Arena<SignalId, Signal>,
+    sig_env: &SignalEnv,
+    ctx: &ElaborationContext<'_>,
+) -> Option<ConstValue> {
+    if let vhdl_ast::Expr::Name(name) = actual {
+        let declared = sig_env.get(&name.primary).filter(|_| name.parts.is_empty());
+        if let Some(&sid) = declared {
+            let sig = signals.get(sid);
+            if sig.kind == SignalKind::Const {
+                if let Some(init) = &sig.init {
+                    return Some(init.clone());
+                }
+            }
+            ctx.sink.emit(errors::error_param_not_const(
+                &format!(
+                    "`{}` is not a constant with a known value",
+                    ctx.interner.resolve(name.primary)
+                ),
+                name.span,
+            ));
+            return None;
+        }
+    }
+    const_eval::eval_vhdl_expr(
+        actual,
+        ctx.source_db,
+        ctx.interner,
+        sig_env.consts(),
+        ctx.sink,
+    )
+}
+
 /// Elaborates a VHDL component instantiation.
 fn elaborate_vhdl_component(
     ci: &vhdl_ast::ComponentInstantiation,
+    signals: &Arena<SignalId, Signal>,
     sig_env: &SignalEnv,
     cells: &mut Arena<CellId, Cell>,
     ctx: &mut ElaborationContext<'_>,
@@ -1045,13 +1083,7 @@ fn elaborate_vhdl_component(
                 .iter()
                 .filter_map(|elem| {
                     let formal_name = extract_vhdl_formal(&elem.formal)?;
-                    let val = const_eval::eval_vhdl_expr(
-                        &elem.actual,
-                        ctx.source_db,
-                        ctx.interner,
-                        sig_env.consts(),
-                        ctx.sink,
-                    )?;
+                    let val = eval_vhdl_generic_actual(&elem.actual, signals, sig_env, ctx)?;
                     Some((formal_name, val))
                 })
                 .collect()

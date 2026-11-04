@@ -1,0 +1,22 @@
+## 2026-11-04 — Elaborator: VHDL Boolean Literals in Expressions (Fixes #71)
+
+- **Bug fixed:** `assert false report "..." severity failure;` failed with E204 "unknown signal `false`". The testbench end-of-simulation idiom could not elaborate. `lower_vhdl_name` passed every bare name to `resolve_signal`, and that function only knows signals and constants. Constant evaluation of defaults (`vhdl.rs`) already handled `true`/`false`; expression lowering did not.
+- **Fix:** one shared helper, `const_eval::vhdl_boolean_literal`, matches `true`/`false` case-insensitively, as enumeration literals of the predefined `boolean`. Three paths use it, and each one looks up declared names first, so a signal, constant or generic with the same name hides the literal:
+  - expression lowering (`lower_vhdl_name`), where the literal becomes a 1-bit `IrExpr::Literal`. The new `lookup_name` does the signal/constant lookup once, and `resolve_signal` reuses it;
+  - constant evaluation (`eval_vhdl_expr`), which now returns `ConstValue::Bool`. Before, `generic (EN : boolean := true)` and `generic map (EN => false)` failed with E209;
+  - object default evaluation (`eval_vhdl_default`), which used to have its own copy of the match. It now looks up declared objects before the literal, so `constant false : boolean := true; signal q : boolean := false;` gives `q` the constant's value.
+- **Generic maps (from review on #74):** architecture constants are stored as signals, not in the constant environment, so `generic map (EN => false)` silently took the literal even when the architecture declared `constant false`. The new `eval_vhdl_generic_actual` resolves a bare name that is a declared object first: a constant gives its init value, and any other object is E209. As a side effect, `generic map (W => C)` with an architecture constant `C` now works; it used to be E209 "unknown identifier".
+- Names with suffixes still go through normal resolution.
+- **Silent miscompile fixed (from review on #74, outside #71's scope, fixed here at the owner's request):** VHDL binary `nand`/`nor`/`xnor` lowered to plain `and`/`or`/`xor`, so `a nand b` computed `a and b` with no diagnostic. `map_vhdl_binary_op` now returns a complement flag, like `map_vhdl_unary_op`, and `lower_vhdl_expr` wraps those results in `not (...)`. Tests: 2 lowering tests in `expr.rs` (all three complemented operators, and `and`/`or`/`xor` unchanged) and an end-to-end sim test in `aion_conformance/tests/sim_assign_semantics.rs` that checks all six truth tables on 4-bit vectors.
+- **Verified:** `assert false` in a VHDL testbench now elaborates, and `aion sim` reports the assertion failure.
+- **Tests:**
+  - 4 unit tests in `expr.rs`: both literals in mixed case, a signal named `true` and a constant named `false` that hide the literal, and look-alike names that still get E204;
+  - 3 tests in `const_eval.rs`: the helper itself, evaluating the literals, and a declared name that hides one;
+  - 7 elaboration tests in `lib.rs`:
+    - `assert False` / `assert TRUE` lower to constant conditions;
+    - `assert falsy` still reports E204;
+    - boolean generic defaults and `generic map` values elaborate with no errors;
+    - literals inside `=`, `/=`, `and` and `not` alongside `boolean` signals elaborate, and both the signals and the literals are 1 bit.
+    - a declared `constant false` hides the literal in a signal default and in a `generic map`;
+    - a `generic map` actual naming an architecture constant takes its value, and one naming a signal reports E209.
+- **Out of scope, still open:** `examples/blinky_vhdl/tests/blinky_tb.vhd` still fails to elaborate, because of `constant CLK_PERIOD : time := 20 ns;` (E210 unknown VHDL type `time`), which is #70. The simulator ignores VHDL `report` text and `severity` and prints "ASSERTION FAILED: assertion failed" for a `severity note`; that is #12.

@@ -502,3 +502,35 @@ fn verilog_unary_plus_parameter_is_identity() {
 fn sv_unary_plus_parameter_is_identity() {
     check_unary_plus_params("tb.sv", "logic");
 }
+
+#[test]
+fn vhdl_binary_nand_nor_xnor_are_complemented() {
+    // `nand`/`nor`/`xnor` used to lower to plain `and`/`or`/`xor`.
+    let src = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity tb is
+end entity;
+
+architecture sim of tb is
+  signal a : std_logic_vector(3 downto 0) := "1100";
+  signal b : std_logic_vector(3 downto 0) := "1010";
+  signal y_and, y_nand, y_or, y_nor, y_xor, y_xnor : std_logic_vector(3 downto 0);
+begin
+  y_and  <= a and b;
+  y_nand <= a nand b;
+  y_or   <= a or b;
+  y_nor  <= a nor b;
+  y_xor  <= a xor b;
+  y_xnor <= a xnor b;
+end architecture;
+"#;
+    let (kernel, _) = simulate("tb.vhd", src, "tb");
+    assert_eq!(value(&kernel, "y_and"), Some(0b1000));
+    assert_eq!(value(&kernel, "y_nand"), Some(0b0111));
+    assert_eq!(value(&kernel, "y_or"), Some(0b1110));
+    assert_eq!(value(&kernel, "y_nor"), Some(0b0001));
+    assert_eq!(value(&kernel, "y_xor"), Some(0b0110));
+    assert_eq!(value(&kernel, "y_xnor"), Some(0b1001));
+}

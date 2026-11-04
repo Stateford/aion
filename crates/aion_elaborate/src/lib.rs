@@ -2017,6 +2017,75 @@ mod tests {
         );
     }
 
+    /// Returns the init value of the signal or constant `name` in `m`.
+    fn init_of(m: &aion_ir::Module, interner: &Interner, name: &str) -> Option<ConstValue> {
+        let (_, sig) = m
+            .signals
+            .iter()
+            .find(|(_, s)| interner.resolve(s.name) == name)
+            .unwrap_or_else(|| panic!("no signal `{name}`"));
+        sig.init.clone()
+    }
+
+    #[test]
+    fn vhdl_declared_constant_named_false_hides_literal_in_default() {
+        let src = "entity m is end entity;
+            architecture rtl of m is
+              constant false : boolean := true;
+              signal q : boolean := false;
+            begin end architecture;";
+        let (design, interner, diags) = elaborate_src("m.vhd", src, "m");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let top = design.top_module();
+        let declared = init_of(top, &interner, "false");
+        assert!(declared.is_some());
+        // `q` takes the declared constant's value (true), not the literal.
+        assert_eq!(init_of(top, &interner, "q"), declared);
+    }
+
+    #[test]
+    fn vhdl_generic_map_uses_architecture_constants() {
+        let src = "entity child is generic (EN : boolean := false; W : integer := 1);
+              end entity;
+            architecture rtl of child is begin end architecture;
+            entity m is end entity;
+            architecture rtl of m is
+              constant false : boolean := true;
+              constant C : integer := 6;
+            begin
+              u : entity work.child generic map (EN => false, W => C);
+            end architecture;";
+        let (design, interner, diags) = elaborate_src("m.vhd", src, "m");
+        assert!(errors_of(&diags).is_empty(), "{diags:?}");
+        let top = design.top_module();
+        let declared_false = init_of(top, &interner, "false").expect("constant init");
+        let child = module_named(&design, &interner, "child");
+        assert_eq!(
+            params_of(child, &interner),
+            vec![
+                ("en".to_string(), declared_false),
+                (
+                    "w".to_string(),
+                    init_of(top, &interner, "c").expect("constant init")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn vhdl_generic_map_naming_a_signal_reports_e209() {
+        let src = "entity child is generic (EN : boolean := false); end entity;
+            architecture rtl of child is begin end architecture;
+            entity m is end entity;
+            architecture rtl of m is
+              signal true : boolean;
+            begin
+              u : entity work.child generic map (EN => true);
+            end architecture;";
+        let (_, _, diags) = elaborate_src("m.vhd", src, "m");
+        assert_eq!(spans_with(&diags, errors::E209), vec!["true"], "{diags:?}");
+    }
+
     #[test]
     fn vhdl_generic_type_range_attribute_reports_e212() {
         // A generic is the first declaration of an entity, so a range
@@ -2157,6 +2226,136 @@ end architecture;
         let errors = error_messages(&diags);
         assert!(
             errors.iter().any(|m| m.contains("unknown signal `clock`")),
+            "errors: {errors:?}"
+        );
+    }
+
+    /// Collects the condition of every assertion in `stmt`, in source order.
+    fn assertion_conditions(stmt: &aion_ir::Statement, out: &mut Vec<aion_common::LogicVec>) {
+        match stmt {
+            aion_ir::Statement::Assertion { condition, .. } => match condition {
+                aion_ir::Expr::Literal(lv) => out.push(lv.clone()),
+                other => panic!("assertion condition is not a literal: {other:?}"),
+            },
+            aion_ir::Statement::Block { stmts, .. } => {
+                stmts.iter().for_each(|s| assertion_conditions(s, out))
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn vhdl_assert_boolean_literal_elaborates_as_constant() {
+        // Issue #71: `assert false` is the standard end-of-simulation idiom.
+        let src = r#"
+entity tb is end entity;
+architecture sim of tb is
+begin
+  process begin
+    assert False report "done" severity failure;
+    assert TRUE;
+    wait;
+  end process;
+end architecture;
+"#;
+        let (design, _, diags) = elaborate_sources(&[("tb.vhd", src)], "tb");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let top = design.top_module();
+        let (_, proc) = top.processes.iter().next().unwrap();
+        let mut conds = Vec::new();
+        assertion_conditions(&proc.body, &mut conds);
+        assert_eq!(
+            conds,
+            vec![
+                aion_common::LogicVec::from_bool(false),
+                aion_common::LogicVec::from_bool(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn vhdl_boolean_generic_default_and_map_accept_literals() {
+        let src = r#"
+entity child is generic (EN : boolean := true); end entity;
+architecture rtl of child is begin end architecture;
+entity tb is generic (G : boolean := FALSE); end entity;
+architecture sim of tb is
+begin
+  u0 : entity work.child generic map (EN => false);
+  u1 : entity work.child;
+end architecture;
+"#;
+        let (design, _, diags) = elaborate_sources(&[("tb.vhd", src)], "tb");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(design.modules.len() >= 2);
+    }
+
+    #[test]
+    fn vhdl_boolean_literals_inside_operators() {
+        let src = r#"
+entity tb is end entity;
+architecture sim of tb is
+  signal flag : boolean;
+  signal b : boolean;
+begin
+  b <= not false;
+  process begin
+    assert flag = true;
+    assert flag and TRUE;
+    if flag /= false then b <= true; end if;
+    wait;
+  end process;
+end architecture;
+"#;
+        let (design, interner, diags) = elaborate_sources(&[("tb.vhd", src)], "tb");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let top = design.top_module();
+        // Boolean signals and the literals they are compared with are 1 bit.
+        assert_eq!(signal_width(&design, top, &interner, "flag"), 1);
+        let (_, proc) = top.processes.iter().next().unwrap();
+        let mut rhs_widths = Vec::new();
+        collect_assert_rhs_widths(&proc.body, &mut rhs_widths);
+        assert_eq!(rhs_widths, vec![1, 1]);
+    }
+
+    /// Records the width of every literal right operand of a binary
+    /// assertion condition in `stmt`.
+    fn collect_assert_rhs_widths(stmt: &aion_ir::Statement, out: &mut Vec<u32>) {
+        match stmt {
+            aion_ir::Statement::Assertion {
+                condition: aion_ir::Expr::Binary { rhs, .. },
+                ..
+            } => {
+                if let aion_ir::Expr::Literal(lv) = rhs.as_ref() {
+                    out.push(lv.width());
+                }
+            }
+            aion_ir::Statement::Block { stmts, .. } => {
+                stmts.iter().for_each(|s| collect_assert_rhs_widths(s, out))
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn vhdl_assert_on_unknown_name_still_reports_e204() {
+        let src = r#"
+entity tb is end entity;
+architecture sim of tb is
+begin
+  process begin
+    assert falsy;
+    wait;
+  end process;
+end architecture;
+"#;
+        let (_, _, diags) = elaborate_sources(&[("tb.vhd", src)], "tb");
+        let errors = error_messages(&diags);
+        assert!(
+            errors.iter().any(|m| m.contains("unknown signal `falsy`")),
             "errors: {errors:?}"
         );
     }
