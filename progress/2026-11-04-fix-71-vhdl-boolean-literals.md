@@ -15,4 +15,4 @@
     - `assert falsy` still reports E204;
     - boolean generic defaults and `generic map` values elaborate with no errors;
     - literals inside `=`, `/=`, `and` and `not` alongside `boolean` signals elaborate, and both the signals and the literals are 1 bit.
-- **Out of scope, still open:** `examples/blinky_vhdl/tests/blinky_tb.vhd` still fails to elaborate, because of `constant CLK_PERIOD : time := 20 ns;` (E210 unknown VHDL type `time`). The simulator ignores VHDL `report` text and `severity` and prints "ASSERTION FAILED: assertion failed" for a `severity note`; that is #12.
+- **Out of scope, still open:** `examples/blinky_vhdl/tests/blinky_tb.vhd` still fails to elaborate, because of `constant CLK_PERIOD : time := 20 ns;` (E210 unknown VHDL type `time`), which is #70. The simulator ignores VHDL `report` text and `severity` and prints "ASSERTION FAILED: assertion failed" for a `severity note`; that is #12.
