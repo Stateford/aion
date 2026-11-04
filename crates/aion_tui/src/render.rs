@@ -53,43 +53,31 @@ pub fn render(app: &TuiApp, frame: &mut Frame) {
 
     // Help popup (if visible)
     if app.state.show_help {
-        render_help_popup(frame);
+        render_help_popup(frame, app.state.help_scroll);
     }
 }
 
 /// Renders a centered help popup.
-fn render_help_popup(frame: &mut Frame) {
+fn render_help_popup(frame: &mut Frame, scroll: u16) {
     use ratatui::style::{Color, Style};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-    let help_text = "\
-Navigation:
-  j/k ↑/↓  Select signal       h/l ←/→  Scroll waveform
-  +/-       Zoom in/out         f         Fit viewport
-  Space     Step simulation     Enter     Toggle signal
-  Tab       Switch panel        d         Cycle format
-  ?         Toggle help         :         Command mode
-  q         Quit
-
-Commands:
-  run <dur>    Run for duration    step (s)    Single step
-  continue     Run to end          goto <t>    Jump cursor
-  add <sig>    Add to waveform     rm <sig>    Remove
-  zoomin/zo    Zoom in/out         fit         Fit viewport
-  fmt          Cycle format        quit (q)    Exit
-
-Press ? to close";
+    let help_text = format!("{}\n\nPress ? to close", crate::help::help_body());
+    let content_lines = help_text.lines().count() as u16;
 
     let area = frame.size();
-    let popup_width = 60u16.min(area.width.saturating_sub(4));
-    let popup_height = 18u16.min(area.height.saturating_sub(4));
+    let popup_width = 64u16.min(area.width.saturating_sub(4));
+    let popup_height = (content_lines + 2).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = ratatui::layout::Rect::new(x, y, popup_width, popup_height);
+    let visible = popup_height.saturating_sub(2);
+    let scroll = scroll.min(content_lines.saturating_sub(visible));
 
     frame.render_widget(Clear, popup_area);
 
     let popup = Paragraph::new(help_text)
+        .scroll((scroll, 0))
         .block(
             Block::default()
                 .title(" Help ")
@@ -199,5 +187,29 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(&app, f)).unwrap();
+    }
+
+    fn popup_text(scroll: u16) -> String {
+        let design = make_test_design();
+        let mut app = TuiApp::new(&design, &make_test_interner()).unwrap();
+        app.state.show_help = true;
+        app.state.help_scroll = scroll;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn help_popup_shows_expand_key() {
+        assert!(popup_text(0).contains("Expand/collapse bus bits"));
+    }
+
+    #[test]
+    fn help_popup_scrolls_to_commands() {
+        assert!(!popup_text(0).contains("inspect (i)"));
+        assert!(popup_text(u16::MAX).contains("quit (q)"));
+        assert!(popup_text(18).contains("inspect (i)"));
     }
 }

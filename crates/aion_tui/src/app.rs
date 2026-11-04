@@ -460,6 +460,24 @@ impl TuiApp {
     /// Handles a key event in normal mode.
     pub fn handle_normal_key(&mut self, key: crossterm::event::KeyCode) {
         use crossterm::event::KeyCode;
+        if self.state.show_help {
+            let max = crate::help::help_line_count().saturating_sub(1) as u16;
+            match key {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.state.help_scroll = (self.state.help_scroll + 1).min(max);
+                    return;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.state.help_scroll = self.state.help_scroll.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.state.show_help = false;
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.state.select_next_signal(),
@@ -485,6 +503,7 @@ impl TuiApp {
             }
             KeyCode::Char('?') => {
                 self.state.show_help = !self.state.show_help;
+                self.state.help_scroll = 0;
             }
             KeyCode::Char('e') => {
                 self.toggle_expand();
@@ -547,35 +566,9 @@ impl TuiApp {
     }
 }
 
-/// Returns the help text for the TUI.
+/// Returns the help text for the TUI, generated from [`crate::help`].
 fn help_text() -> String {
-    "\
-Navigation:
-  j/k  or ↑/↓   Select signal
-  h/l  or ←/→   Scroll waveform
-  +/-            Zoom in/out
-  f              Fit to time range
-  Space          Step simulation
-  Enter          Toggle signal in waveform
-  e              Expand/collapse bus bits
-  Tab            Switch panel focus
-  d              Cycle value format (hex/bin/dec)
-  ?              Toggle help
-  :              Enter command mode
-  q              Quit
-
-Commands:
-  run <dur>      Run for duration (e.g., 'run 100ns')
-  step (s)       Single delta step
-  continue (c)   Run to completion
-  goto <time>    Jump cursor to time
-  zoomin/zo      Zoom in/out
-  fit            Fit viewport
-  add <signal>   Add signal to waveform
-  rm <signal>    Remove signal from waveform
-  fmt            Cycle value format
-  quit (q)       Exit"
-        .to_string()
+    crate::help::help_body()
 }
 
 #[cfg(test)]
@@ -767,6 +760,40 @@ mod tests {
         assert_eq!(app.state.selected_signal, 1);
         app.handle_normal_key(crossterm::event::KeyCode::Char('k'));
         assert_eq!(app.state.selected_signal, 0);
+    }
+
+    #[test]
+    fn help_open_scrolls_instead_of_selecting() {
+        use crossterm::event::KeyCode;
+        let design = make_simple_design();
+        let mut app = TuiApp::new(&design, &make_test_interner()).unwrap();
+        app.handle_normal_key(KeyCode::Char('?'));
+        assert!(app.state.show_help);
+        app.handle_normal_key(KeyCode::Char('j'));
+        assert_eq!(app.state.help_scroll, 1);
+        assert_eq!(app.state.selected_signal, 0);
+        app.handle_normal_key(KeyCode::Char('k'));
+        app.handle_normal_key(KeyCode::Char('k'));
+        assert_eq!(app.state.help_scroll, 0);
+        app.handle_normal_key(KeyCode::Esc);
+        assert!(!app.state.show_help);
+    }
+
+    #[test]
+    fn help_text_lists_all_commands() {
+        let t = help_text();
+        for w in [
+            "inspect",
+            "breakpoint",
+            "watch",
+            "unwatch",
+            "status",
+            "signals",
+            "zoomout",
+        ] {
+            assert!(t.contains(w), "missing {w}");
+        }
+        assert!(t.contains("+ or ="));
     }
 
     #[test]
