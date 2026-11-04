@@ -461,15 +461,8 @@ fn eval_vhdl_default(
             if name.parts.is_empty() && !const_env.contains_key(&name.primary) =>
         {
             // Boolean literals.
-            match ctx
-                .interner
-                .resolve(name.primary)
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "true" => return Some(fit(LogicVec::from_bool(true))),
-                "false" => return Some(fit(LogicVec::from_bool(false))),
-                _ => {}
+            if let Some(b) = const_eval::vhdl_boolean_literal(ctx.interner.resolve(name.primary)) {
+                return Some(fit(LogicVec::from_bool(b)));
             }
             // A previously declared object with a constant init.
             let sid = *sig_env.get(&name.primary)?;
