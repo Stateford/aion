@@ -1408,6 +1408,26 @@ fn is_vhdl_builtin(name: &str) -> bool {
     VHDL_BUILTINS.iter().any(|b| *b == lower)
 }
 
+/// Recognizes the enumeration literals `true` and `false` of the predefined
+/// VHDL type `boolean` (case-insensitive) and returns their value.
+///
+/// A signal or constant declared with the same name hides the predefined
+/// literal, so a name found in `sig_env` is never treated as a boolean
+/// literal and `None` is returned for it, as for any other name.
+fn vhdl_boolean_literal(name: Ident, sig_env: &SignalEnv, interner: &Interner) -> Option<bool> {
+    if sig_env.get(&name).is_some() || sig_env.const_literal(name).is_some() {
+        return None;
+    }
+    let text = interner.resolve(name);
+    if text.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if text.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Lowers a VHDL `Name` to an IR expression.
 fn lower_vhdl_name(
     name: &aion_vhdl_parser::ast::Name,
@@ -1437,6 +1457,12 @@ fn lower_vhdl_name(
         }
         // No arguments — return a passthrough zero literal (type name used as value)
         return IrExpr::Literal(LogicVec::all_zero(1));
+    }
+
+    if name.parts.is_empty() {
+        if let Some(value) = vhdl_boolean_literal(name.primary, sig_env, interner) {
+            return IrExpr::Literal(LogicVec::from_bool(value));
+        }
     }
 
     let base = resolve_signal(name.primary, name.span, sig_env, interner, sink);
@@ -2432,6 +2458,67 @@ mod tests {
         });
         let _ = lower_vhdl_expr(&ast_expr, &env, &sdb, &interner, &sink);
         assert!(sink.has_errors(), "unknown name should still emit E204");
+    }
+
+    /// Lowers the bare VHDL name `text` against `env` with a fresh sink.
+    fn lower_vhdl_bare_name(text: &str, env: &SignalEnv, interner: &Interner) -> (IrExpr, bool) {
+        let sdb = SourceDb::new();
+        let sink = DiagnosticSink::new();
+        let ast_expr = aion_vhdl_parser::ast::Expr::Name(aion_vhdl_parser::ast::Name {
+            primary: interner.get_or_intern(text),
+            parts: vec![],
+            span: Span::DUMMY,
+        });
+        let ir = lower_vhdl_expr(&ast_expr, env, &sdb, interner, &sink);
+        (ir, sink.has_errors())
+    }
+
+    #[test]
+    fn vhdl_boolean_literals_lower_to_single_bit_constants() {
+        let interner = Interner::new();
+        let env = SignalEnv::new();
+        for (text, value) in [
+            ("true", true),
+            ("false", false),
+            ("TRUE", true),
+            ("False", false),
+        ] {
+            let (ir, errored) = lower_vhdl_bare_name(text, &env, &interner);
+            assert!(!errored, "`{text}` must not emit E204");
+            assert!(
+                matches!(&ir, IrExpr::Literal(lv) if *lv == LogicVec::from_bool(value)),
+                "{text}: {ir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vhdl_signal_named_true_hides_boolean_literal() {
+        let interner = Interner::new();
+        let mut env = SignalEnv::new();
+        let sid = SignalId::from_raw(7);
+        env.insert(interner.get_or_intern("true"), sid);
+        let (ir, errored) = lower_vhdl_bare_name("true", &env, &interner);
+        assert!(!errored);
+        assert!(
+            matches!(ir, IrExpr::Signal(SignalRef::Signal(s)) if s == sid),
+            "{ir:?}"
+        );
+    }
+
+    #[test]
+    fn vhdl_boolean_literal_helper_rejects_other_names() {
+        let interner = Interner::new();
+        let env = SignalEnv::new();
+        for text in ["truthy", "f", "falsehood", ""] {
+            let name = interner.get_or_intern(text);
+            assert_eq!(vhdl_boolean_literal(name, &env, &interner), None, "{text}");
+        }
+        let (_, errored) = lower_vhdl_bare_name("truthy", &env, &interner);
+        assert!(
+            errored,
+            "a name that only resembles a literal is still E204"
+        );
     }
 
     /// Lowers `<op> v` for a VHDL unary operator applied to signal `v`.

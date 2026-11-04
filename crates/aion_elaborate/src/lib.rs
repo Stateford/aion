@@ -2161,6 +2161,70 @@ end architecture;
         );
     }
 
+    /// Collects the condition of every assertion in `stmt`, in source order.
+    fn assertion_conditions(stmt: &aion_ir::Statement, out: &mut Vec<aion_common::LogicVec>) {
+        match stmt {
+            aion_ir::Statement::Assertion { condition, .. } => match condition {
+                aion_ir::Expr::Literal(lv) => out.push(lv.clone()),
+                other => panic!("assertion condition is not a literal: {other:?}"),
+            },
+            aion_ir::Statement::Block { stmts, .. } => {
+                stmts.iter().for_each(|s| assertion_conditions(s, out))
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn vhdl_assert_boolean_literal_elaborates_as_constant() {
+        // Issue #71: `assert false` is the standard end-of-simulation idiom.
+        let src = r#"
+entity tb is end entity;
+architecture sim of tb is
+begin
+  process begin
+    assert False report "done" severity failure;
+    assert TRUE;
+    wait;
+  end process;
+end architecture;
+"#;
+        let (design, _, diags) = elaborate_sources(&[("tb.vhd", src)], "tb");
+        let errors = error_messages(&diags);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let top = design.top_module();
+        let (_, proc) = top.processes.iter().next().unwrap();
+        let mut conds = Vec::new();
+        assertion_conditions(&proc.body, &mut conds);
+        assert_eq!(
+            conds,
+            vec![
+                aion_common::LogicVec::from_bool(false),
+                aion_common::LogicVec::from_bool(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn vhdl_assert_on_unknown_name_still_reports_e204() {
+        let src = r#"
+entity tb is end entity;
+architecture sim of tb is
+begin
+  process begin
+    assert falsy;
+    wait;
+  end process;
+end architecture;
+"#;
+        let (_, _, diags) = elaborate_sources(&[("tb.vhd", src)], "tb");
+        let errors = error_messages(&diags);
+        assert!(
+            errors.iter().any(|m| m.contains("unknown signal `falsy`")),
+            "errors: {errors:?}"
+        );
+    }
+
     #[test]
     fn verilog_instantiates_vhdl_entity_case_insensitively() {
         let vhdl = r#"
